@@ -39,13 +39,33 @@ class ProjectionExecutor : public AbstractExecutor {
         len_ = curr_offset;
     }
 
-    void beginTuple() override {}
+    void beginTuple() override { prev_->beginTuple(); }
 
-    void nextTuple() override {}
+    void nextTuple() override { prev_->nextTuple(); }
 
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        // return nullptr;
+        auto src = prev_->Next();
+        if (src == nullptr) {
+            return nullptr;
+        }
+        auto out = std::make_unique<RmRecord>(len_);
+        const auto &prev_cols = prev_->cols();
+        for (size_t i = 0; i < sel_idxs_.size(); i++) {
+            const auto &col = cols_[i];
+            auto &prev_col = prev_cols[sel_idxs_[i]];
+            memcpy(out->data + col.offset, src->data + prev_col.offset, col.len);
+        }
+        _abstract_rid = prev_->rid();
+        return out;
     }
 
     Rid &rid() override { return _abstract_rid; }
+
+    size_t tupleLen() const override { return len_; }
+
+    const std::vector<ColMeta> &cols() const override { return cols_; }
+
+    bool is_end() const override { return prev_->is_end(); }
+
 };
