@@ -1,0 +1,39 @@
+# Build directories
+build/
+cmake-build-*/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+Testing/
+cmake_install.cmake
+compile_commands.json
+Makefile
+
+# Build artifacts
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Vendored deps: keep sources, ignore generated files inside them
+deps/googletest/install_manifest.txt
+deps/googletest/**/generated/
+deps/googletest/**/CMakeFiles/
+deps/googletest/**/CMakeCache.txt
+deps/googletest/**/CTestTestfile.cmake
+deps/googletest/**/cmake_install.cmake
+deps/googletest/**/Makefile
