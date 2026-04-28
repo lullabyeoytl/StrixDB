@@ -21,14 +21,19 @@ std::unordered_map<txn_id_t, Transaction *> TransactionManager::txn_map = {};
  * @param {LogManager*} log_manager 日志管理器指针
  */
 Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manager) {
-    // Todo:
     // 1. 判断传入事务参数是否为空指针
     // 2. 如果为空指针，创建新事务
     // 3. 把开始事务加入到全局事务表中
     // 4. 返回当前事务指针
     // 如果需要支持MVCC请在上述过程中添加代码
-    
-    return nullptr;
+    if (txn == nullptr) {
+        txn = new Transaction(next_txn_id_++);
+    }
+    txn->set_state(TransactionState::DEFAULT);
+    txn->set_start_ts(next_timestamp_++);
+    std::unique_lock<std::mutex> lock(latch_);
+    txn_map[txn->get_transaction_id()] = txn;
+    return txn;
 }
 
 /**
@@ -44,7 +49,13 @@ void TransactionManager::commit(Transaction* txn, LogManager* log_manager) {
     // 4. 把事务日志刷入磁盘中
     // 5. 更新事务状态
     // 如果需要支持MVCC请在上述过程中添加代码
-
+    if (txn == nullptr) {
+        return;
+    }
+    txn->set_state(TransactionState::COMMITTED);
+    if (log_manager != nullptr) {
+        log_manager->flush_log_to_disk();
+    }
 }
 
 /**
@@ -60,5 +71,11 @@ void TransactionManager::abort(Transaction * txn, LogManager *log_manager) {
     // 4. 把事务日志刷入磁盘中
     // 5. 更新事务状态
     // 如果需要支持MVCC请在上述过程中添加代码
-    
+    if (txn == nullptr) {
+        return;
+    }
+    txn->set_state(TransactionState::ABORTED);
+    if (log_manager != nullptr) {
+        log_manager->flush_log_to_disk();
+    }
 }

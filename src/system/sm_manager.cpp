@@ -85,8 +85,23 @@ void SmManager::drop_db(const std::string& db_name) {
  * @param {string&} db_name 数据库名称，与文件夹同名
  */
 void SmManager::open_db(const std::string& db_name) {
-    
-}
+    if (!is_dir(db_name)) {
+        throw DatabaseNotFoundError(db_name);
+    }
+    if (chdir(db_name.c_str()) < 0) {
+        throw UnixError();
+    }
+    std::ifstream ifs(DB_META_NAME);
+    if (!ifs.is_open()) {
+        throw DatabaseMetaCorruptedError(db_name);
+    }
+    ifs >> db_;  
+    fhs_.clear();
+    ihs_.clear();
+    for (auto &entry : db_.tabs_) {
+        fhs_.emplace(entry.first, rm_manager_->open_file(entry.first));
+    }
+}   
 
 /**
  * @description: 把数据库相关的元数据刷入磁盘中
@@ -101,7 +116,15 @@ void SmManager::flush_meta() {
  * @description: 关闭数据库并把数据落盘
  */
 void SmManager::close_db() {
-    
+    flush_meta();
+    for (auto &entry : fhs_) {
+        rm_manager_->close_file(entry.second.get());
+    }
+    fhs_.clear();
+    ihs_.clear();
+    if (chdir("..") < 0) {
+        throw UnixError();
+    }
 }
 
 /**
