@@ -1,18 +1,20 @@
+#include <cerrno>
+#include <cassert>
+#include <cstdio>
+#include <cstring>
+#include <iostream>
+#include <memory>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <readline/history.h>
 #include <readline/readline.h>
+#include <string>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <termios.h>
 #include <unistd.h>
-
-#include <cassert>
-#include <iostream>
-#include <memory>
-#include <string>
 
 #define MAX_MEM_BUFFER_SIZE 8192
 #define PORT_DEFAULT 8765
