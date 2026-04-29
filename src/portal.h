@@ -45,6 +45,9 @@ struct PortalStmt {
             tag(tag_), sel_cols(std::move(sel_cols_)), root(std::move(root_)), plan(std::move(plan_)) {}
 };
 
+/**
+ * @brief Portal模块负责将查询执行计划转换成对应的算子树，并执行算子树生成结果
+ */
 class Portal
 {
    private:

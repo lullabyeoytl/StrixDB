@@ -28,6 +28,11 @@ Makefile
 *.swp
 *.swo
 *~
+*~origin_master
+
+# Parser generated files (bison/flex output)
+src/parser/yacc.tab.*
+src/parser/lex.yy.*
 
 # Vendored deps: keep sources, ignore generated files inside them
 deps/googletest/install_manifest.txt

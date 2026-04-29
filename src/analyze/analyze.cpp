@@ -23,8 +23,11 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         // 处理表名
         query->tables = std::move(x->tabs);
         /** TODO: 检查表是否存在 */
-
-        // 处理target list，再target list中添加上表名，例如 a.id
+        for (auto &tab_name : query->tables) {
+            if (!sm_manager_->db_.is_table(tab_name)) {
+                throw TableNotFoundError(tab_name);
+            }
+        }
         for (auto &sv_sel_col : x->cols) {
             TabCol sel_col = {.tab_name = sv_sel_col->tab_name, .col_name = sv_sel_col->col_name};
             query->cols.push_back(sel_col);
@@ -41,19 +44,21 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         } else {
             // infer table name from column name
             for (auto &sel_col : query->cols) {
-                sel_col = check_column(all_cols, sel_col);  // 列元数据校验
+                check_column(all_cols, sel_col);  // 列元数据校验
             }
         }
         //处理where条件
         get_clause(x->conds, query->conds);
-        check_clause(query->tables, query->conds);
+        check_clause(all_cols, query->conds);
     } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(parse)) {
         /** TODO: */
 
     } else if (auto x = std::dynamic_pointer_cast<ast::DeleteStmt>(parse)) {
         //处理where条件
         get_clause(x->conds, query->conds);
-        check_clause({x->tab_name}, query->conds);        
+        std::vector<ColMeta> del_cols;
+        get_all_cols({x->tab_name}, del_cols);
+        check_clause(del_cols, query->conds);
     } else if (auto x = std::dynamic_pointer_cast<ast::InsertStmt>(parse)) {
         // 处理insert 的values值
         for (auto &sv_val : x->vals) {
@@ -67,7 +72,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
 }
 
 
-TabCol Analyze::check_column(const std::vector<ColMeta> &all_cols, TabCol target) {
+void Analyze::check_column(const std::vector<ColMeta> &all_cols, TabCol &target) {
     if (target.tab_name.empty()) {
         // Table name not specified, infer table name from column name
         std::string tab_name;
@@ -82,15 +87,28 @@ TabCol Analyze::check_column(const std::vector<ColMeta> &all_cols, TabCol target
         if (tab_name.empty()) {
             throw ColumnNotFoundError(target.col_name);
         }
-        target.tab_name = tab_name;
+        target.tab_name = std::move(tab_name);
     } else {
         /** TODO: Make sure target column exists */
-        
+        bool not_exist = true;
+        for (auto&col: all_cols) {
+            if (col.tab_name == target.tab_name && col.name == target.col_name) {
+                not_exist = false;
+                break;
+            }
+        }
+        if (not_exist) {
+            throw ColumnNotFoundError(target.tab_name + "." + target.col_name);
+        }
     }
-    return target;
 }
 
 void Analyze::get_all_cols(const std::vector<std::string> &tab_names, std::vector<ColMeta> &all_cols) {
+    size_t total = 0;
+    for (auto &name : tab_names) {
+        total += sm_manager_->db_.get_table(name).cols.size();
+    }
+    all_cols.reserve(all_cols.size() + total);
     for (auto &sel_tab_name : tab_names) {
         // 这里db_不能写成get_db(), 注意要传指针
         const auto &sel_tab_cols = sm_manager_->db_.get_table(sel_tab_name).cols;
@@ -115,18 +133,20 @@ void Analyze::get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv
     }
 }
 
-void Analyze::check_clause(const std::vector<std::string> &tab_names, std::vector<Condition> &conds) {
-    // auto all_cols = get_all_cols(tab_names);
-    std::vector<ColMeta> all_cols;
-    get_all_cols(tab_names, all_cols);
+void Analyze::check_clause(const std::vector<ColMeta> &all_cols, std::vector<Condition> &conds) {
+    std::map<std::string, TabMeta> tab_cache;
     // Get raw values in where clause
     for (auto &cond : conds) {
         // Infer table name from column name
-        cond.lhs_col = check_column(all_cols, cond.lhs_col);
+        check_column(all_cols, cond.lhs_col);
         if (!cond.is_rhs_val) {
-            cond.rhs_col = check_column(all_cols, cond.rhs_col);
+            check_column(all_cols, cond.rhs_col);
         }
-        TabMeta &lhs_tab = sm_manager_->db_.get_table(cond.lhs_col.tab_name);
+        auto tab_it = tab_cache.find(cond.lhs_col.tab_name);
+        if (tab_it == tab_cache.end()) {
+            tab_it = tab_cache.emplace(cond.lhs_col.tab_name, sm_manager_->db_.get_table(cond.lhs_col.tab_name)).first;
+        }
+        TabMeta &lhs_tab = tab_it->second;
         auto lhs_col = lhs_tab.get_col(cond.lhs_col.col_name);
         ColType lhs_type = lhs_col->type;
         ColType rhs_type;
@@ -134,7 +154,11 @@ void Analyze::check_clause(const std::vector<std::string> &tab_names, std::vecto
             cond.rhs_val.init_raw(lhs_col->len);
             rhs_type = cond.rhs_val.type;
         } else {
-            TabMeta &rhs_tab = sm_manager_->db_.get_table(cond.rhs_col.tab_name);
+            auto rhs_it = tab_cache.find(cond.rhs_col.tab_name);
+            if (rhs_it == tab_cache.end()) {
+                rhs_it = tab_cache.emplace(cond.rhs_col.tab_name, sm_manager_->db_.get_table(cond.rhs_col.tab_name)).first;
+            }
+            TabMeta &rhs_tab = rhs_it->second;
             auto rhs_col = rhs_tab.get_col(cond.rhs_col.col_name);
             rhs_type = rhs_col->type;
         }
@@ -147,11 +171,12 @@ void Analyze::check_clause(const std::vector<std::string> &tab_names, std::vecto
 
 Value Analyze::convert_sv_value(const std::shared_ptr<ast::Value> &sv_val) {
     Value val;
-    if (auto int_lit = std::dynamic_pointer_cast<ast::IntLit>(sv_val)) {
+    auto *raw = sv_val.get();
+    if (auto *int_lit = dynamic_cast<ast::IntLit *>(raw)) {
         val.set_int(int_lit->val);
-    } else if (auto float_lit = std::dynamic_pointer_cast<ast::FloatLit>(sv_val)) {
+    } else if (auto *float_lit = dynamic_cast<ast::FloatLit *>(raw)) {
         val.set_float(float_lit->val);
-    } else if (auto str_lit = std::dynamic_pointer_cast<ast::StringLit>(sv_val)) {
+    } else if (auto *str_lit = dynamic_cast<ast::StringLit *>(raw)) {
         val.set_str(str_lit->val);
     } else {
         throw InternalError("Unexpected sv value type");
@@ -160,9 +185,13 @@ Value Analyze::convert_sv_value(const std::shared_ptr<ast::Value> &sv_val) {
 }
 
 CompOp Analyze::convert_sv_comp_op(ast::SvCompOp op) {
-    std::map<ast::SvCompOp, CompOp> m = {
-        {ast::SV_OP_EQ, OP_EQ}, {ast::SV_OP_NE, OP_NE}, {ast::SV_OP_LT, OP_LT},
-        {ast::SV_OP_GT, OP_GT}, {ast::SV_OP_LE, OP_LE}, {ast::SV_OP_GE, OP_GE},
-    };
-    return m.at(op);
+    switch (op) {
+        case ast::SV_OP_EQ: return OP_EQ;
+        case ast::SV_OP_NE: return OP_NE;
+        case ast::SV_OP_LT: return OP_LT;
+        case ast::SV_OP_GT: return OP_GT;
+        case ast::SV_OP_LE: return OP_LE;
+        case ast::SV_OP_GE: return OP_GE;
+        default: throw InternalError("Unexpected comparison op");
+    }
 }

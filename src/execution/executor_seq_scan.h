@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include "execution_common.h"
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
@@ -30,6 +31,27 @@ class SeqScanExecutor : public AbstractExecutor {
 
     SmManager *sm_manager_;
 
+    void set_end() {
+        rid_ = Rid{-1, -1};
+    }
+
+    // add filter conds
+    void seek_to_next_valid() {
+        if (!scan_) {
+            set_end();
+            return;
+        }
+        while (!scan_ -> is_end()) {
+            rid_ = scan_ -> rid();
+            auto record = fh_ -> get_record(rid_, context_);
+            if (evaluate_conditions(conds_, *record, cols_)) {
+                return;
+            }
+            scan_ -> next();
+        }
+        set_end();
+    }
+
    public:
     SeqScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, Context *context) {
         sm_manager_ = sm_manager;
@@ -43,29 +65,22 @@ class SeqScanExecutor : public AbstractExecutor {
         context_ = context;
 
         fed_conds_ = conds_;
+        set_end();
     }
 
     void beginTuple() override {
         scan_ = std::make_unique<RmScan>(fh_);
-        if (scan_->is_end()) {
-            rid_ = Rid{-1, -1};
-            return;
-        }
-        rid_ = scan_->rid();
+        seek_to_next_valid();
     }
 
 
     void nextTuple() override {
-        if(!scan_) {
-            rid_ = Rid{-1, -1};
+        if(!scan_ || scan_ -> is_end()) {
+            set_end();
             return;
         }
         scan_->next();
-        if (scan_->is_end()) {
-            rid_ = Rid{-1, -1};
-        } else {
-            rid_ = scan_->rid();
-        }
+        seek_to_next_valid();
     }
 
     std::unique_ptr<RmRecord> Next() override {

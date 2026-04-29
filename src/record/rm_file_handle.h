@@ -21,6 +21,12 @@ See the Mulan PSL v2 for more details. */
 class RmManager;
 
 /* 对表数据文件中的页面进行封装 */
+/**
+ * 页面的结构示意如下：
+ *  | 4B LSN | 8B RmPageHdr | bitmap_size B | num_records_per_page * record_size B | 剩余空
+  白 |
+ * page_hdr存储页面的元信息，bitmap存储页面上每个slot是否有记录，slots存储表的记录，每个slot的长度为file_hdr->record_size
+ */
 struct RmPageHandle {
     const RmFileHdr *file_hdr;  // 当前页面所在文件的文件头指针
     Page *page;                 // 页面的实际数据，包括页面存储的数据、元信息等

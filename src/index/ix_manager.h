@@ -17,6 +17,10 @@ See the Mulan PSL v2 for more details. */
 #include "ix_defs.h"
 #include "ix_index_handle.h"
 
+/**
+ * @brief 索引管理器，负责索引的创建、删除、打开和关闭等操作
+ * 索引文件的命名规则为：表名_字段1_字段2_..._字段n.idx
+ */
 class IxManager {
    private:
     DiskManager *disk_manager_;

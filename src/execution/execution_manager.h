@@ -28,6 +28,10 @@ See the Mulan PSL v2 for more details. */
 
 class Planner;
 
+/**
+ * @brief: QlManager主要负责执行SQL语句，包含DDL语句和DML语句
+ * 其中DDL语句的执行主要是调用SmManager提供的接口来完成的，而DML语句的执行主要是构建一个执行计划树，并调用对应的Executor来完成的
+ */
 class QlManager {
    private:
     SmManager *sm_manager_;
