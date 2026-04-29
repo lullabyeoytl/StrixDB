@@ -42,3 +42,5 @@ deps/googletest/**/CMakeCache.txt
 deps/googletest/**/CTestTestfile.cmake
 deps/googletest/**/cmake_install.cmake
 deps/googletest/**/Makefile
+
+/demo

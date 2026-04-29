@@ -12,17 +12,21 @@ See the Mulan PSL v2 for more details. */
 
 #define private public
 
+#include "index/ix.h"
 #include "record/rm.h"
 #include "storage/buffer_pool_manager.h"
 
 #undef private
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <random>
@@ -565,6 +569,348 @@ TEST(StorageTest, SimpleTest) {
         } catch (const FileNotFoundError &e) {
         }
     }
+}
+
+TEST(DiskManagerTest, CloseOnlyReleasesFileOnLastReference) {
+    auto local_disk_manager = std::make_unique<DiskManager>();
+    const std::string filename = "disk_manager_refcount.txt";
+
+    if (local_disk_manager->is_file(filename)) {
+        local_disk_manager->destroy_file(filename);
+    }
+    local_disk_manager->create_file(filename);
+
+    int fd1 = local_disk_manager->open_file(filename);
+    int fd2 = local_disk_manager->open_file(filename);
+    ASSERT_EQ(fd1, fd2);
+
+    std::array<char, PAGE_SIZE> write_buf{};
+    snprintf(write_buf.data(), write_buf.size(), "shared-open");
+
+    local_disk_manager->close_file(fd1);
+
+    EXPECT_NO_THROW(local_disk_manager->write_page(fd2, 0, write_buf.data(), PAGE_SIZE));
+
+    std::array<char, PAGE_SIZE> read_buf{};
+    EXPECT_NO_THROW(local_disk_manager->read_page(fd2, 0, read_buf.data(), PAGE_SIZE));
+    EXPECT_STREQ("shared-open", read_buf.data());
+
+    local_disk_manager->close_file(fd2);
+    local_disk_manager->destroy_file(filename);
+}
+
+TEST(DiskManagerTest, DirectoryOperationsSupportWhitespacePaths) {
+    auto local_disk_manager = std::make_unique<DiskManager>();
+    const std::string dir_path = "__rmdb_dir__ __rmdb_space__ __rmdb_case__";
+    const std::string child_path = dir_path + "/child.txt";
+
+    std::filesystem::remove_all(dir_path);
+    std::filesystem::remove_all("__rmdb_dir__");
+    std::filesystem::remove_all("__rmdb_space__");
+    std::filesystem::remove_all("__rmdb_case__");
+
+    local_disk_manager->create_dir(dir_path);
+    EXPECT_TRUE(local_disk_manager->is_dir(dir_path));
+
+    local_disk_manager->create_file(child_path);
+    EXPECT_TRUE(local_disk_manager->is_file(child_path));
+
+    int fd = local_disk_manager->open_file(child_path);
+    local_disk_manager->close_file(fd);
+
+    local_disk_manager->destroy_dir(dir_path);
+    EXPECT_FALSE(local_disk_manager->is_dir(dir_path));
+
+    std::filesystem::remove_all("__rmdb_dir__");
+    std::filesystem::remove_all("__rmdb_space__");
+    std::filesystem::remove_all("__rmdb_case__");
+}
+
+TEST(DiskManagerTest, ConcurrentReadsUseStableOffsets) {
+    auto local_disk_manager = std::make_unique<DiskManager>();
+    const std::string filename = "disk_manager_concurrent_reads.txt";
+
+    if (local_disk_manager->is_file(filename)) {
+        local_disk_manager->destroy_file(filename);
+    }
+    local_disk_manager->create_file(filename);
+    int fd = local_disk_manager->open_file(filename);
+
+    std::array<char, PAGE_SIZE> page_zero{};
+    std::array<char, PAGE_SIZE> page_one{};
+    memset(page_zero.data(), 'A', page_zero.size());
+    memset(page_one.data(), 'B', page_one.size());
+    local_disk_manager->write_page(fd, 0, page_zero.data(), PAGE_SIZE);
+    local_disk_manager->write_page(fd, 1, page_one.data(), PAGE_SIZE);
+
+    std::atomic<bool> corrupted{false};
+    auto reader = [&](page_id_t page_no, const std::array<char, PAGE_SIZE> &expected) {
+        std::array<char, PAGE_SIZE> buf{};
+        for (int i = 0; i < 20000 && !corrupted.load(); ++i) {
+            local_disk_manager->read_page(fd, page_no, buf.data(), PAGE_SIZE);
+            if (memcmp(buf.data(), expected.data(), PAGE_SIZE) != 0) {
+                corrupted.store(true);
+                return;
+            }
+            std::this_thread::yield();
+        }
+    };
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 4; ++i) {
+        threads.emplace_back(reader, 0, std::cref(page_zero));
+        threads.emplace_back(reader, 1, std::cref(page_one));
+    }
+    for (auto &thread : threads) {
+        thread.join();
+    }
+
+    EXPECT_FALSE(corrupted.load());
+
+    local_disk_manager->close_file(fd);
+    local_disk_manager->destroy_file(filename);
+}
+
+TEST(BufferPoolManagerRegressionTest, DirtyFlagSurvivesReadonlyUnpin) {
+    auto local_disk_manager = std::make_unique<DiskManager>();
+    auto local_buffer_pool_manager = std::make_unique<BufferPoolManager>(1, local_disk_manager.get());
+    const std::string filename = "buffer_pool_dirty_regression.txt";
+
+    if (local_disk_manager->is_file(filename)) {
+        local_disk_manager->destroy_file(filename);
+    }
+    local_disk_manager->create_file(filename);
+    int fd = local_disk_manager->open_file(filename);
+    local_disk_manager->set_fd2pageno(fd, 0);
+
+    PageId page_id = {.fd = fd, .page_no = INVALID_PAGE_ID};
+    Page *page = local_buffer_pool_manager->new_page(&page_id);
+    ASSERT_NE(nullptr, page);
+    snprintf(page->get_data(), PAGE_SIZE, "dirty-page");
+    ASSERT_TRUE(local_buffer_pool_manager->unpin_page(page_id, true));
+
+    page = local_buffer_pool_manager->fetch_page(page_id);
+    ASSERT_NE(nullptr, page);
+    EXPECT_STREQ("dirty-page", page->get_data());
+    ASSERT_TRUE(local_buffer_pool_manager->unpin_page(page_id, false));
+
+    PageId other_page_id = {.fd = fd, .page_no = INVALID_PAGE_ID};
+    Page *other_page = local_buffer_pool_manager->new_page(&other_page_id);
+    ASSERT_NE(nullptr, other_page);
+    ASSERT_TRUE(local_buffer_pool_manager->unpin_page(other_page_id, false));
+
+    page = local_buffer_pool_manager->fetch_page(page_id);
+    ASSERT_NE(nullptr, page);
+    EXPECT_STREQ("dirty-page", page->get_data());
+    ASSERT_TRUE(local_buffer_pool_manager->unpin_page(page_id, false));
+
+    local_disk_manager->close_file(fd);
+    local_disk_manager->destroy_file(filename);
+}
+
+TEST(BufferPoolManagerRegressionTest, ReusedFdDoesNotHitCachedPageFromClosedFile) {
+    auto local_disk_manager = std::make_unique<DiskManager>();
+    auto local_buffer_pool_manager = std::make_unique<BufferPoolManager>(2, local_disk_manager.get());
+    const std::string first_filename = "buffer_pool_fd_reuse_first.txt";
+    const std::string second_filename = "buffer_pool_fd_reuse_second.txt";
+
+    if (local_disk_manager->is_file(first_filename)) {
+        local_disk_manager->destroy_file(first_filename);
+    }
+    if (local_disk_manager->is_file(second_filename)) {
+        local_disk_manager->destroy_file(second_filename);
+    }
+    local_disk_manager->create_file(first_filename);
+    int first_fd = local_disk_manager->open_file(first_filename);
+    local_disk_manager->set_fd2pageno(first_fd, 0);
+
+    PageId first_page_id = {.fd = first_fd, .page_no = INVALID_PAGE_ID};
+    Page *page = local_buffer_pool_manager->new_page(&first_page_id);
+    ASSERT_NE(nullptr, page);
+    snprintf(page->get_data(), PAGE_SIZE, "first-file-page");
+    ASSERT_TRUE(local_buffer_pool_manager->unpin_page(first_page_id, true));
+    ASSERT_TRUE(local_buffer_pool_manager->flush_page(first_page_id));
+    local_disk_manager->fd2pageno_[first_fd] = 7;
+
+    local_disk_manager->close_file(first_fd);
+
+    EXPECT_EQ(0, local_disk_manager->fd2pageno_[first_fd].load());
+
+    local_disk_manager->create_file(second_filename);
+    int second_fd = local_disk_manager->open_file(second_filename);
+    ASSERT_EQ(first_fd, second_fd);
+
+    std::array<char, PAGE_SIZE> second_page{};
+    snprintf(second_page.data(), second_page.size(), "second-file-page");
+    local_disk_manager->write_page(second_fd, 0, second_page.data(), PAGE_SIZE);
+
+    Page *second_cached_page = local_buffer_pool_manager->fetch_page(PageId{second_fd, 0});
+    ASSERT_NE(nullptr, second_cached_page);
+    EXPECT_STREQ("second-file-page", second_cached_page->get_data());
+    ASSERT_TRUE(local_buffer_pool_manager->unpin_page(PageId{second_fd, 0}, false));
+
+    local_disk_manager->close_file(second_fd);
+    local_disk_manager->destroy_file(first_filename);
+    local_disk_manager->destroy_file(second_filename);
+}
+
+TEST(IndexManagerRegressionTest, ReopenRestoresNextPageNumber) {
+    auto local_disk_manager = std::make_unique<DiskManager>();
+    auto local_buffer_pool_manager = std::make_unique<BufferPoolManager>(8, local_disk_manager.get());
+    auto local_index_manager = std::make_unique<IxManager>(local_disk_manager.get(), local_buffer_pool_manager.get());
+
+    const std::string table_name = "ix_page_allocator_regression";
+    std::vector<ColMeta> index_cols = {{
+        .tab_name = table_name,
+        .name = "id",
+        .type = TYPE_INT,
+        .len = static_cast<int>(sizeof(int)),
+        .offset = 0,
+        .index = false,
+    }};
+
+    const std::string index_filename = local_index_manager->get_index_name(table_name, index_cols);
+    if (local_disk_manager->is_file(index_filename)) {
+        local_disk_manager->destroy_file(index_filename);
+    }
+
+    local_index_manager->create_index(table_name, index_cols);
+
+    auto index_handle = local_index_manager->open_index(table_name, index_cols);
+    IxNodeHandle *first_node = index_handle->create_node();
+    ASSERT_NE(nullptr, first_node);
+    EXPECT_EQ(IX_INIT_NUM_PAGES, first_node->get_page_no());
+    ASSERT_TRUE(local_buffer_pool_manager->unpin_page(first_node->get_page_id(), true));
+    delete first_node;
+    local_index_manager->close_index(index_handle.get());
+
+    index_handle = local_index_manager->open_index(table_name, index_cols);
+    IxNodeHandle *second_node = index_handle->create_node();
+    ASSERT_NE(nullptr, second_node);
+    EXPECT_EQ(IX_INIT_NUM_PAGES + 1, second_node->get_page_no());
+    ASSERT_TRUE(local_buffer_pool_manager->unpin_page(second_node->get_page_id(), true));
+    delete second_node;
+    local_index_manager->close_index(index_handle.get());
+
+    local_index_manager->destroy_index(table_name, index_cols);
+}
+
+class IndexHandleRegressionTest : public ::testing::Test {
+   protected:
+    std::unique_ptr<DiskManager> disk_manager_;
+    std::unique_ptr<BufferPoolManager> buffer_pool_manager_;
+    std::unique_ptr<IxManager> index_manager_;
+    std::string table_name_;
+    std::vector<ColMeta> index_cols_;
+
+    void SetUp() override {
+        disk_manager_ = std::make_unique<DiskManager>();
+        buffer_pool_manager_ = std::make_unique<BufferPoolManager>(32, disk_manager_.get());
+        index_manager_ = std::make_unique<IxManager>(disk_manager_.get(), buffer_pool_manager_.get());
+        table_name_ = std::string("ix_handle_regression_") + ::testing::UnitTest::GetInstance()->current_test_info()->name();
+        index_cols_ = {{
+            .tab_name = table_name_,
+            .name = "id",
+            .type = TYPE_INT,
+            .len = static_cast<int>(sizeof(int)),
+            .offset = 0,
+            .index = false,
+        }};
+        destroy_index_if_exists();
+    }
+
+    void TearDown() override { destroy_index_if_exists(); }
+
+    void destroy_index_if_exists() {
+        const std::string index_name = index_manager_->get_index_name(table_name_, index_cols_);
+        if (disk_manager_->is_file(index_name) && !disk_manager_->is_file_open(index_name)) {
+            index_manager_->destroy_index(table_name_, index_cols_);
+        }
+    }
+
+    std::unique_ptr<IxIndexHandle> create_open_index() {
+        index_manager_->create_index(table_name_, index_cols_);
+        return index_manager_->open_index(table_name_, index_cols_);
+    }
+
+    void close_index(std::unique_ptr<IxIndexHandle> &ih) {
+        index_manager_->close_index(ih.get());
+        ih.reset();
+    }
+
+    static void insert_int(IxIndexHandle *ih, int key) {
+        ih->insert_entry(reinterpret_cast<const char *>(&key), Rid{key, key + 1000}, nullptr);
+    }
+
+    static bool delete_int(IxIndexHandle *ih, int key) {
+        return ih->delete_entry(reinterpret_cast<const char *>(&key), nullptr);
+    }
+
+    static void expect_find_int(IxIndexHandle *ih, int key) {
+        std::vector<Rid> result;
+        ASSERT_TRUE(ih->get_value(reinterpret_cast<const char *>(&key), &result, nullptr));
+        ASSERT_EQ(1, result.size());
+        EXPECT_EQ(key, result[0].page_no);
+        EXPECT_EQ(key + 1000, result[0].slot_no);
+    }
+};
+
+TEST_F(IndexHandleRegressionTest, BoundsPastLastKeyReturnLeafEnd) {
+    auto ih = create_open_index();
+    insert_int(ih.get(), 1);
+
+    int high_key = 2;
+    Iid end = ih->leaf_end();
+
+    EXPECT_EQ(end, ih->lower_bound(reinterpret_cast<const char *>(&high_key)));
+    EXPECT_EQ(end, ih->upper_bound(reinterpret_cast<const char *>(&high_key)));
+
+    close_index(ih);
+}
+
+TEST_F(IndexHandleRegressionTest, DeleteLastKeyLeavesIndexReusable) {
+    auto ih = create_open_index();
+    insert_int(ih.get(), 1);
+
+    ASSERT_TRUE(delete_int(ih.get(), 1));
+    insert_int(ih.get(), 2);
+
+    expect_find_int(ih.get(), 2);
+
+    close_index(ih);
+}
+
+TEST_F(IndexHandleRegressionTest, RightSiblingRedistributionPreservesMovedKey) {
+    auto ih = create_open_index();
+    for (int key = 1; key <= 400; ++key) {
+        insert_int(ih.get(), key);
+    }
+
+    ASSERT_TRUE(delete_int(ih.get(), 1));
+
+    expect_find_int(ih.get(), 170);
+
+    close_index(ih);
+}
+
+TEST_F(IndexHandleRegressionTest, RootWithSingleChildIsPromotedAfterCoalesce) {
+    auto ih = create_open_index();
+    for (int key = 1; key <= 400; ++key) {
+        insert_int(ih.get(), key);
+    }
+    for (int key = 170; key <= 400; ++key) {
+        ASSERT_TRUE(delete_int(ih.get(), key));
+    }
+
+    IxNodeHandle *root = ih->fetch_node(ih->file_hdr_->root_page_);
+    EXPECT_TRUE(root->is_leaf_page());
+    EXPECT_EQ(IX_NO_PAGE, root->get_parent_page_no());
+    ASSERT_TRUE(buffer_pool_manager_->unpin_page(root->get_page_id(), false));
+    delete root;
+
+    expect_find_int(ih.get(), 1);
+
+    close_index(ih);
 }
 
 TEST(RecordManagerTest, SimpleTest) {

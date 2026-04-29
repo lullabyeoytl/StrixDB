@@ -32,7 +32,7 @@ public:
     std::vector<int> col_lens_;         // 字段的长度
     int col_tot_len_;                   // 索引包含的字段的总长度
     int btree_order_;                   // # children per page 每个结点最多可插入的键值对数量
-    int keys_size_;                     // keys_size = (btree_order + 1) * col_tot_len
+    int keys_size_;                     // keys_size = (btree_order + 1) * col_tot_len, 节点预留一个草欸用于分裂插入时的空位
     // first_leaf初始化之后没有进行修改，只不过是在测试文件中遍历叶子结点的时候用了
     page_id_t first_leaf_;              // 首叶节点对应的页号，在上层IxManager的open函数进行初始化，初始化为root page_no
     page_id_t last_leaf_;               // 尾叶节点对应的页号
@@ -100,7 +100,6 @@ public:
         offset += sizeof(page_id_t);
         col_num_ = *reinterpret_cast<const int*>(src + offset);
         offset += sizeof(int);
-        std::cout << col_num_ << "\n";
         for(int i = 0; i < col_num_; ++i) {
             // col_types_[i] = *reinterpret_cast<const ColType*>(src + offset);
             ColType type = *reinterpret_cast<const ColType*>(src + offset);
