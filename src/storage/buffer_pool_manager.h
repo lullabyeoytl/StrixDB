@@ -13,7 +13,9 @@ See the Mulan PSL v2 for more details. */
 #include <unistd.h>
 
 #include <cassert>
+#include <condition_variable>
 #include <list>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -25,23 +27,52 @@ See the Mulan PSL v2 for more details. */
 
 class BufferPoolManager {
    private:
+   // Free: no usefule page, can be used directly
+   // Ready: page is ready to be used, can be fetched
+    // IO_IN_PROGRESS: page is being read from or written to disk, cannot be used
+    enum class FrameState { FREE, READY, IO_IN_PROGRESS };
+    
+    // since the fd may be reused by OS, so previous {fd,page_no} not reliable
+    // we use {file_name,page_no} as the key to identify a page for decrease mistakes
+    struct PageKey {
+        std::string file_name;
+        page_id_t page_no = INVALID_PAGE_ID;
+
+        bool operator==(const PageKey &other) const {
+            return file_name == other.file_name && page_no == other.page_no;
+        }
+    };
+
+    struct PageKeyHash {
+        size_t operator()(const PageKey &key) const {
+            return std::hash<std::string>()(key.file_name) ^ (std::hash<page_id_t>()(key.page_no) << 1);
+        }
+    };
+
     size_t pool_size_;      // buffer_pool中可容纳页面的个数，即帧的个数
     Page *pages_;           // buffer_pool中的Page对象数组，在构造空间中申请内存空间，在析构函数中释放，大小为BUFFER_POOL_SIZE
-    std::unordered_map<PageId, frame_id_t, PageIdHash> page_table_; // 帧号和页面号的映射哈希表，用于根据页面的PageId定位该页面的帧编号
+    std::unordered_map<PageKey, frame_id_t, PageKeyHash> page_table_; // 帧号和页面号的映射哈希表，用于定位缓存页
     std::list<frame_id_t> free_list_;   // 空闲帧编号的链表
     DiskManager *disk_manager_;
     Replacer *replacer_;    // buffer_pool的置换策略，当前赛题中为LRU置换策略
     std::mutex latch_;      // 用于共享数据结构的并发控制
+    // cv_ 用于等待IO_IN_PROGRESS状态的页面被IO完成，变为READY状态
+    std::condition_variable cv_;
+    std::vector<FrameState> frame_states_;
+    std::vector<PageKey> frame_keys_;
 
    public:
     BufferPoolManager(size_t pool_size, DiskManager *disk_manager)
-        : pool_size_(pool_size), disk_manager_(disk_manager) {
+        : pool_size_(pool_size),
+          disk_manager_(disk_manager),
+          frame_states_(pool_size, FrameState::FREE),
+          frame_keys_(pool_size) {
         // 为buffer pool分配一块连续的内存空间
         pages_ = new Page[pool_size_];
         // 可以被Replacer改变
-        if (REPLACER_TYPE.compare("LRU"))
+        if (REPLACER_TYPE == "LRU")
             replacer_ = new LRUReplacer(pool_size_);
-        else if (REPLACER_TYPE.compare("CLOCK"))
+        else if (REPLACER_TYPE == "CLOCK")
             replacer_ = new LRUReplacer(pool_size_);
         else {
             replacer_ = new LRUReplacer(pool_size_);
@@ -80,4 +111,8 @@ class BufferPoolManager {
     bool find_victim_page(frame_id_t* frame_id);
 
     void update_page(Page* page, PageId new_page_id, frame_id_t new_frame_id);
+
+    PageKey make_page_key(PageId page_id);
+
+    void write_page_data(const PageKey &page_key, const char *data);
 };

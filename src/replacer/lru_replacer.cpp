@@ -60,9 +60,10 @@ void LRUReplacer::unpin(frame_id_t frame_id) {
     //  支持并发锁
     //  选择一个frame取消固定
     std::scoped_lock lock{latch_};
-    auto it = LRUhash_.find(frame_id);
-    if (it != LRUhash_.end()) {
-        LRUlist_.erase(it->second);
+
+    // If the frame is already in the replacer, don't change its LRU position.
+    if (LRUhash_.find(frame_id) != LRUhash_.end()) {
+        return;
     }
     LRUlist_.push_front(frame_id);
     LRUhash_[frame_id] = LRUlist_.begin();

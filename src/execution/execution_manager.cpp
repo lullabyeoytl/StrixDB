@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "execution_manager.h"
 
+#include "execution_common.h"
 #include "executor_delete.h"
 #include "executor_index_scan.h"
 #include "executor_insert.h"
@@ -168,28 +169,30 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
 
     // Print records
     size_t num_rec = 0;
+    
     // 执行query_plan
+   auto value_to_string = [](const Value &value) {
+        if (value.type == TYPE_INT) {
+            return std::to_string(value.int_val);
+        }
+        if (value.type == TYPE_FLOAT) {
+            return std::to_string(value.float_val);
+        }
+        if (value.type == TYPE_STRING) {
+            return value.str_val;
+        }
+        throw InternalError("Unexpected value type in select_from");
+    };
+
     for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
         auto Tuple = executorTreeRoot->Next();
         std::vector<std::string> columns;
         for (auto &col : executorTreeRoot->cols()) {
-            std::string col_str;
-            char *rec_buf = Tuple->data + col.offset;
-            if (col.type == TYPE_INT) {
-                col_str = std::to_string(*(int *)rec_buf);
-            } else if (col.type == TYPE_FLOAT) {
-                col_str = std::to_string(*(float *)rec_buf);
-            } else if (col.type == TYPE_STRING) {
-                col_str = std::string((char *)rec_buf, col.len);
-                col_str.resize(strlen(col_str.c_str()));
-            }
-            columns.push_back(col_str);
+            columns.push_back(value_to_string(get_col_value(*Tuple, col)));
         }
-        // print record into buffer
         rec_printer.print_record(columns, context);
-        // print record into file
         outfile << "|";
-        for(int i = 0; i < columns.size(); ++i) {
+        for (size_t i = 0; i < columns.size(); ++i) {
             outfile << " " << columns[i] << " |";
         }
         outfile << "\n";
