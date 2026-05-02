@@ -51,7 +51,26 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         get_clause(x->conds, query->conds);
         check_clause(all_cols, query->conds);
     } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(parse)) {
-        /** TODO: */
+        // 检查表是否存在
+        if (!sm_manager_->db_.is_table(x->tab_name)) {
+            throw TableNotFoundError(x->tab_name);
+        }
+        // 处理 SET 子句
+        for (auto &sv_set : x->set_clauses) {
+            SetClause set_clause;
+            set_clause.lhs = {.tab_name = std::string(), .col_name = sv_set->col_name};
+            set_clause.rhs = convert_sv_value(sv_set->val);
+            query->set_clauses.push_back(set_clause);
+        }
+        // 校验 SET 中的列存在性并推断表名
+        std::vector<ColMeta> upd_cols;
+        get_all_cols({x->tab_name}, upd_cols);
+        for (auto &set_clause : query->set_clauses) {
+            check_column(upd_cols, set_clause.lhs);
+        }
+        // 处理 WHERE 条件
+        get_clause(x->conds, query->conds);
+        check_clause(upd_cols, query->conds);
 
     } else if (auto x = std::dynamic_pointer_cast<ast::DeleteStmt>(parse)) {
         //处理where条件
