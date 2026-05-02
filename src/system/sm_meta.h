@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <algorithm>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <string>
@@ -45,6 +46,15 @@ struct IndexMeta {
     int col_tot_len;                // 索引字段长度总和
     int col_num;                    // 索引字段数量
     std::vector<ColMeta> cols;      // 索引包含的字段
+
+    // Copy index-column values from a record into a caller-owned key buffer
+    void build_key(char *key, const char *rec_data) const {
+        int offset = 0;
+        for (int i = 0; i < col_num; ++i) {
+            memcpy(key + offset, rec_data + cols[i].offset, cols[i].len);
+            offset += cols[i].len;
+        }
+    }
 
     friend std::ostream &operator<<(std::ostream &os, const IndexMeta &index) {
         os << index.tab_name << " " << index.col_tot_len << " " << index.col_num;

@@ -50,7 +50,11 @@ class SmManager {
 
     RmManager* get_rm_manager() { return rm_manager_; }  
 
-    IxManager* get_ix_manager() { return ix_manager_; }  
+    IxManager* get_ix_manager() { return ix_manager_; }
+
+    IxIndexHandle *get_ih(const std::string &tab_name, const std::vector<ColMeta> &cols) {
+        return ihs_.at(ix_manager_->get_index_name(tab_name, cols)).get();
+    }
 
     bool is_dir(const std::string& db_name);
 
