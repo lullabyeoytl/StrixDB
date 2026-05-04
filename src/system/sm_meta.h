@@ -46,6 +46,14 @@ struct IndexMeta {
     int col_tot_len;                // 索引字段长度总和
     int col_num;                    // 索引字段数量
     std::vector<ColMeta> cols;      // 索引包含的字段
+    bool unique;                    // 是否是唯一索引
+
+    std::vector<std::string> col_names() const {
+        std::vector<std::string> names;
+        names.reserve(cols.size());
+        for (auto &c : cols) names.push_back(c.name);
+        return names;
+    }
 
     // Copy index-column values from a record into a caller-owned key buffer
     void build_key(char *key, const char *rec_data) const {
@@ -57,7 +65,7 @@ struct IndexMeta {
     }
 
     friend std::ostream &operator<<(std::ostream &os, const IndexMeta &index) {
-        os << index.tab_name << " " << index.col_tot_len << " " << index.col_num;
+        os << index.tab_name << " " << index.col_tot_len << " " << index.col_num << " " << index.unique;
         for(auto& col: index.cols) {
             os << "\n" << col;
         }
@@ -65,7 +73,7 @@ struct IndexMeta {
     }
 
     friend std::istream &operator>>(std::istream &is, IndexMeta &index) {
-        is >> index.tab_name >> index.col_tot_len >> index.col_num;
+        is >> index.tab_name >> index.col_tot_len >> index.col_num >> index.unique;
         for(int i = 0; i < index.col_num; ++i) {
             ColMeta col;
             is >> col;

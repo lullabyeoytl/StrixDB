@@ -18,6 +18,10 @@ See the Mulan PSL v2 for more details. */
 
 class Context;
 
+// SM-layer column definition. Does NOT carry a `unique` flag — uniqueness is
+// represented separately via IndexSpec / DDLPlan::index_specs_. The parser layer
+// has its own ast::ColDef (in ast.h) which *does* carry a `bool unique` field
+// because it represents the user-facing syntax directly.
 struct ColDef {
     std::string name;  // Column name
     ColType type;      // Type of column
@@ -78,7 +82,12 @@ class SmManager {
 
     void create_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context);
 
+    void create_unique_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context);
+
     void drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context);
-    
+
     void drop_index(const std::string& tab_name, const std::vector<ColMeta>& col_names, Context* context);
+
+   private:
+    IxIndexHandle *open_and_build_index(const std::string& tab_name, const std::vector<ColMeta>& index_cols, bool unique);
 };
