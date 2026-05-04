@@ -339,6 +339,27 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle *old_node, const char *key, 
 page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transaction *transaction) {
     auto [leaf, _] = find_leaf_page(key, Operation::INSERT, transaction);
 
+    // Uniqueness check folded into the same traversal — no separate get_value() call.
+    if (file_hdr_->unique_) {
+        Rid *found = nullptr;
+        if (leaf->leaf_lookup(key, &found)) {
+            buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+            throw UniqueKeyViolationError();
+        }
+        // Also check the next leaf: B+tree routing may place the target just
+        // before the first key of the successor leaf.
+        page_id_t next_pid = leaf->get_next_leaf();
+        if (next_pid != IX_LEAF_HEADER_PAGE && next_pid != IX_NO_PAGE) {
+            auto next_leaf = fetch_node(next_pid);
+            if (next_leaf->leaf_lookup(key, &found)) {
+                buffer_pool_manager_->unpin_page(next_leaf->get_page_id(), false);
+                buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+                throw UniqueKeyViolationError();
+            }
+            buffer_pool_manager_->unpin_page(next_leaf->get_page_id(), false);
+        }
+    }
+
     // 先分裂再插入：如果节点已满，先分裂（避免 insert_pairs 写越界到 rids 区域）
     if (leaf->get_size() >= leaf->get_max_size()) {
         auto new_leaf = split(leaf.get());
@@ -883,4 +904,33 @@ void IxIndexHandle::maintain_child(IxNodeHandle *node, int child_idx) {
         child->set_parent_page_no(node->get_page_no());
         buffer_pool_manager_->unpin_page(child->get_page_id(), true);
     }
+}
+
+bool IxIndexHandle::has_duplicate_keys() const {
+    Iid iid = leaf_begin();
+    Iid end = leaf_end();
+    if (iid == end) return false;  // empty index
+
+    std::vector<char> prev_key(file_hdr_->col_tot_len_);
+    bool has_prev = false;
+
+    while (iid != end) {
+        auto node = fetch_node(iid.page_no);
+        while (iid.slot_no < node->get_size()) {
+            const char *key = node->get_key(iid.slot_no);
+            if (has_prev && memcmp(prev_key.data(), key, file_hdr_->col_tot_len_) == 0) {
+                buffer_pool_manager_->unpin_page(node->get_page_id(), false);
+                return true;
+            }
+            memcpy(prev_key.data(), key, file_hdr_->col_tot_len_);
+            has_prev = true;
+            iid.slot_no++;
+        }
+        page_id_t next_page = node->get_next_leaf();
+        buffer_pool_manager_->unpin_page(node->get_page_id(), false);
+        if (iid.page_no == file_hdr_->last_leaf_) break;
+        iid.page_no = next_page;
+        iid.slot_no = 0;
+    }
+    return false;
 }

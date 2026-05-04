@@ -37,22 +37,35 @@ public:
     page_id_t first_leaf_;              // 首叶节点对应的页号，在上层IxManager的open函数进行初始化，初始化为root page_no
     page_id_t last_leaf_;               // 尾叶节点对应的页号
     int tot_len_;                       // 记录结构体的整体长度
+    bool unique_;                       // 是否为唯一索引
 
     IxFileHdr() {
         tot_len_ = col_num_ = 0;
+        unique_ = false;
     }
 
     IxFileHdr(page_id_t first_free_page_no, int num_pages, page_id_t root_page, int col_num,
                 int col_tot_len, int btree_order, int keys_size, page_id_t first_leaf, page_id_t last_leaf)
                 : first_free_page_no_(first_free_page_no), num_pages_(num_pages), root_page_(root_page), col_num_(col_num),
-                col_tot_len_(col_tot_len), btree_order_(btree_order), keys_size_(keys_size), first_leaf_(first_leaf), last_leaf_(last_leaf) {
+                col_tot_len_(col_tot_len), btree_order_(btree_order), keys_size_(keys_size), first_leaf_(first_leaf), last_leaf_(last_leaf),
+                unique_(false) {
                     tot_len_ = 0;
-                } 
+                }
+
+    void set_unique(bool v) { unique_ = v; }
+    bool is_unique() const { return unique_; }
 
     void update_tot_len() {
-        tot_len_ = 0;
-        tot_len_ += sizeof(page_id_t) * 4 + sizeof(int) * 6;
-        tot_len_ += sizeof(ColType) * col_num_ + sizeof(int) * col_num_;
+        tot_len_ = sizeof(page_id_t) * 4 + sizeof(int) * 6;
+        if (col_num_ > 0) {
+            // Guard against integer overflow from crafted col_num_
+            if (col_num_ > 256) {
+                throw InternalError("Column count overflow in IxFileHdr");
+            }
+            tot_len_ += static_cast<int>(sizeof(ColType)) * col_num_
+                      + static_cast<int>(sizeof(int)) * col_num_;
+        }
+        tot_len_ += sizeof(bool);
     }
 
     void serialize(char* dest) {
@@ -85,6 +98,8 @@ public:
         offset += sizeof(page_id_t);
         memcpy(dest + offset, &last_leaf_, sizeof(page_id_t));
         offset += sizeof(page_id_t);
+        memcpy(dest + offset, &unique_, sizeof(bool));
+        offset += sizeof(bool);
         assert(offset == tot_len_);
     }
 
@@ -100,14 +115,18 @@ public:
         offset += sizeof(page_id_t);
         col_num_ = *reinterpret_cast<const int*>(src + offset);
         offset += sizeof(int);
+
+        // Validate col_num_ BEFORE any allocation to prevent OOM / negative bypass
+        if (col_num_ < 0 || col_num_ > 256) {
+            throw InternalError("IxFileHdr layout mismatch");
+        }
+
         for(int i = 0; i < col_num_; ++i) {
-            // col_types_[i] = *reinterpret_cast<const ColType*>(src + offset);
             ColType type = *reinterpret_cast<const ColType*>(src + offset);
             offset += sizeof(ColType);
             col_types_.push_back(type);
         }
         for(int i = 0; i < col_num_; ++i) {
-            // col_lens_[i] = *reinterpret_cast<const int*>(src + offset);
             int len = *reinterpret_cast<const int*>(src + offset);
             offset += sizeof(int);
             col_lens_.push_back(len);
@@ -122,6 +141,16 @@ public:
         offset += sizeof(page_id_t);
         last_leaf_ = *reinterpret_cast<const page_id_t*>(src + offset);
         offset += sizeof(page_id_t);
+        int expected_tot_len = sizeof(page_id_t) * 4 + sizeof(int) * 6 +
+                               static_cast<int>(sizeof(ColType)) * col_num_
+                             + static_cast<int>(sizeof(int)) * col_num_
+                             + sizeof(bool);
+
+        if (tot_len_ != expected_tot_len) {
+            throw InternalError("IxFileHdr layout mismatch");
+        }
+        unique_ = *reinterpret_cast<const bool*>(src + offset);
+        offset += sizeof(bool);
         assert(offset == tot_len_);
     }
 };

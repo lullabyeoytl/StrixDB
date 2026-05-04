@@ -211,6 +211,8 @@ class IxIndexHandle {
 
     Iid leaf_begin() const;
 
+    bool has_duplicate_keys() const;
+
    private:
     // 辅助函数
     void update_root_page_no(page_id_t root) { file_hdr_->root_page_ = root; }
