@@ -340,38 +340,6 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
     flush_meta();
 }
 
-IxIndexHandle *SmManager::open_and_build_index(const std::string& tab_name, const std::vector<ColMeta>& index_cols, bool unique) {
-    std::string ix_name = ix_manager_->get_index_name(tab_name, index_cols);
-    assert(ihs_.find(ix_name) == ihs_.end() && "index handle already open");
-    auto ih = ix_manager_->open_index(tab_name, index_cols);
-
-    IndexMeta index_meta;
-    index_meta.tab_name = tab_name;
-    index_meta.col_tot_len = 0;
-    for (auto &col : index_cols) {
-        index_meta.col_tot_len += col.len;
-        index_meta.cols.push_back(col);
-    }
-    index_meta.col_num = index_cols.size();
-    index_meta.unique = unique;
-
-    auto &tab = db_.get_table(tab_name);
-    tab.indexes.push_back(index_meta);
-
-    // Mark columns as indexed
-    for (auto &col : tab.cols) {
-        for (auto &index_col : index_cols) {
-            if (col.name == index_col.name) {
-                col.index = true;
-            }
-        }
-    }
-
-    auto *raw = ih.get();
-    ihs_.emplace(ix_name, std::move(ih));
-    return raw;
-}
-
 void SmManager::create_unique_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
     TabMeta &tab = db_.get_table(tab_name);
 
@@ -432,7 +400,7 @@ void SmManager::create_unique_index(const std::string& tab_name, const std::vect
     // Create the index file with unique flag set
     ix_manager_->create_index(tab_name, index_cols, /*unique=*/true);
 
-    // Open the index handle directly (not via open_and_build_index) so we can
+    // Open the index handle directly ,so we can
     // populate before registering metadata.  If population fails, the index
     // file is destroyed and no inconsistent state persists.
     std::string ix_name = ix_manager_->get_index_name(tab_name, index_cols);

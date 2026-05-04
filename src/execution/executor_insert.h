@@ -49,10 +49,25 @@ class InsertExecutor : public AbstractExecutor {
             val.init_raw(col.len);
             memcpy(rec.data + col.offset, val.raw->data, col.len);
         }
+        // Pre-check all unique indexes before mutating anything.
+        // This avoids dangling index entries when a table has multiple unique
+        // indexes and a later one fails after earlier ones already succeeded.
+        for (size_t i = 0; i < tab_.indexes.size(); ++i) {
+            auto &index = tab_.indexes[i];
+            if (!index.unique) continue;
+            auto ih = sm_manager_->get_ih(tab_name_, index.cols);
+            auto key = std::make_unique<char[]>(index.col_tot_len);
+            index.build_key(key.get(), rec.data);
+            std::vector<Rid> result;
+            if (ih->get_value(key.get(), &result, context_->txn_)) {
+                throw UniqueViolationError(tab_name_, index.col_names());
+            }
+        }
+
         // Insert into record file
         rid_ = fh_->insert_record(rec.data, context_);
-        
-        // Insert into index
+
+        // Insert into index (uniqueness already pre-checked above)
         for (size_t i = 0; i < tab_.indexes.size(); ++i) {
             auto &index = tab_.indexes[i];
             auto ih = sm_manager_->get_ih(tab_name_, index.cols);

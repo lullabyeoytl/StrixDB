@@ -87,7 +87,4 @@ class SmManager {
     void drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context);
 
     void drop_index(const std::string& tab_name, const std::vector<ColMeta>& col_names, Context* context);
-
-   private:
-    IxIndexHandle *open_and_build_index(const std::string& tab_name, const std::vector<ColMeta>& index_cols, bool unique);
 };

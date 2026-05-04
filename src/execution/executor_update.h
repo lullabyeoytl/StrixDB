@@ -15,6 +15,10 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "system/sm.h"
 #include <cstddef>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 class UpdateExecutor : public AbstractExecutor {
    private:
@@ -61,30 +65,94 @@ class UpdateExecutor : public AbstractExecutor {
             index_handles.push_back(sm_manager_->get_ih(tab_name_, tab_.indexes[i].cols));
         }
 
-        for (auto &rid : rids_) {
-            auto rec = fh_->get_record(rid, context_);
+        struct UpdateCandidate {
+            Rid rid;
+            std::unique_ptr<RmRecord> old_rec;
+            std::unique_ptr<RmRecord> new_rec;
+        };
 
-            RmRecord new_rec(record_size);
-            memcpy(new_rec.data, rec->data, record_size);
+        std::vector<UpdateCandidate> candidates;
+        candidates.reserve(rids_.size());
+        for (auto &rid : rids_) {
+            auto old_rec = fh_->get_record(rid, context_);
+            auto new_rec = std::make_unique<RmRecord>(record_size);
+            memcpy(new_rec->data, old_rec->data, record_size);
             for (size_t i = 0; i < set_clauses_.size(); ++i) {
                 auto &col = *set_cols[i];
-                memcpy(new_rec.data + col.offset, set_clauses_[i].rhs.raw->data, col.len);
+                memcpy(new_rec->data + col.offset, set_clauses_[i].rhs.raw->data, col.len);
+            }
+            candidates.push_back(UpdateCandidate{rid, std::move(old_rec), std::move(new_rec)});
+        }
+
+        // Pre-check all unique indexes before mutating any row.
+        for (size_t i = 0; i < tab_.indexes.size(); ++i) {
+            auto &index = tab_.indexes[i];
+            if (!index.unique) {
+                continue;
             }
 
+            std::vector<std::pair<std::string, Rid>> seen_new_keys;
+            for (auto &candidate : candidates) {
+                auto new_key = std::make_unique<char[]>(index.col_tot_len);
+                index.build_key(new_key.get(), candidate.new_rec->data);
+                std::string key_bytes(new_key.get(), index.col_tot_len);
+
+                for (auto &seen : seen_new_keys) {
+                    if (seen.first == key_bytes &&
+                        (seen.second.page_no != candidate.rid.page_no ||
+                         seen.second.slot_no != candidate.rid.slot_no)) {
+                        throw UniqueViolationError(tab_name_, index.col_names());
+                    }
+                }
+                seen_new_keys.push_back({std::move(key_bytes), candidate.rid});
+
+                std::vector<Rid> result;
+                if (index_handles[i]->get_value(new_key.get(), &result, context_->txn_)) {
+                    for (auto &r : result) {
+                        // Self-hit: same row, key unchanged → OK
+                        if (r.page_no == candidate.rid.page_no &&
+                            r.slot_no == candidate.rid.slot_no) {
+                            auto old_k = std::make_unique<char[]>(index.col_tot_len);
+                            index.build_key(old_k.get(), candidate.old_rec->data);
+                            if (memcmp(old_k.get(), new_key.get(), index.col_tot_len) == 0) {
+                                continue;  // self-hit, no-op
+                            }
+                        }
+                        // Swap: entry belongs to a sibling candidate vacating this key → OK
+                        bool vacated = false;
+                        for (auto &other : candidates) {
+                            if (other.rid.page_no == r.page_no &&
+                                other.rid.slot_no == r.slot_no) {
+                                auto other_new_key = std::make_unique<char[]>(index.col_tot_len);
+                                index.build_key(other_new_key.get(), other.new_rec->data);
+                                if (memcmp(other_new_key.get(), new_key.get(), index.col_tot_len) != 0) {
+                                    vacated = true;
+                                }
+                                break;
+                            }
+                        }
+                        if (vacated) continue;
+                        throw UniqueViolationError(tab_name_, index.col_names());
+                    }
+                }
+            }
+        }
+
+        for (auto &candidate : candidates) {
             for (size_t i = 0; i < tab_.indexes.size(); ++i) {
                 auto &index = tab_.indexes[i];
                 auto old_key = std::make_unique<char[]>(index.col_tot_len);
-                index.build_key(old_key.get(), rec->data);
-                index_handles[i]->delete_entry(old_key.get(), rid, context_->txn_);
+                index.build_key(old_key.get(), candidate.old_rec->data);
+                index_handles[i]->delete_entry(old_key.get(), candidate.rid, context_->txn_);
             }
 
-            fh_->update_record(rid, new_rec.data, context_);
+            fh_->update_record(candidate.rid, candidate.new_rec->data, context_);
 
             for (size_t i = 0; i < tab_.indexes.size(); ++i) {
                 auto &index = tab_.indexes[i];
                 auto new_key = std::make_unique<char[]>(index.col_tot_len);
-                index.build_key(new_key.get(), new_rec.data);
-                index_handles[i]->insert_entry(new_key.get(), rid, context_->txn_);
+                index.build_key(new_key.get(), candidate.new_rec->data);
+                index_handles[i]->insert_entry(new_key.get(), candidate.rid, context_->txn_);
             }
         }
         return nullptr;

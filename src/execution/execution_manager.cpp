@@ -24,9 +24,9 @@ See the Mulan PSL v2 for more details. */
 const char *help_info = "Supported SQL syntax:\n"
                    "  command ;\n"
                    "command:\n"
-                   "  CREATE TABLE table_name (column_name type [, column_name type ...])\n"
+                   "  CREATE TABLE table_name (column_name type [UNIQUE] [, column_name type [UNIQUE] ...] [, UNIQUE (column_name [, ...])])\n"
                    "  DROP TABLE table_name\n"
-                   "  CREATE INDEX table_name (column_name)\n"
+                   "  CREATE [UNIQUE] INDEX table_name (column_name)\n"
                    "  DROP INDEX table_name (column_name)\n"
                    "  INSERT INTO table_name VALUES (value [, value ...])\n"
                    "  DELETE FROM table_name [WHERE where_clause]\n"
@@ -52,6 +52,13 @@ void QlManager::run_mutli_query(std::shared_ptr<Plan> plan, Context *context){
             case T_CreateTable:
             {
                 sm_manager_->create_table(x->tab_name_, x->cols_, context);
+                for (auto &spec : x->index_specs_) {
+                    if (spec.unique) {
+                        sm_manager_->create_unique_index(x->tab_name_, spec.cols, context);
+                    } else {
+                        sm_manager_->create_index(x->tab_name_, spec.cols, context);
+                    }
+                }
                 break;
             }
             case T_DropTable:
@@ -61,7 +68,11 @@ void QlManager::run_mutli_query(std::shared_ptr<Plan> plan, Context *context){
             }
             case T_CreateIndex:
             {
-                sm_manager_->create_index(x->tab_name_, x->tab_col_names_, context);
+                if (x->unique_) {
+                    sm_manager_->create_unique_index(x->tab_name_, x->tab_col_names_, context);
+                } else {
+                    sm_manager_->create_index(x->tab_name_, x->tab_col_names_, context);
+                }
                 break;
             }
             case T_DropIndex:

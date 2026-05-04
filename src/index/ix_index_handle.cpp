@@ -910,6 +910,7 @@ bool IxIndexHandle::has_duplicate_keys() const {
     Iid iid = leaf_begin();
     Iid end = leaf_end();
     if (iid == end) return false;  // empty index
+    if (file_hdr_->col_tot_len_ <= 0) return false;  // invalid key length, treat as no duplicates
 
     std::vector<char> prev_key(file_hdr_->col_tot_len_);
     bool has_prev = false;
