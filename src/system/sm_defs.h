@@ -11,3 +11,9 @@ See the Mulan PSL v2 for more details. */
 
 #include "defs.h"
 #include <string>
+#include <vector>
+
+struct IndexSpec {
+    std::vector<std::string> cols;
+    bool unique;
+};
