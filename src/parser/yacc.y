@@ -22,7 +22,7 @@ using namespace ast;
 
 // keywords
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
-WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
+WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX UNIQUE AND JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
 
@@ -133,7 +133,11 @@ ddl:
     }
     |   CREATE INDEX tbName '(' colNameList ')'
     {
-        $$ = std::make_shared<CreateIndex>($3, $5);
+        $$ = std::make_shared<CreateIndex>($3, $5, false);
+    }
+    |   CREATE UNIQUE INDEX tbName '(' colNameList ')'
+    {
+        $$ = std::make_shared<CreateIndex>($4, $6, true);
     }
     |   DROP INDEX tbName '(' colNameList ')'
     {
@@ -185,7 +189,15 @@ colNameList:
 field:
         colName type
     {
-        $$ = std::make_shared<ColDef>($1, $2);
+        $$ = std::make_shared<ColDef>($1, $2, false);
+    }
+    |   colName type UNIQUE
+    {
+        $$ = std::make_shared<ColDef>($1, $2, true);
+    }
+    |   UNIQUE '(' colNameList ')'
+    {
+        $$ = std::make_shared<UniqueDef>($3);
     }
     ;
 

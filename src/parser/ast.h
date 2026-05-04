@@ -72,9 +72,16 @@ struct Field : public TreeNode {
 struct ColDef : public Field {
     std::string col_name;
     std::shared_ptr<TypeLen> type_len;
+    bool unique;
 
-    ColDef(std::string col_name_, std::shared_ptr<TypeLen> type_len_) :
-            col_name(std::move(col_name_)), type_len(std::move(type_len_)) {}
+    ColDef(std::string col_name_, std::shared_ptr<TypeLen> type_len_, bool unique_ = false) :
+            col_name(std::move(col_name_)), type_len(std::move(type_len_)), unique(unique_) {}
+};
+
+struct UniqueDef : public Field {
+    std::vector<std::string> col_names;
+
+    explicit UniqueDef(std::vector<std::string> col_names_) : col_names(std::move(col_names_)) {}
 };
 
 struct CreateTable : public TreeNode {
@@ -100,9 +107,10 @@ struct DescTable : public TreeNode {
 struct CreateIndex : public TreeNode {
     std::string tab_name;
     std::vector<std::string> col_names;
+    bool unique;
 
-    CreateIndex(std::string tab_name_, std::vector<std::string> col_names_) :
-            tab_name(std::move(tab_name_)), col_names(std::move(col_names_)) {}
+    CreateIndex(std::string tab_name_, std::vector<std::string> col_names_, bool unique_ = false) :
+            tab_name(std::move(tab_name_)), col_names(std::move(col_names_)), unique(unique_) {}
 };
 
 struct DropIndex : public TreeNode {

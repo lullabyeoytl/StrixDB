@@ -13,7 +13,11 @@
 %{
 #include "ast.h"
 #include "yacc.tab.h"
+#include "errors.h"
 #include <iostream>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
 
 // automatically update location
 #define YY_USER_ACTION \
@@ -78,6 +82,7 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "CHAR" { return CHAR; }
 "FLOAT" { return FLOAT; }
 "INDEX" { return INDEX; }
+"UNIQUE" { return UNIQUE; }
 "AND" { return AND; }
 "JOIN" {return JOIN;}
 "EXIT" { return EXIT; }
@@ -107,11 +112,21 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 }
     /* literals */
 {value_int} {
-    yylval->sv_int = atoi(yytext);
+    errno = 0;
+    long val = strtol(yytext, nullptr, 10);
+    if (errno == ERANGE || val > INT_MAX || val < INT_MIN) {
+        throw RMDBError("Integer literal out of range");
+    }
+    yylval->sv_int = static_cast<int>(val);
     return VALUE_INT;
 }
 {value_float} {
-    yylval->sv_float = atof(yytext);
+    errno = 0;
+    double val = strtod(yytext, nullptr);
+    if (errno == ERANGE) {
+        throw RMDBError("Float literal out of range");
+    }
+    yylval->sv_float = static_cast<float>(val);
     return VALUE_FLOAT;
 }
 {value_string} {
