@@ -15,6 +15,17 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include <vector>
 
+static inline std::string format_index_msg(const std::string &prefix, const std::string &tab_name,
+                                          const std::vector<std::string> &col_names) {
+    std::string result = prefix + tab_name + ".(";
+    for (size_t i = 0; i < col_names.size(); ++i) {
+        if (i > 0) result += ", ";
+        result += col_names[i];
+    }
+    result += ")";
+    return result;
+}
+
 class RMDBError : public std::exception {
    public:
     RMDBError() : _msg("Error: ") {}
@@ -82,6 +93,13 @@ class IndexEntryNotFoundError : public RMDBError {
     IndexEntryNotFoundError() : RMDBError("Index entry not found") {}
 };
 
+// Thrown by the B+tree layer when a unique constraint is violated.
+// Caught by executors and re-wrapped as UniqueViolationError with table context.
+class UniqueKeyViolationError : public RMDBError {
+   public:
+    UniqueKeyViolationError() : RMDBError("Unique index duplicate key") {}
+};
+
 // SM errors
 class DatabaseNotFoundError : public RMDBError {
    public:
@@ -115,26 +133,20 @@ class ColumnNotFoundError : public RMDBError {
 
 class IndexNotFoundError : public RMDBError {
    public:
-    IndexNotFoundError(const std::string &tab_name, const std::vector<std::string> &col_names) {
-        _msg += "Index not found: " + tab_name + ".(";
-        for(size_t i = 0; i < col_names.size(); ++i) {
-            if(i > 0) _msg += ", ";
-            _msg += col_names[i];
-        }
-        _msg += ")";
-    }
+    IndexNotFoundError(const std::string &tab_name, const std::vector<std::string> &col_names)
+        : RMDBError(format_index_msg("Index not found: ", tab_name, col_names)) {}
+};
+
+class UniqueViolationError : public RMDBError {
+   public:
+    UniqueViolationError(const std::string &tab_name, const std::vector<std::string> &col_names)
+        : RMDBError(format_index_msg("Unique violation on index ", tab_name, col_names)) {}
 };
 
 class IndexExistsError : public RMDBError {
    public:
-    IndexExistsError(const std::string &tab_name, const std::vector<std::string> &col_names) {
-        _msg += "Index already exists: " + tab_name + ".(";
-        for(size_t i = 0; i < col_names.size(); ++i) {
-            if(i > 0) _msg += ", ";
-            _msg += col_names[i];
-        }
-        _msg += ")";
-    }
+    IndexExistsError(const std::string &tab_name, const std::vector<std::string> &col_names)
+        : RMDBError(format_index_msg("Index already exists: ", tab_name, col_names)) {}
 };
 
 // QL errors
