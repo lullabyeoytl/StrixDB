@@ -76,6 +76,8 @@ class SmManager {
 
     void desc_table(const std::string& tab_name, Context* context);
 
+    void show_index(const std::string& tab_name, Context* context);
+
     void create_table(const std::string& tab_name, const std::vector<ColDef>& col_defs, Context* context);
 
     void drop_table(const std::string& tab_name, Context* context);

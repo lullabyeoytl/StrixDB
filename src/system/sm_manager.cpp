@@ -166,6 +166,41 @@ void SmManager::show_tables(Context* context) {
     outfile.close();
 }
 
+void SmManager::show_index(const std::string& tab_name, Context* context) {
+    if (!db_.is_table(tab_name)) {
+        throw TableNotFoundError(tab_name);
+    }
+    TabMeta &tab = db_.get_table(tab_name);
+
+    std::vector<std::string> captions = {"Index", "Columns", "Unique"};
+    RecordPrinter printer(captions.size());
+
+    printer.print_separator(context);
+    printer.print_record(captions, context);
+    printer.print_separator(context);
+
+    std::fstream outfile;
+    outfile.open("output.txt", std::ios::out | std::ios::app);
+    outfile << "| Index | Columns | Unique |\n";
+
+    for (auto &index : tab.indexes) {
+        std::string ix_name = ix_manager_->get_index_name(tab_name, index.cols);
+        std::string cols;
+        for (size_t i = 0; i < index.cols.size(); ++i) {
+            if (i != 0) {
+                cols += ",";
+            }
+            cols += index.cols[i].name;
+        }
+        std::string unique = index.unique ? "YES" : "NO";
+        printer.print_record({ix_name, cols, unique}, context);
+        outfile << "| " << ix_name << " | " << cols << " | " << unique << " |\n";
+    }
+
+    printer.print_separator(context);
+    outfile.close();
+}
+
 /**
  * @description: 显示表的元数据
  * @param {string&} tab_name 表名称

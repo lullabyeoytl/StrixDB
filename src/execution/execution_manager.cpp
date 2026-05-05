@@ -27,6 +27,7 @@ const char *help_info = "Supported SQL syntax:\n"
                    "  CREATE TABLE table_name (column_name type [UNIQUE] [, column_name type [UNIQUE] ...] [, UNIQUE (column_name [, ...])])\n"
                    "  DROP TABLE table_name\n"
                    "  CREATE [UNIQUE] INDEX table_name (column_name)\n"
+                   "  SHOW INDEX FROM table_name\n"
                    "  DROP INDEX table_name (column_name)\n"
                    "  INSERT INTO table_name VALUES (value [, value ...])\n"
                    "  DELETE FROM table_name [WHERE where_clause]\n"
@@ -100,6 +101,11 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
             case T_ShowTable:
             {
                 sm_manager_->show_tables(context);
+                break;
+            }
+            case T_ShowIndex:
+            {
+                sm_manager_->show_index(x->tab_name_, context);
                 break;
             }
             case T_DescTable:
