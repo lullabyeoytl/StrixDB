@@ -116,7 +116,9 @@ class IxNodeHandle {
 
     void insert_pairs(int pos, const char *key, const Rid *rid, int n);
 
-    page_id_t internal_lookup(const char *key);
+    page_id_t internal_lookup_ub(const char *key);
+    
+    page_id_t internal_lookup_lb(const char *key);
 
     bool leaf_lookup(const char *key, Rid **value);
 
