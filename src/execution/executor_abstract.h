@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include "execution_defs.h"
+#include "execution_common.h"
 #include "common/common.h"
 #include "index/ix.h"
 #include "system/sm.h"
@@ -45,9 +46,8 @@ class AbstractExecutor {
     virtual ColMeta get_col_offset(const TabCol &target) { return ColMeta();};
 
     std::vector<ColMeta>::const_iterator get_col(const std::vector<ColMeta> &rec_cols, const TabCol &target) {
-        auto pos = std::find_if(rec_cols.begin(), rec_cols.end(), [&](const ColMeta &col) {
-            return col.tab_name == target.tab_name && col.name == target.col_name;
-        });
+        auto pos = std::find_if(rec_cols.begin(), rec_cols.end(),
+                                [&](const ColMeta &col) { return col_meta_matches(col, target); });
         if (pos == rec_cols.end()) {
             throw ColumnNotFoundError(target.tab_name + '.' + target.col_name);
         }

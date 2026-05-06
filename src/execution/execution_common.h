@@ -24,10 +24,13 @@ auto ReconstructTuple(const TabMeta *schema, const RmRecord &base_tuple, const T
 
 auto IsWriteWriteConflict(timestamp_t tuple_ts, Transaction *txn) -> bool;
 
+inline bool col_meta_matches(const ColMeta &col, const TabCol &target) {
+    return col.tab_name == target.tab_name && col.name == target.col_name;
+}
+
 inline auto find_col_meta(const std::vector<ColMeta> &cols, const TabCol &target) -> const ColMeta & {
-    auto it = std::find_if(cols.begin(), cols.end(), [&](const ColMeta &col) {
-        return col.tab_name == target.tab_name && col.name == target.col_name;
-    });
+    auto it = std::find_if(cols.begin(), cols.end(),
+                           [&](const ColMeta &col) { return col_meta_matches(col, target); });
     if (it == cols.end()) {
         throw InternalError("Analyze guaranteed column existence before execution");
     }
