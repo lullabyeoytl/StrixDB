@@ -90,6 +90,13 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "ORDER" { return ORDER; }
 "BY" {  return BY;  }
 "ASC" { return ASC; }
+"COUNT" { return COUNT; }
+"SUM" { return SUM; }
+"AVG" { return AVG; }
+"MIN" { return MIN; }
+"MAX" { return MAX; }
+"GROUP" { return GROUP; }
+"HAVING" { return HAVING; }
 "ENABLE_NESTLOOP" { return ENABLE_NESTLOOP; }
 "ENABLE_SORTMERGE" { return ENABLE_SORTMERGE; }
 "TRUE" { 

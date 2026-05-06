@@ -10,8 +10,10 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -26,6 +28,18 @@ struct TabCol {
     friend bool operator<(const TabCol &x, const TabCol &y) {
         return std::make_pair(x.tab_name, x.col_name) < std::make_pair(y.tab_name, y.col_name);
     }
+};
+
+inline bool same_col(const TabCol &lhs, const TabCol &rhs) {
+    return lhs.tab_name == rhs.tab_name && lhs.col_name == rhs.col_name;
+}
+
+inline bool contains_col(const std::vector<TabCol> &cols, const TabCol &target) {
+    return std::any_of(cols.begin(), cols.end(), [&](const TabCol &col) { return same_col(col, target); });
+}
+
+enum AggType {
+    AGG_COUNT, AGG_SUM, AGG_AVG, AGG_MIN, AGG_MAX
 };
 
 struct Value {
@@ -52,7 +66,7 @@ struct Value {
         type = TYPE_STRING;
         str_val = std::move(str_val_);
     }
-
+    
     void init_raw(int len) {
         assert(raw == nullptr);
         raw = std::make_shared<RmRecord>(len);
@@ -86,3 +100,31 @@ struct SetClause {
     TabCol lhs;
     Value rhs;
 };
+
+struct AggInfo {
+    AggType agg_type;
+    bool is_star;
+    TabCol col;
+};
+
+struct HavingCond {
+    bool is_agg;
+    AggInfo agg;
+    TabCol col;
+    CompOp op;
+    Value rhs_val;
+};
+
+inline std::string agg_output_name(const AggInfo &agg) {
+    static const std::map<AggType, std::string> names = {
+        {AGG_COUNT, "count"},
+        {AGG_SUM, "sum"},
+        {AGG_AVG, "avg"},
+        {AGG_MIN, "min"},
+        {AGG_MAX, "max"},
+    };
+    if (agg.is_star) {
+        return names.at(agg.agg_type) + "(*)";
+    }
+    return names.at(agg.agg_type) + "(" + agg.col.col_name + ")";
+}

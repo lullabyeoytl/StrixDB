@@ -23,6 +23,7 @@ using namespace ast;
 // keywords
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
 WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX UNIQUE AND JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
+%token COUNT SUM AVG MIN MAX GROUP HAVING
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
 
@@ -39,18 +40,23 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX UNIQUE AND JOIN EXIT HELP TXN_BEGIN
 %type <sv_type_len> type
 %type <sv_comp_op> op
 %type <sv_expr> expr
+%type <sv_exprs> exprList selector
+%type <sv_agg_func> agg_func
 %type <sv_val> value
 %type <sv_vals> valueList
 %type <sv_str> tbName colName
 %type <sv_strs> tableList colNameList
 %type <sv_col> col
-%type <sv_cols> colList selector
+%type <sv_cols> colList
 %type <sv_set_clause> setClause
 %type <sv_set_clauses> setClauses
 %type <sv_cond> condition
 %type <sv_conds> whereClause optWhereClause
 %type <sv_orderby>  order_clause opt_order_clause
 %type <sv_orderby_dir> opt_asc_desc
+%type <sv_group_by> opt_group_clause
+%type <sv_having_cond> having_cond
+%type <sv_having_conds> havingCondList opt_having_clause
 %type <sv_setKnobType> set_knob_type
 
 %%
@@ -158,9 +164,9 @@ dml:
     {
         $$ = std::make_shared<UpdateStmt>($2, $4, $5);
     }
-    |   SELECT selector FROM tableList optWhereClause opt_order_clause
+    |   SELECT selector FROM tableList optWhereClause opt_group_clause opt_having_clause opt_order_clause
     {
-        $$ = std::make_shared<SelectStmt>($2, $4, $5, $6);
+        $$ = std::make_shared<SelectStmt>($2, $4, $5, $8, $6, $7);
     }
     ;
 
@@ -219,7 +225,7 @@ type:
 valueList:
         value
     {
-        $$ = std::vector<std::shared_ptr<Value>>{$1};
+        $$ = std::vector<std::shared_ptr<ast::Value>>{$1};
     }
     |   valueList ',' value
     {
@@ -330,12 +336,63 @@ expr:
     {
         $$ = std::static_pointer_cast<Expr>($1);
     }
+    |   agg_func
+    {
+        $$ = std::static_pointer_cast<Expr>($1);
+    }
+    ;
+
+agg_func:
+        COUNT '(' '*' ')'
+    {
+        $$ = std::make_shared<AggFunc>(AGG_COUNT, true, nullptr);
+    }
+    |   COUNT '(' col ')'
+    {
+        $$ = std::make_shared<AggFunc>(AGG_COUNT, false, $3);
+    }
+    |   SUM '(' col ')'
+    {
+        $$ = std::make_shared<AggFunc>(AGG_SUM, false, $3);
+    }
+    |   AVG '(' col ')'
+    {
+        $$ = std::make_shared<AggFunc>(AGG_AVG, false, $3);
+    }
+    |   MIN '(' col ')'
+    {
+        $$ = std::make_shared<AggFunc>(AGG_MIN, false, $3);
+    }
+    |   MAX '(' col ')'
+    {
+        $$ = std::make_shared<AggFunc>(AGG_MAX, false, $3);
+    }
+    |   SUM '(' '*' ')'
+    {
+        yyerror(&@1, "SUM(*) is not supported");
+        YYERROR;
+    }
+    |   AVG '(' '*' ')'
+    {
+        yyerror(&@1, "AVG(*) is not supported");
+        YYERROR;
+    }
+    |   MIN '(' '*' ')'
+    {
+        yyerror(&@1, "MIN(*) is not supported");
+        YYERROR;
+    }
+    |   MAX '(' '*' ')'
+    {
+        yyerror(&@1, "MAX(*) is not supported");
+        YYERROR;
+    }
     ;
 
 setClauses:
         setClause
     {
-        $$ = std::vector<std::shared_ptr<SetClause>>{$1};
+        $$ = std::vector<std::shared_ptr<ast::SetClause>>{$1};
     }
     |   setClauses ',' setClause
     {
@@ -346,7 +403,7 @@ setClauses:
 setClause:
         colName '=' value
     {
-        $$ = std::make_shared<SetClause>($1, $3);
+        $$ = std::make_shared<ast::SetClause>($1, $3);
     }
     ;
 
@@ -355,7 +412,62 @@ selector:
     {
         $$ = {};
     }
-    |   colList
+    |   exprList
+    ;
+
+exprList:
+        expr
+    {
+        $$ = std::vector<std::shared_ptr<Expr>>{$1};
+    }
+    |   exprList ',' expr
+    {
+        $$.push_back($3);
+    }
+    ;
+
+opt_group_clause:
+        GROUP BY colList
+    {
+        $$ = std::make_shared<GroupBy>($3);
+    }
+    |   /* epsilon */
+    {
+        $$ = nullptr;
+    }
+    ;
+
+opt_having_clause:
+        HAVING havingCondList
+    {
+        $$ = $2;
+    }
+    |   /* epsilon */
+    {
+        $$ = {};
+    }
+    ;
+
+havingCondList:
+        having_cond
+    {
+        $$ = std::vector<std::shared_ptr<ast::HavingCond>>{$1};
+    }
+    |   havingCondList AND having_cond
+    {
+        $$.push_back($3);
+    }
+    ;
+
+having_cond:
+        agg_func op value
+    {
+        $$ = std::make_shared<ast::HavingCond>(true, $1, nullptr, $2, std::static_pointer_cast<Expr>($3));
+    }
+    |   col op value
+    {
+        $$ = std::make_shared<ast::HavingCond>(false, nullptr, $1, $2, std::static_pointer_cast<Expr>($3));
+    }
     ;
 
 tableList:

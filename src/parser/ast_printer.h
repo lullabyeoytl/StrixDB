@@ -62,6 +62,26 @@ private:
         return m.at(op);
     }
 
+    static std::string agg2str(AggType type) {
+        static std::map<AggType, std::string> m{
+                {AGG_COUNT, "COUNT"},
+                {AGG_SUM,   "SUM"},
+                {AGG_AVG,   "AVG"},
+                {AGG_MIN,   "MIN"},
+                {AGG_MAX,   "MAX"},
+        };
+        return m.at(type);
+    }
+
+    static std::string orderby2str(OrderByDir dir) {
+        static std::map<OrderByDir, std::string> m{
+                {OrderBy_DEFAULT, "DEFAULT"},
+                {OrderBy_ASC,     "ASC"},
+                {OrderBy_DESC,    "DESC"},
+        };
+        return m.at(dir);
+    }
+
     template<typename T>
     static void print_node_list(std::vector<T> nodes, int offset) {
         std::cout << offset2string(offset);
@@ -115,6 +135,26 @@ private:
             std::cout << "COL\n";
             print_val(x->tab_name, offset);
             print_val(x->col_name, offset);
+        } else if (auto x = std::dynamic_pointer_cast<AggFunc>(node)) {
+            std::cout << "AGG_FUNC\n";
+            print_val(agg2str(x->agg_type), offset);
+            if (x->is_star) {
+                print_val("*", offset);
+            } else {
+                print_node(x->col, offset);
+            }
+        } else if (auto x = std::dynamic_pointer_cast<GroupBy>(node)) {
+            std::cout << "GROUP_BY\n";
+            print_node_list(x->cols, offset);
+        } else if (auto x = std::dynamic_pointer_cast<HavingCond>(node)) {
+            std::cout << "HAVING_COND\n";
+            print_node(x->is_agg ? std::static_pointer_cast<TreeNode>(x->agg) : std::static_pointer_cast<TreeNode>(x->col), offset);
+            print_val(op2str(x->op), offset);
+            print_node(x->rhs, offset);
+        } else if (auto x = std::dynamic_pointer_cast<OrderBy>(node)) {
+            std::cout << "ORDER_BY\n";
+            print_node(x->cols, offset);
+            print_val(orderby2str(x->orderby_dir), offset);
         } else if (auto x = std::dynamic_pointer_cast<TypeLen>(node)) {
             std::cout << "TYPE_LEN\n";
             print_val(type2str(x->type), offset);
@@ -155,6 +195,15 @@ private:
             print_node_list(x->cols, offset);
             print_val_list(x->tabs, offset);
             print_node_list(x->conds, offset);
+            if (x->has_group_by) {
+                print_node(x->group_by, offset);
+            }
+            if (x->has_having) {
+                print_node_list(x->having_conds, offset);
+            }
+            if (x->has_sort) {
+                print_node(x->order, offset);
+            }
         } else if (auto x = std::dynamic_pointer_cast<TxnBegin>(node)) {
             std::cout << "BEGIN\n";
         } else if (auto x = std::dynamic_pointer_cast<TxnCommit>(node)) {

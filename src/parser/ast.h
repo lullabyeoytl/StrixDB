@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #include <vector>
 #include <string>
 #include <memory>
+#include "common/common.h"
 
 enum JoinType {
     INNER_JOIN, LEFT_JOIN, RIGHT_JOIN, FULL_JOIN
@@ -127,6 +128,8 @@ struct Expr : public TreeNode {
 struct Value : public Expr {
 };
 
+struct Col;
+
 struct IntLit : public Value {
     int val;
 
@@ -151,6 +154,15 @@ struct BoolLit : public Value {
     BoolLit(bool val_) : val(val_) {}
 };
 
+struct AggFunc : public Expr {
+    AggType agg_type;
+    bool is_star;
+    std::shared_ptr<Col> col;
+
+    AggFunc(AggType agg_type_, bool is_star_, std::shared_ptr<Col> col_) :
+            agg_type(agg_type_), is_star(is_star_), col(std::move(col_)) {}
+};
+
 struct Col : public Expr {
     std::string tab_name;
     std::string col_name;
@@ -158,6 +170,7 @@ struct Col : public Expr {
     Col(std::string tab_name_, std::string col_name_) :
             tab_name(std::move(tab_name_)), col_name(std::move(col_name_)) {}
 };
+
 
 struct SetClause : public TreeNode {
     std::string col_name;
@@ -174,6 +187,23 @@ struct BinaryExpr : public TreeNode {
 
     BinaryExpr(std::shared_ptr<Col> lhs_, SvCompOp op_, std::shared_ptr<Expr> rhs_) :
             lhs(std::move(lhs_)), op(op_), rhs(std::move(rhs_)) {}
+};
+
+struct GroupBy : public TreeNode {
+    std::vector<std::shared_ptr<Col>> cols;
+
+    GroupBy(std::vector<std::shared_ptr<Col>> cols_) : cols(std::move(cols_)) {}
+};
+
+struct HavingCond : public TreeNode {
+    bool is_agg;
+    std::shared_ptr<AggFunc> agg;
+    std::shared_ptr<Col> col;
+    SvCompOp op;
+    std::shared_ptr<Expr> rhs;
+
+    HavingCond(bool is_agg_, std::shared_ptr<AggFunc> agg_, std::shared_ptr<Col> col_, SvCompOp op_, std::shared_ptr<Expr> rhs_) :
+            is_agg(is_agg_), agg(std::move(agg_)), col(std::move(col_)), op(op_), rhs(std::move(rhs_)) {}
 };
 
 struct OrderBy : public TreeNode
@@ -223,7 +253,7 @@ struct JoinExpr : public TreeNode {
 };
 
 struct SelectStmt : public TreeNode {
-    std::vector<std::shared_ptr<Col>> cols;
+    std::vector<std::shared_ptr<Expr>> cols;
     std::vector<std::string> tabs;
     std::vector<std::shared_ptr<BinaryExpr>> conds;
     std::vector<std::shared_ptr<JoinExpr>> jointree;
@@ -231,15 +261,24 @@ struct SelectStmt : public TreeNode {
     
     bool has_sort;
     std::shared_ptr<OrderBy> order;
+    
+    bool has_group_by;
+    std::shared_ptr<GroupBy> group_by;
+    
+    bool has_having;
+    std::vector<std::shared_ptr<HavingCond>> having_conds;
 
-
-    SelectStmt(std::vector<std::shared_ptr<Col>> cols_,
+    SelectStmt(std::vector<std::shared_ptr<Expr>> cols_,
                std::vector<std::string> tabs_,
                std::vector<std::shared_ptr<BinaryExpr>> conds_,
-               std::shared_ptr<OrderBy> order_) :
+               std::shared_ptr<OrderBy> order_,
+               std::shared_ptr<GroupBy> group_by_,
+               std::vector<std::shared_ptr<HavingCond>> having_conds_) :
             cols(std::move(cols_)), tabs(std::move(tabs_)), conds(std::move(conds_)), 
-            order(std::move(order_)) {
+            order(std::move(order_)), group_by(std::move(group_by_)), having_conds(std::move(having_conds_)) {
                 has_sort = (bool)order;
+                has_group_by = (bool)group_by;
+                has_having = !having_conds.empty();
             }
 };
 
@@ -271,6 +310,7 @@ struct SemValue {
     std::vector<std::shared_ptr<Field>> sv_fields;
 
     std::shared_ptr<Expr> sv_expr;
+    std::vector<std::shared_ptr<Expr>> sv_exprs;
 
     std::shared_ptr<Value> sv_val;
     std::vector<std::shared_ptr<Value>> sv_vals;
@@ -285,6 +325,12 @@ struct SemValue {
     std::vector<std::shared_ptr<BinaryExpr>> sv_conds;
 
     std::shared_ptr<OrderBy> sv_orderby;
+    
+    // aggregation concerning
+    std::shared_ptr<AggFunc> sv_agg_func;
+    std::shared_ptr<GroupBy> sv_group_by;
+    std::shared_ptr<HavingCond> sv_having_cond;
+    std::vector<std::shared_ptr<HavingCond>> sv_having_conds;
 
     SetKnobType sv_setKnobType;
 };
