@@ -22,6 +22,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_update.h"
 #include "execution/executor_insert.h"
 #include "execution/executor_delete.h"
+#include "execution/executor_aggregation.h"
 #include "execution/execution_sort.h"
 #include "common/common.h"
 
@@ -161,6 +162,10 @@ class Portal
         if(auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)){
             return std::make_unique<ProjectionExecutor>(convert_plan_executor(x->subplan_, context), 
                                                         x->sel_cols_);
+        } else if(auto x = std::dynamic_pointer_cast<AggregationPlan>(plan)) {
+            return std::make_unique<AggregationExecutor>(convert_plan_executor(x->subplan_, context),
+                                                         x->agg_infos_, x->group_by_cols_,
+                                                         x->having_conds_);
         } else if(auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
             if(x->tag == T_SeqScan) {
                 return std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->conds_, context);
