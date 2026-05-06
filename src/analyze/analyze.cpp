@@ -10,6 +10,28 @@ See the Mulan PSL v2 for more details. */
 
 #include "analyze.h"
 
+#include <algorithm>
+
+namespace {
+
+AggInfo convert_agg_func(const std::shared_ptr<ast::AggFunc> &sv_agg) {
+    AggInfo agg;
+    agg.agg_type = sv_agg->agg_type;
+    agg.is_star = sv_agg->is_star;
+    if (!sv_agg->is_star) {
+        agg.col = {.tab_name = sv_agg->col->tab_name, .col_name = sv_agg->col->col_name};
+    }
+    return agg;
+}
+
+auto find_col_meta_iter(const std::vector<ColMeta> &all_cols, const TabCol &target) {
+    return std::find_if(all_cols.begin(), all_cols.end(), [&](const ColMeta &col) {
+        return col.tab_name == target.tab_name && col.name == target.col_name;
+    });
+}
+
+}  // namespace
+
 /**
  * @description: 分析器，进行语义分析和查询重写，需要检查不符合语义规定的部分
  * @param {shared_ptr<ast::TreeNode>} parse parser生成的结果集
@@ -28,25 +50,77 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
                 throw TableNotFoundError(tab_name);
             }
         }
-        for (auto &sv_sel_col : x->cols) {
-            TabCol sel_col = {.tab_name = sv_sel_col->tab_name, .col_name = sv_sel_col->col_name};
-            query->cols.push_back(sel_col);
+        for (auto &sv_sel_expr : x->cols) {
+            if (auto sv_sel_col = std::dynamic_pointer_cast<ast::Col>(sv_sel_expr)) {
+                TabCol sel_col = {.tab_name = sv_sel_col->tab_name, .col_name = sv_sel_col->col_name};
+                query->cols.push_back(sel_col);
+            } else if (auto sv_agg = std::dynamic_pointer_cast<ast::AggFunc>(sv_sel_expr)) {
+                auto agg = convert_agg_func(sv_agg);
+                query->agg_infos.push_back(agg);
+            } else {
+                throw InternalError("Unexpected select expression type");
+            }
         }
         
         std::vector<ColMeta> all_cols;
         get_all_cols(query->tables, all_cols);
-        if (query->cols.empty()) {
+        if (x->cols.empty()) {
             // select all columns
             for (auto &col : all_cols) {
                 TabCol sel_col = {.tab_name = col.tab_name, .col_name = col.name};
                 query->cols.push_back(sel_col);
+                query->select_items.push_back(sel_col);
             }
         } else {
             // infer table name from column name
             for (auto &sel_col : query->cols) {
                 check_column(all_cols, sel_col);  // 列元数据校验
             }
+            query->select_items.clear();
+            size_t col_idx = 0;
+            for (auto &sv_sel_expr : x->cols) {
+                if (std::dynamic_pointer_cast<ast::Col>(sv_sel_expr)) {
+                    query->select_items.push_back(query->cols[col_idx++]);
+                } else if (auto sv_agg = std::dynamic_pointer_cast<ast::AggFunc>(sv_sel_expr)) {
+                    query->select_items.push_back({std::string(), agg_output_name(convert_agg_func(sv_agg))});
+                } else {
+                    throw InternalError("Unexpected select expression type");
+                }
+            }
         }
+        for (auto &agg : query->agg_infos) {
+            if (!agg.is_star) {
+                check_column(all_cols, agg.col);
+            }
+        }
+        if (x->has_group_by) {
+            for (auto &sv_group_col : x->group_by->cols) {
+                TabCol group_col = {.tab_name = sv_group_col->tab_name, .col_name = sv_group_col->col_name};
+                check_column(all_cols, group_col);
+                query->group_by_cols.push_back(group_col);
+            }
+        }
+        for (auto &sv_having : x->having_conds) {
+            HavingCond having_cond;
+            having_cond.is_agg = sv_having->is_agg;
+            having_cond.op = convert_sv_comp_op(sv_having->op);
+            if (sv_having->is_agg) {
+                having_cond.agg = convert_agg_func(sv_having->agg);
+                if (!having_cond.agg.is_star) {
+                    check_column(all_cols, having_cond.agg.col);
+                }
+            } else {
+                having_cond.col = {.tab_name = sv_having->col->tab_name, .col_name = sv_having->col->col_name};
+                check_column(all_cols, having_cond.col);
+            }
+            auto rhs_val = std::dynamic_pointer_cast<ast::Value>(sv_having->rhs);
+            if (rhs_val == nullptr) {
+                throw InternalError("Unexpected HAVING rhs expression type");
+            }
+            having_cond.rhs_val = convert_sv_value(rhs_val);
+            query->having_conds.push_back(having_cond);
+        }
+        check_aggregate(all_cols, *query);
         //处理where条件
         get_clause(x->conds, query->conds);
         check_clause(all_cols, query->conds);
@@ -108,15 +182,7 @@ void Analyze::check_column(const std::vector<ColMeta> &all_cols, TabCol &target)
         }
         target.tab_name = std::move(tab_name);
     } else {
-        /** TODO: Make sure target column exists */
-        bool not_exist = true;
-        for (auto&col: all_cols) {
-            if (col.tab_name == target.tab_name && col.name == target.col_name) {
-                not_exist = false;
-                break;
-            }
-        }
-        if (not_exist) {
+        if (find_col_meta_iter(all_cols, target) == all_cols.end()) {
             throw ColumnNotFoundError(target.tab_name + "." + target.col_name);
         }
     }
@@ -197,6 +263,8 @@ Value Analyze::convert_sv_value(const std::shared_ptr<ast::Value> &sv_val) {
         val.set_float(float_lit->val);
     } else if (auto *str_lit = dynamic_cast<ast::StringLit *>(raw)) {
         val.set_str(str_lit->val);
+    } else if (auto *bool_lit = dynamic_cast<ast::BoolLit *>(raw)) {
+        val.set_int(bool_lit->val ? 1 : 0);
     } else {
         throw InternalError("Unexpected sv value type");
     }
@@ -212,5 +280,72 @@ CompOp Analyze::convert_sv_comp_op(ast::SvCompOp op) {
         case ast::SV_OP_LE: return OP_LE;
         case ast::SV_OP_GE: return OP_GE;
         default: throw InternalError("Unexpected comparison op");
+    }
+}
+
+ColType Analyze::get_column_type(const std::vector<ColMeta> &all_cols, const TabCol &target) {
+    auto it = find_col_meta_iter(all_cols, target);
+    if (it == all_cols.end()) {
+        throw ColumnNotFoundError(target.tab_name + "." + target.col_name);
+    }
+    return it->type;
+}
+
+ColType Analyze::agg_result_type(const AggInfo &agg, const std::vector<ColMeta> &all_cols) {
+    if (agg.agg_type == AGG_COUNT) {
+        return TYPE_INT;
+    }
+
+    ColType input_type = get_column_type(all_cols, agg.col);
+    if ((agg.agg_type == AGG_SUM || agg.agg_type == AGG_AVG) && input_type == TYPE_STRING) {
+        throw RMDBError("SUM/AVG only support INT or FLOAT columns");
+    }
+    if (agg.agg_type == AGG_AVG) {
+        return TYPE_FLOAT;
+    }
+    return input_type;
+}
+
+void Analyze::check_aggregate(const std::vector<ColMeta> &all_cols, Query &query) {
+    bool has_agg_func = !query.agg_infos.empty() ||
+        std::any_of(query.having_conds.begin(), query.having_conds.end(), [](const HavingCond &cond) {
+            return cond.is_agg;
+        });
+    bool has_aggregate = has_agg_func || !query.having_conds.empty();
+    bool has_group_by = !query.group_by_cols.empty();
+    if (!has_aggregate && !has_group_by) {
+        return;
+    }
+
+    for (auto &agg : query.agg_infos) {
+        (void)agg_result_type(agg, all_cols);
+    }
+
+    if (!has_group_by && has_agg_func && !query.cols.empty()) {
+        throw RMDBError("Non-aggregated columns must appear in GROUP BY");
+    }
+
+    if (has_group_by) {
+        for (auto &sel_col : query.cols) {
+            if (!contains_col(query.group_by_cols, sel_col)) {
+                throw RMDBError(sel_col.col_name + " must appear in GROUP BY");
+            }
+        }
+    }
+
+    for (auto &having_cond : query.having_conds) {
+        ColType lhs_type;
+        if (having_cond.is_agg) {
+            lhs_type = agg_result_type(having_cond.agg, all_cols);
+        } else {
+            if (!contains_col(query.group_by_cols, having_cond.col)) {
+                throw RMDBError(having_cond.col.col_name + " must appear in GROUP BY");
+            }
+            lhs_type = get_column_type(all_cols, having_cond.col);
+        }
+
+        if (lhs_type != having_cond.rhs_val.type) {
+            throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(having_cond.rhs_val.type));
+        }
     }
 }

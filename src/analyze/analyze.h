@@ -34,6 +34,11 @@ class Query{
     std::vector<SetClause> set_clauses;
     //insert 的values值
     std::vector<Value> values;
+    // aggregation metadata
+    std::vector<AggInfo> agg_infos;
+    std::vector<TabCol> select_items;
+    std::vector<TabCol> group_by_cols;
+    std::vector<HavingCond> having_conds;
 
     Query(){}
 
@@ -57,5 +62,7 @@ private:
     void check_clause(const std::vector<ColMeta> &all_cols, std::vector<Condition> &conds);
     Value convert_sv_value(const std::shared_ptr<ast::Value> &sv_val);
     CompOp convert_sv_comp_op(ast::SvCompOp op);
+    ColType get_column_type(const std::vector<ColMeta> &all_cols, const TabCol &target);
+    ColType agg_result_type(const AggInfo &agg, const std::vector<ColMeta> &all_cols);
+    void check_aggregate(const std::vector<ColMeta> &all_cols, Query &query);
 };
-
