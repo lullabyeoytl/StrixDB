@@ -9,6 +9,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "analyze.h"
+#include "errors.h"
 
 #include <algorithm>
 
@@ -24,10 +25,13 @@ AggInfo convert_agg_func(const std::shared_ptr<ast::AggFunc> &sv_agg) {
     return agg;
 }
 
-auto find_col_meta_iter(const std::vector<ColMeta> &all_cols, const TabCol &target) {
-    return std::find_if(all_cols.begin(), all_cols.end(), [&](const ColMeta &col) {
-        return col.tab_name == target.tab_name && col.name == target.col_name;
+void append_unique_agg(std::vector<AggInfo> &agg_infos, const AggInfo &agg) {
+    auto it = std::find_if(agg_infos.begin(), agg_infos.end(), [&](const AggInfo &existing) {
+        return existing.equals(agg);
     });
+    if (it == agg_infos.end()) {
+        agg_infos.push_back(agg);
+    }
 }
 
 }  // namespace
@@ -109,6 +113,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
                 if (!having_cond.agg.is_star) {
                     check_column(all_cols, having_cond.agg.col);
                 }
+                append_unique_agg(query->agg_infos, having_cond.agg);
             } else {
                 having_cond.col = {.tab_name = sv_having->col->tab_name, .col_name = sv_having->col->col_name};
                 check_column(all_cols, having_cond.col);
@@ -182,8 +187,10 @@ void Analyze::check_column(const std::vector<ColMeta> &all_cols, TabCol &target)
         }
         target.tab_name = std::move(tab_name);
     } else {
-        if (find_col_meta_iter(all_cols, target) == all_cols.end()) {
-            throw ColumnNotFoundError(target.tab_name + "." + target.col_name);
+        try {
+            find_col_meta(all_cols, target);
+        } catch (const RMDBError &e) {
+            throw e;
         }
     }
 }
@@ -247,7 +254,7 @@ void Analyze::check_clause(const std::vector<ColMeta> &all_cols, std::vector<Con
             auto rhs_col = rhs_tab.get_col(cond.rhs_col.col_name);
             rhs_type = rhs_col->type;
         }
-        if (lhs_type != rhs_type) {
+        if (!are_comparable_types(lhs_type, rhs_type)) {
             throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
         }
     }
@@ -284,11 +291,8 @@ CompOp Analyze::convert_sv_comp_op(ast::SvCompOp op) {
 }
 
 ColType Analyze::get_column_type(const std::vector<ColMeta> &all_cols, const TabCol &target) {
-    auto it = find_col_meta_iter(all_cols, target);
-    if (it == all_cols.end()) {
-        throw ColumnNotFoundError(target.tab_name + "." + target.col_name);
-    }
-    return it->type;
+    auto col = find_col_meta(all_cols, target);
+    return col.type;
 }
 
 ColType Analyze::agg_result_type(const AggInfo &agg, const std::vector<ColMeta> &all_cols) {
@@ -344,7 +348,7 @@ void Analyze::check_aggregate(const std::vector<ColMeta> &all_cols, Query &query
             lhs_type = get_column_type(all_cols, having_cond.col);
         }
 
-        if (lhs_type != having_cond.rhs_val.type) {
+        if (!are_comparable_types(lhs_type, having_cond.rhs_val.type)) {
             throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(having_cond.rhs_val.type));
         }
     }

@@ -18,6 +18,8 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include <vector>
 #include "defs.h"
+#include "errors.h"
+#include "system/sm_meta.h"
 #include "record/rm_defs.h"
 
 
@@ -28,18 +30,49 @@ struct TabCol {
     friend bool operator<(const TabCol &x, const TabCol &y) {
         return std::make_pair(x.tab_name, x.col_name) < std::make_pair(y.tab_name, y.col_name);
     }
+    
+    inline bool equals(const TabCol &rhs) const {
+        return tab_name == rhs.tab_name && col_name == rhs.col_name;
+    }
 };
 
-inline bool same_col(const TabCol &lhs, const TabCol &rhs) {
-    return lhs.tab_name == rhs.tab_name && lhs.col_name == rhs.col_name;
+inline bool contains_col(const std::vector<TabCol> &cols, const TabCol &target) {
+    return std::any_of(cols.begin(), cols.end(), [&](const TabCol &col) { return col.equals(target); });
 }
 
-inline bool contains_col(const std::vector<TabCol> &cols, const TabCol &target) {
-    return std::any_of(cols.begin(), cols.end(), [&](const TabCol &col) { return same_col(col, target); });
+inline bool col_meta_matches(const ColMeta &col, const TabCol &target) {
+    return col.tab_name == target.tab_name && col.name == target.col_name;
+}
+
+inline auto find_col_meta(const std::vector<ColMeta> &cols, const TabCol &target) -> const ColMeta & {
+    auto it = std::find_if(cols.begin(), cols.end(),
+                           [&](const ColMeta &col) { return col_meta_matches(col, target); });
+    if (it == cols.end()) {
+        throw ColumnNotFoundError("Column not found: " + target.tab_name + "." + target.col_name);
+    }
+    return *it;
 }
 
 enum AggType {
     AGG_COUNT, AGG_SUM, AGG_AVG, AGG_MIN, AGG_MAX
+};
+
+enum CompOp { OP_EQ, OP_NE, OP_LT, OP_GT, OP_LE, OP_GE };
+
+inline auto is_numeric_type(ColType type) -> bool {
+    return type == TYPE_INT || type == TYPE_FLOAT;
+}
+
+inline auto are_comparable_types(ColType lhs, ColType rhs) -> bool {
+    return lhs == rhs || (is_numeric_type(lhs) && is_numeric_type(rhs));
+}
+
+inline auto is_range_comp_op(CompOp op) -> bool {
+    return op == OP_LT || op == OP_LE || op == OP_GT || op == OP_GE;
+}
+
+const std::map<CompOp, CompOp> kSwapOp = {
+    {OP_EQ, OP_EQ}, {OP_NE, OP_NE}, {OP_LT, OP_GT}, {OP_GT, OP_LT}, {OP_LE, OP_GE}, {OP_GE, OP_LE},
 };
 
 struct Value {
@@ -84,9 +117,49 @@ struct Value {
             memcpy(raw->data, str_val.c_str(), str_val.size());
         }
     }
-};
 
-enum CompOp { OP_EQ, OP_NE, OP_LT, OP_GT, OP_LE, OP_GE };
+    inline auto is_numeric() const -> bool {
+        return is_numeric_type(type);
+    }
+
+    inline auto compare(const Value &rhs) const -> int {
+        if (is_numeric() && rhs.is_numeric()) {
+            double lhs_num = type == TYPE_INT ? static_cast<double>(int_val) : static_cast<double>(float_val);
+            double rhs_num = rhs.type == TYPE_INT ? static_cast<double>(rhs.int_val) : static_cast<double>(rhs.float_val);
+            if (lhs_num < rhs_num) {
+                return -1;
+            }
+            if (lhs_num > rhs_num) {
+                return 1;
+            }
+            return 0;
+        }
+
+        if (type == TYPE_STRING && rhs.type == TYPE_STRING) {
+            if (str_val < rhs.str_val) {
+                return -1;
+            }
+            if (str_val > rhs.str_val) {
+                return 1;
+            }
+            return 0;
+        }
+
+        throw InternalError("Unexpected value type combination in Value::compare");
+    }
+
+    inline auto equals(const Value &rhs) const -> bool {
+        return compare(rhs) == 0;
+    }
+
+    friend inline auto operator==(const Value &lhs, const Value &rhs) -> bool {
+        return lhs.equals(rhs);
+    }
+
+    friend inline auto operator!=(const Value &lhs, const Value &rhs) -> bool {
+        return !lhs.equals(rhs);
+    }
+};
 
 struct Condition {
     TabCol lhs_col;   // left-hand side column
@@ -94,6 +167,15 @@ struct Condition {
     bool is_rhs_val;  // true if right-hand side is a value (not a column)
     TabCol rhs_col;   // right-hand side column
     Value rhs_val;    // right-hand side value
+    
+    inline auto equals(const Condition &rhs) const -> bool {
+        // 左列， 操作符， RHS种类&值
+        if (!lhs_col.equals(rhs.lhs_col) || op != rhs.op || is_rhs_val != rhs.is_rhs_val) return false;
+        if (is_rhs_val) {
+            return rhs_val.equals(rhs.rhs_val);
+        } 
+        return rhs_col.equals(rhs.rhs_col);
+    }
 };
 
 struct SetClause {
@@ -105,6 +187,16 @@ struct AggInfo {
     AggType agg_type;
     bool is_star;
     TabCol col;
+
+    inline auto equals(const AggInfo &rhs) const -> bool {
+        if (agg_type != rhs.agg_type || is_star != rhs.is_star) {
+            return false;
+        }
+        if (is_star) {
+            return true;
+        }
+        return col.equals(rhs.col);
+    }
 };
 
 struct HavingCond {

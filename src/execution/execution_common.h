@@ -24,18 +24,6 @@ auto ReconstructTuple(const TabMeta *schema, const RmRecord &base_tuple, const T
 
 auto IsWriteWriteConflict(timestamp_t tuple_ts, Transaction *txn) -> bool;
 
-inline bool col_meta_matches(const ColMeta &col, const TabCol &target) {
-    return col.tab_name == target.tab_name && col.name == target.col_name;
-}
-
-inline auto find_col_meta(const std::vector<ColMeta> &cols, const TabCol &target) -> const ColMeta & {
-    auto it = std::find_if(cols.begin(), cols.end(),
-                           [&](const ColMeta &col) { return col_meta_matches(col, target); });
-    if (it == cols.end()) {
-        throw InternalError("Analyze guaranteed column existence before execution");
-    }
-    return *it;
-}
 
 inline auto get_col_value(const RmRecord &record, const ColMeta &col) -> Value {
     Value value;
@@ -55,44 +43,14 @@ inline auto get_col_value(const RmRecord &record, const ColMeta &col) -> Value {
 }
 
 inline auto compare_values(const Value &lhs, const Value &rhs, CompOp op) -> bool {
-    assert(lhs.type == rhs.type);
-    switch (lhs.type) {
-        case TYPE_INT: {
-            switch (op) {
-                case OP_EQ: return lhs.int_val == rhs.int_val;
-                case OP_NE: return lhs.int_val != rhs.int_val;
-                case OP_LT: return lhs.int_val < rhs.int_val;
-                case OP_GT: return lhs.int_val > rhs.int_val;
-                case OP_LE: return lhs.int_val <= rhs.int_val;
-                case OP_GE: return lhs.int_val >= rhs.int_val;
-            }
-            break;
-        }
-        case TYPE_FLOAT: {
-            // Strict arithmetic comparison. Type compatibility is guaranteed by Analyze::check_clause.
-            switch (op) {
-                case OP_EQ: return lhs.float_val == rhs.float_val;
-                case OP_NE: return lhs.float_val != rhs.float_val;
-                case OP_LT: return lhs.float_val < rhs.float_val;
-                case OP_GT: return lhs.float_val > rhs.float_val;
-                case OP_LE: return lhs.float_val <= rhs.float_val;
-                case OP_GE: return lhs.float_val >= rhs.float_val;
-            }
-            break;
-        }
-        case TYPE_STRING: {
-            switch (op) {
-                case OP_EQ: return lhs.str_val == rhs.str_val;
-                case OP_NE: return lhs.str_val != rhs.str_val;
-                case OP_LT: return lhs.str_val < rhs.str_val;
-                case OP_GT: return lhs.str_val > rhs.str_val;
-                case OP_LE: return lhs.str_val <= rhs.str_val;
-                case OP_GE: return lhs.str_val >= rhs.str_val;
-            }
-            break;
-        }
-        default:
-            break;
+    int cmp = lhs.compare(rhs);
+    switch (op) {
+        case OP_EQ: return cmp == 0;
+        case OP_NE: return cmp != 0;
+        case OP_LT: return cmp < 0;
+        case OP_GT: return cmp > 0;
+        case OP_LE: return cmp <= 0;
+        case OP_GE: return cmp >= 0;
     }
     throw InternalError("Unexpected value type in compare_values");
 }
@@ -112,4 +70,25 @@ inline auto evaluate_conditions(const std::vector<Condition> &conds, const RmRec
         }
     }
     return true;
+}
+
+template <typename RecordFetcher>
+inline auto seek_to_next_valid_tuple(RecScan *scan, Rid &rid, const std::vector<Condition> &conds,
+                                     const std::vector<ColMeta> &cols, RecordFetcher &&fetch_record) -> bool {
+    if (scan == nullptr || scan->is_end()) {
+        rid = Rid{-1, -1};
+        return false;
+    }
+
+    while (!scan->is_end()) {
+        rid = scan->rid();
+        auto record = fetch_record(rid);
+        if (evaluate_conditions(conds, *record, cols)) {
+            return true;
+        }
+        scan->next();
+    }
+
+    rid = Rid{-1, -1};
+    return false;
 }

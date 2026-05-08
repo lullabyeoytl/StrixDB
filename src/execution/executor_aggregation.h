@@ -39,7 +39,7 @@ struct AggState {
 class AggregationExecutor : public AbstractExecutor {
    private:
     std::unique_ptr<AbstractExecutor> prev_;
-    std::vector<AggInfo> agg_infos_;    
+    std::vector<AggInfo> agg_infos_;
     std::vector<TabCol> group_by_cols_;
     std::vector<HavingCond> having_conds_;
 
@@ -50,12 +50,6 @@ class AggregationExecutor : public AbstractExecutor {
     std::map<std::string, AggState>::iterator iter_;    // 指向当前分组的迭代器
     Rid rid_;
     bool built_;
-
-    bool agg_info_same(const AggInfo &lhs, const AggInfo &rhs) const {
-        if (lhs.agg_type != rhs.agg_type || lhs.is_star != rhs.is_star) return false;
-        if (lhs.is_star) return true;
-        return lhs.col.tab_name == rhs.col.tab_name && lhs.col.col_name == rhs.col.col_name;
-    }
 
     ColType agg_result_type(const AggInfo &agg) const {
         if (agg.agg_type == AGG_COUNT) {
@@ -184,21 +178,21 @@ class AggregationExecutor : public AbstractExecutor {
         }
         throw InternalError("Unexpected aggregate type");
     }
-    
+
     // having filter for every group
     bool passes_having(const AggState &state) const {
         for (auto &cond : having_conds_) {
             Value lhs;
             if (cond.is_agg) {
                 auto it = std::find_if(agg_infos_.begin(), agg_infos_.end(),
-                                        [&](const AggInfo &agg) { return agg_info_same(agg, cond.agg); });
+                                        [&](const AggInfo &agg) { return agg.equals(cond.agg); });
                 if (it == agg_infos_.end()) {
                     throw InternalError("AggregationExecutor guaranteed HAVING aggregate state");
                 }
                 lhs = agg_value(state, *it, it - agg_infos_.begin());
             } else {
                 auto it = std::find_if(group_by_cols_.begin(), group_by_cols_.end(),
-                                        [&](const TabCol &col) { return same_col(col, cond.col); });
+                                        [&](const TabCol &col) { return col.equals(cond.col); });
                 if (it == group_by_cols_.end()) {
                     throw InternalError("Analyze guaranteed HAVING group column existence");
                 }
@@ -224,7 +218,7 @@ class AggregationExecutor : public AbstractExecutor {
             }
             update_state(it->second, *record);  // 写groups_
         }
-        
+
         // no group by and source col is none: SQL standard is to return a single row
         if (groups_.empty() && group_by_cols_.empty()) {
             groups_.emplace(std::string(), empty_state());
