@@ -20,36 +20,107 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_seq_scan.h"
 #include "execution/executor_update.h"
 #include "index/ix.h"
+#include "index_matcher.h"
+#include "predicate_normalizer.h"
 #include "record_printer.h"
 
-namespace {
-
-const std::map<CompOp, CompOp> kSwapOp = {
-    {OP_EQ, OP_EQ}, {OP_NE, OP_NE}, {OP_LT, OP_GT}, {OP_GT, OP_LT}, {OP_LE, OP_GE}, {OP_GE, OP_LE},
-};
-
-}  // namespace
-
-// 目前的索引匹配规则为：完全匹配索引字段，且全部为单点查询，不会自动调整where条件的顺序
-bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_conds, std::vector<std::string>& index_col_names) {
-    index_col_names.clear();
-    for(auto& cond: curr_conds) {
-        if(cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.tab_name.compare(tab_name) == 0)
-            index_col_names.push_back(cond.lhs_col.col_name);
+void prepare_index_lookup_values(const IndexMeta &index_meta, std::vector<Condition> &lookup_conds) {
+    for (auto &cond : lookup_conds) {
+        if (!cond.is_rhs_val || cond.rhs_val.raw) {
+            continue;
+        }
+        auto col_it = std::find_if(index_meta.cols.begin(), index_meta.cols.end(),
+                                   [&](const ColMeta &col) { return col.name == cond.lhs_col.col_name; });
+        if (col_it != index_meta.cols.end()) {
+            cond.rhs_val.init_raw(col_it->len);
+        }
     }
-    TabMeta& tab = sm_manager_->db_.get_table(tab_name);
-    if(tab.is_index(index_col_names)) return true;
-    return false;
 }
 
-std::shared_ptr<ScanPlan> Planner::make_scan_plan(const std::string &tab_name, std::vector<Condition> conds) {
-    std::vector<std::string> index_col_names;
-    bool index_exist = get_index_cols(tab_name, conds, index_col_names);
-    if (!index_exist) {
-        index_col_names.clear();
-        return std::make_shared<ScanPlan>(T_SeqScan, sm_manager_, tab_name, std::move(conds), index_col_names);
+std::vector<TabCol> Planner::collect_scan_required_cols(const Query &query, const std::string &tab_name) const {
+    std::vector<TabCol> required_cols;
+    auto append_col = [&](const TabCol &col) {
+        if (col.tab_name != tab_name) {
+            return;
+        }
+        if (!contains_col(required_cols, col)) {
+            required_cols.push_back(col);
+        }
+    };
+
+    for (const auto &cond : query.conds) {
+        append_col(cond.lhs_col);
+        if (!cond.is_rhs_val) {
+            append_col(cond.rhs_col);
+        }
     }
-    return std::make_shared<ScanPlan>(T_IndexScan, sm_manager_, tab_name, std::move(conds), index_col_names);
+    for (const auto &col : query.cols) {
+        append_col(col);
+    }
+    for (const auto &agg : query.agg_infos) {
+        if (!agg.is_star) {
+            append_col(agg.col);
+        }
+    }
+    for (const auto &col : query.group_by_cols) {
+        append_col(col);
+    }
+    for (const auto &having : query.having_conds) {
+        if (having.is_agg) {
+            if (!having.agg.is_star) {
+                append_col(having.agg.col);
+            }
+        } else {
+            append_col(having.col);
+        }
+    }
+    return required_cols;
+}
+
+std::vector<TabCol> Planner::collect_dml_required_cols(const Query &query, const std::string &tab_name) const {
+    std::vector<TabCol> required_cols;
+    auto append_col = [&](const TabCol &col) {
+        if (col.tab_name != tab_name) {
+            return;
+        }
+        if (!contains_col(required_cols, col)) {
+            required_cols.push_back(col);
+        }
+    };
+
+    for (const auto &cond : query.conds) {
+        append_col(cond.lhs_col);
+        if (!cond.is_rhs_val) {
+            append_col(cond.rhs_col);
+        }
+    }
+    for (const auto &set_clause : query.set_clauses) {
+        append_col(set_clause.lhs);
+    }
+    return required_cols;
+}
+
+std::shared_ptr<ScanPlan> Planner::make_scan_plan(const std::string &tab_name, std::vector<Condition> conds,
+                                                  std::vector<TabCol> required_cols) {
+    const auto &table_cols = sm_manager_->db_.get_table(tab_name).cols;
+    auto normalized = normalize_predicates(table_cols, conds);
+    if (normalized.contradiction) {
+        return std::make_shared<ScanPlan>(sm_manager_, tab_name, std::move(normalized.normalized_conds), true);
+    }
+    conds = std::move(normalized.normalized_conds);
+    const auto &tab = sm_manager_->db_.get_table(tab_name);
+    auto best_match = match_best_index(tab, conds, required_cols);
+    if (!best_match.matched) {
+        return std::make_shared<ScanPlan>(sm_manager_, tab_name, std::move(conds));
+    }
+    if (best_match.index_meta.has_value()) {
+        prepare_index_lookup_values(*best_match.index_meta, best_match.lookup_conds);
+    }
+    return std::make_shared<ScanPlan>(sm_manager_, tab_name,
+                                      std::move(best_match.lookup_conds),
+                                      std::move(best_match.residual_conds),
+                                      std::move(best_match.index_col_names),
+                                      std::move(best_match.index_meta));
 }
 
 /**
@@ -66,7 +137,7 @@ std::vector<Condition> pop_conds(std::vector<Condition> &conds, std::string tab_
     std::vector<Condition> solved_conds;
     auto it = conds.begin();
     while (it != conds.end()) {
-        if ((tab_names.compare(it->lhs_col.tab_name) == 0 && it->is_rhs_val) || (it->lhs_col.tab_name.compare(it->rhs_col.tab_name) == 0)) {
+        if ((tab_names.compare(it->lhs_col.tab_name) == 0 && it->is_rhs_val) || (it->lhs_col.tab_name.compare(it->rhs_col.tab_name) == 0 && it->lhs_col.tab_name.compare(tab_names) == 0)) {
             solved_conds.emplace_back(std::move(*it));
             it = conds.erase(it);
         } else {
@@ -160,10 +231,11 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
     std::vector<std::string> tables = query->tables;
     // // Scan table , 生成表算子列表tab_nodes
     std::vector<std::shared_ptr<Plan>> table_scan_executors(tables.size());
-        for (size_t i = 0; i < tables.size(); i++) {
-            auto curr_conds = pop_conds(query->conds, tables[i]);
-            table_scan_executors[i] = make_scan_plan(tables[i], std::move(curr_conds));
-        }
+    for (size_t i = 0; i < tables.size(); i++) {
+        auto curr_conds = pop_conds(query->conds, tables[i]);
+        auto required_cols = collect_scan_required_cols(*query, tables[i]);
+        table_scan_executors[i] = make_scan_plan(tables[i], std::move(curr_conds), std::move(required_cols));
+    }
     // 只有一个表，不需要join。
     if(tables.size() == 1)
     {
@@ -356,14 +428,16 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context 
         std::shared_ptr<Plan> table_scan_executors;
         // 只有一张表，不需要进行物理优化了
         // int index_no = get_indexNo(x->tab_name, query->conds);
-        table_scan_executors = make_scan_plan(x->tab_name, query->conds);
+        table_scan_executors = make_scan_plan(x->tab_name, query->conds,
+                                              collect_dml_required_cols(*query, x->tab_name));
 
         plannerRoot = std::make_shared<DMLPlan>(T_Delete, table_scan_executors, x->tab_name,  
                                                 std::vector<Value>(), query->conds, std::vector<SetClause>());
     } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(query->parse)) {
         // update;
         // 生成表扫描方式
-        std::shared_ptr<Plan> table_scan_executors = make_scan_plan(x->tab_name, query->conds);
+        std::shared_ptr<Plan> table_scan_executors = make_scan_plan(
+            x->tab_name, query->conds, collect_dml_required_cols(*query, x->tab_name));
         plannerRoot = std::make_shared<DMLPlan>(T_Update, table_scan_executors, x->tab_name,
                                                      std::vector<Value>(), query->conds, 
                                                      query->set_clauses);

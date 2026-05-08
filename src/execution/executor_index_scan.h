@@ -10,11 +10,13 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <optional>
 #include <cstring>
 #include <algorithm>
 #include <climits>
 #include <cfloat>
 
+#include "common/common.h"
 #include "execution_common.h"
 #include "execution_defs.h"
 #include "execution_manager.h"
@@ -24,13 +26,28 @@ See the Mulan PSL v2 for more details. */
 
 class IndexScanExecutor : public AbstractExecutor {
    private:
+   // bound for range scan
+    struct RangeBound {
+        bool has_value = false;       
+        Value value;
+        // '>' '<' -> true, '>=','<=' -> false 
+        bool exclusive = false;     
+    };
+
+    struct LookupLayout {
+        int eq_prefix_len = 0;  // EQ prefix cols nums 
+        int range_col_idx = -1; // range cond pos
+        RangeBound lower;
+        RangeBound upper;
+    };
+
     std::string tab_name_;                      // 表名称
     TabMeta tab_;                               // 表的元数据
-    std::vector<Condition> conds_;              // 扫描条件
+    std::vector<Condition> index_lookup_conds_; // 索引查找条件
+    std::vector<Condition> residual_conds_;     // 索引扫描后的剩余过滤条件
     RmFileHandle *fh_;                          // 表的数据文件句柄
     std::vector<ColMeta> cols_;                 // 需要读取的字段
     size_t len_;                                // 选取出来的一条记录的长度
-    std::vector<Condition> fed_conds_;          // 扫描条件，和conds_字段相同
 
     std::vector<std::string> index_col_names_;  // index scan涉及到的索引包含的字段
     IndexMeta index_meta_;                      // index scan涉及到的索引元数据
@@ -45,71 +62,176 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void seek_to_next_valid() {
-        if (!scan_ || scan_->is_end()) {
+        if (!seek_to_next_valid_tuple(scan_.get(), rid_, residual_conds_, cols_, [&](const Rid &rid) {
+                return fh_->get_record(rid, context_);
+            })) {
             set_end();
-            return;
         }
-        while (!scan_->is_end()) {
-            rid_ = scan_->rid();
-            auto record = fh_->get_record(rid_, context_);
-            if (evaluate_conditions(fed_conds_, *record, cols_)) {
-                return;
-            }
-            scan_->next();
-        }
-        set_end();
     }
 
-    // 为索引构建搜索 key。当 for_upper=true 时，没有 EQ 匹配的列用类型最大值填充，
-    // 使得 upper_bound 能正确找到首个大于所有匹配行的位置（复合索引只匹配前导列时）。
-    std::vector<char> build_index_key(bool for_upper = false) {
-        std::vector<char> key(index_meta_.col_tot_len, 0);
-        int offset = 0;
-        for (const auto &index_col : index_meta_.cols) {
-            bool found = false;
-            for (auto &cond : conds_) {
-                if (cond.lhs_col.col_name == index_col.name && cond.is_rhs_val && cond.op == OP_EQ) {
-                    if (!cond.rhs_val.raw) {
-                        cond.rhs_val.init_raw(index_col.len);
+    static void fill_min_value(const ColMeta &col, char *dest) {
+        switch (col.type) {
+            case TYPE_INT: {
+                int val = INT_MIN;
+                memcpy(dest, &val, sizeof(int));
+                break;
+            }
+            case TYPE_FLOAT: {
+                float val = -FLT_MAX;
+                memcpy(dest, &val, sizeof(float));
+                break;
+            }
+            case TYPE_STRING:
+                memset(dest, 0, col.len);
+                break;
+            default:
+                throw InternalError("Unexpected column type");
+        }
+    }
+    
+    static void fill_max_value(const ColMeta &col, char *dest) {
+        switch (col.type) {
+            case TYPE_INT: {
+                int val = INT_MAX;
+                memcpy(dest, &val, sizeof(int));
+                break;
+            }
+            case TYPE_FLOAT: {
+                float val = FLT_MAX;
+                memcpy(dest, &val, sizeof(float));
+                break;
+            }
+            case TYPE_STRING:
+                memset(dest, 0xFF, col.len);
+                break;
+            default:
+                throw InternalError("Unexpected column type");
+        }
+    }
+
+    static void write_value(const ColMeta &col, const Value &value, char *dest) {
+        if (!value.raw) {
+            throw InternalError("Index lookup value raw buffer is not initialized");
+        }
+        memcpy(dest, value.raw->data, col.len);
+    }
+
+    void prepare_lookup_values() {
+        for (auto &cond : index_lookup_conds_) {
+            if (!cond.is_rhs_val || cond.rhs_val.raw) {
+                continue;
+            }
+            auto col_it = std::find_if(index_meta_.cols.begin(), index_meta_.cols.end(),
+                                       [&](const ColMeta &col) { return col.name == cond.lhs_col.col_name; });
+            if (col_it != index_meta_.cols.end()) {
+                cond.rhs_val.init_raw(col_it->len);
+            }
+        }
+    }
+
+    auto find_eq_condition(const std::string &col_name) const -> const Condition * {
+        auto it = std::find_if(index_lookup_conds_.begin(), index_lookup_conds_.end(), [&](const Condition &cond) {
+            return cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.col_name == col_name;
+        });
+        return it == index_lookup_conds_.end() ? nullptr : &(*it);
+    }
+
+    auto analyze_lookup_layout() const -> LookupLayout {
+        LookupLayout layout;
+        // Scan index columns in order: consume the EQ prefix first, then at most one
+        // range column, and stop. Columns after the first non-EQ position stay in
+        // residual filters because the B+ tree cannot narrow them further.
+        for (size_t i = 0; i < index_meta_.cols.size(); ++i) {
+            const auto &index_col = index_meta_.cols[i];
+            if (const auto *eq_cond = find_eq_condition(index_col.name); eq_cond != nullptr) {
+                ++layout.eq_prefix_len;
+                continue;
+            }
+
+            bool saw_range = false;
+            for (const auto &cond : index_lookup_conds_) {
+                if (!cond.is_rhs_val || cond.lhs_col.col_name != index_col.name) {
+                    continue;
+                }
+                if (cond.op == OP_GT || cond.op == OP_GE) {
+                    if (!layout.lower.has_value) {
+                        layout.lower = {.has_value = true, .value = cond.rhs_val, .exclusive = cond.op == OP_GT};
+                    } else {
+                        int cmp = cond.rhs_val.compare(layout.lower.value);
+                        if (cmp > 0 || (cmp == 0 && cond.op == OP_GT && !layout.lower.exclusive)) {
+                            layout.lower = {.has_value = true, .value = cond.rhs_val, .exclusive = cond.op == OP_GT};
+                        }
                     }
-                    memcpy(key.data() + offset, cond.rhs_val.raw->data, index_col.len);
-                    found = true;
-                    break;
+                    saw_range = true;
+                } else if (cond.op == OP_LT || cond.op == OP_LE) {
+                    if (!layout.upper.has_value) {
+                        layout.upper = {.has_value = true, .value = cond.rhs_val, .exclusive = cond.op == OP_LT};
+                    } else {
+                        int cmp = cond.rhs_val.compare(layout.upper.value);
+                        if (cmp < 0 || (cmp == 0 && cond.op == OP_LT && !layout.upper.exclusive)) {
+                            layout.upper = {.has_value = true, .value = cond.rhs_val, .exclusive = cond.op == OP_LT};
+                        }
+                    }
+                    saw_range = true;
                 }
             }
-            if (!found) {
-                if (for_upper) {
-                    switch (index_col.type) {
-                        case TYPE_INT: {
-                            int val = INT_MAX;
-                            memcpy(key.data() + offset, &val, sizeof(int));
-                            break;
-                        }
-                        case TYPE_FLOAT: {
-                            float val = FLT_MAX;
-                            memcpy(key.data() + offset, &val, sizeof(float));
-                            break;
-                        }
-                        case TYPE_STRING:
-                            memset(key.data() + offset, 0xFF, index_col.len);
-                            break;
-                    }
+            if (saw_range) {
+                layout.range_col_idx = static_cast<int>(i);
+            }
+            break;
+        }
+        return layout;
+    }
+
+    static auto empty_range(const LookupLayout &layout) -> bool {
+        if (!layout.lower.has_value || !layout.upper.has_value) {
+            return false;
+        }
+        int cmp = layout.lower.value.compare(layout.upper.value);
+        if (cmp > 0) {
+            return true;
+        }
+        return cmp == 0 && (layout.lower.exclusive || layout.upper.exclusive);
+    }
+
+    auto build_key(const LookupLayout &layout, bool upper_side, bool use_bound_value) -> std::vector<char> {
+        std::vector<char> key(index_meta_.col_tot_len, 0);
+        int offset = 0;
+        for (size_t i = 0; i < index_meta_.cols.size(); ++i) {
+            const auto &index_col = index_meta_.cols[i];
+            if (const auto *eq_cond = find_eq_condition(index_col.name); eq_cond != nullptr) {
+                write_value(index_col, eq_cond->rhs_val, key.data() + offset);
+            } else if (layout.range_col_idx == static_cast<int>(i)) {
+                if (use_bound_value) {
+                    const auto &bound = upper_side ? layout.upper : layout.lower;
+                    write_value(index_col, bound.value, key.data() + offset);
+                } else if (upper_side) {
+                    fill_max_value(index_col, key.data() + offset);
                 } else {
-                    switch (index_col.type) {
-                        case TYPE_INT: {
-                            int val = INT_MIN;
-                            memcpy(key.data() + offset, &val, sizeof(int));
-                            break;
-                        }
-                        case TYPE_FLOAT: {
-                            float val = -FLT_MAX;
-                            memcpy(key.data() + offset, &val, sizeof(float));
-                            break;
-                        }
-                        case TYPE_STRING:
-                            break;
+                    fill_min_value(index_col, key.data() + offset);
+                }
+            } else if (layout.range_col_idx == -1 && static_cast<int>(i) >= layout.eq_prefix_len) {
+                if (upper_side) {
+                    fill_max_value(index_col, key.data() + offset);
+                } else {
+                    fill_min_value(index_col, key.data() + offset);
+                }
+            } else if (layout.range_col_idx != -1 && static_cast<int>(i) > layout.range_col_idx) {
+                bool use_upper_fill = upper_side;
+                if (use_bound_value) {
+                    if (upper_side) {
+                        use_upper_fill = !layout.upper.exclusive;
+                    } else {
+                        use_upper_fill = layout.lower.exclusive;
                     }
                 }
+                if (use_upper_fill) {
+                    fill_max_value(index_col, key.data() + offset);
+                } else {
+                    fill_min_value(index_col, key.data() + offset);
+                }
+            } else {
+                throw InternalError("Unexpected index key layout in IndexScanExecutor::build_key");
             }
             offset += index_col.len;
         }
@@ -117,33 +239,43 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
    public:
-    IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, std::vector<std::string> index_col_names,
-                    Context *context) {
+    IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> index_lookup_conds,
+                      std::vector<Condition> residual_conds, std::vector<std::string> index_col_names,
+                      std::optional<IndexMeta> index_meta, Context *context) {
         sm_manager_ = sm_manager;
         context_ = context;
         tab_name_ = std::move(tab_name);
         tab_ = sm_manager_->db_.get_table(tab_name_);
-        conds_ = std::move(conds);
-        // index_no_ = index_no;
+        index_lookup_conds_ = std::move(index_lookup_conds);
+        residual_conds_ = std::move(residual_conds);
         index_col_names_ = std::move(index_col_names); 
-        index_meta_ = *(tab_.get_index_meta(index_col_names_));
+        if (index_meta.has_value()) {
+            index_meta_ = *index_meta;
+        } else {
+            index_meta_ = *(tab_.get_index_meta(index_col_names_));
+        }
         fh_ = sm_manager_->fhs_.at(tab_name_).get();
         cols_ = tab_.cols;
         len_ = cols_.back().offset + cols_.back().len;
-        std::map<CompOp, CompOp> swap_op = {
-            {OP_EQ, OP_EQ}, {OP_NE, OP_NE}, {OP_LT, OP_GT}, {OP_GT, OP_LT}, {OP_LE, OP_GE}, {OP_GE, OP_LE},
-        };
-
-        for (auto &cond : conds_) {
+        
+        // normalize conds
+        for (auto &cond : index_lookup_conds_) {
             if (cond.lhs_col.tab_name != tab_name_) {
                 // lhs is on other table, now rhs must be on this table
                 assert(!cond.is_rhs_val && cond.rhs_col.tab_name == tab_name_);
                 // swap lhs and rhs
                 std::swap(cond.lhs_col, cond.rhs_col);
-                cond.op = swap_op.at(cond.op);
+                cond.op = kSwapOp.at(cond.op);
             }
         }
-        fed_conds_ = conds_;
+        for (auto &cond : residual_conds_) {
+            if (cond.lhs_col.tab_name != tab_name_) {
+                assert(!cond.is_rhs_val && cond.rhs_col.tab_name == tab_name_);
+                std::swap(cond.lhs_col, cond.rhs_col);
+                cond.op = kSwapOp.at(cond.op);
+            }
+        }
+        prepare_lookup_values();
         set_end();
     }
 
@@ -151,10 +283,39 @@ class IndexScanExecutor : public AbstractExecutor {
         auto ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_);
         auto *ih = sm_manager_->ihs_.at(ix_name).get();
 
-        auto lower_key = build_index_key(false);
-        auto upper_key = build_index_key(true);
-        Iid lower = ih->lower_bound(lower_key.data());
-        Iid upper = ih->upper_bound(upper_key.data());
+        LookupLayout layout = analyze_lookup_layout();
+        if (empty_range(layout)) {
+            scan_.reset();
+            set_end();
+            return;
+        }
+
+        Iid lower = ih->leaf_begin();
+        Iid upper = ih->leaf_end();
+
+        if (layout.range_col_idx == -1) {
+            auto lower_key = build_key(layout, false, false);
+            auto upper_key = build_key(layout, true, false);
+            lower = ih->lower_bound(lower_key.data());
+            upper = ih->upper_bound(upper_key.data());
+        } else {
+            if (layout.lower.has_value) {
+                auto lower_key = build_key(layout, false, true);
+                lower = layout.lower.exclusive ? ih->upper_bound(lower_key.data()) : ih->lower_bound(lower_key.data());
+            } else if (layout.eq_prefix_len > 0) {
+                auto lower_key = build_key(layout, false, false);
+                lower = ih->lower_bound(lower_key.data());
+            }
+
+            if (layout.upper.has_value) {
+                auto upper_key = build_key(layout, true, true);
+                upper = layout.upper.exclusive ? ih->lower_bound(upper_key.data()) : ih->upper_bound(upper_key.data());
+            } else if (layout.eq_prefix_len > 0) {
+                auto upper_key = build_key(layout, true, false);
+                upper = ih->upper_bound(upper_key.data());
+            }
+        }
+
         scan_ = std::make_unique<IxScan>(ih, lower, upper, sm_manager_->get_bpm());
         seek_to_next_valid();
     }

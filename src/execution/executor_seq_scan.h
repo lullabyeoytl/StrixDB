@@ -24,7 +24,7 @@ class SeqScanExecutor : public AbstractExecutor {
     RmFileHandle *fh_;                  // 表的数据文件句柄
     std::vector<ColMeta> cols_;         // scan后生成的记录的字段
     size_t len_;                        // scan后生成的每条记录的长度
-    std::vector<Condition> fed_conds_;  // 同conds_，两个字段相同
+    bool empty_result_ = false;
 
     Rid rid_;
     std::unique_ptr<RecScan> scan_;     // table_iterator
@@ -37,23 +37,16 @@ class SeqScanExecutor : public AbstractExecutor {
 
     // add filter conds
     void seek_to_next_valid() {
-        if (!scan_) {
+        if (!seek_to_next_valid_tuple(scan_.get(), rid_, conds_, cols_, [&](const Rid &rid) {
+                return fh_->get_record(rid, context_);
+            })) {
             set_end();
-            return;
         }
-        while (!scan_ -> is_end()) {
-            rid_ = scan_ -> rid();
-            auto record = fh_ -> get_record(rid_, context_);
-            if (evaluate_conditions(conds_, *record, cols_)) {
-                return;
-            }
-            scan_ -> next();
-        }
-        set_end();
     }
 
    public:
-    SeqScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, Context *context) {
+    SeqScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds,
+                    bool empty_result, Context *context) {
         sm_manager_ = sm_manager;
         tab_name_ = std::move(tab_name);
         conds_ = std::move(conds);
@@ -63,12 +56,16 @@ class SeqScanExecutor : public AbstractExecutor {
         len_ = cols_.back().offset + cols_.back().len;
 
         context_ = context;
-
-        fed_conds_ = conds_;
+        empty_result_ = empty_result;
         set_end();
     }
 
     void beginTuple() override {
+        if (empty_result_) {
+            scan_.reset();
+            set_end();
+            return;
+        }
         scan_ = std::make_unique<RmScan>(fh_);
         seek_to_next_valid();
     }
@@ -84,7 +81,6 @@ class SeqScanExecutor : public AbstractExecutor {
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        // return nullptr;
         if (is_end()) {
             return nullptr;
         }

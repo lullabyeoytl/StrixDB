@@ -13,11 +13,13 @@ See the Mulan PSL v2 for more details. */
 #include <cassert>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include "parser/ast.h"
 
 #include "parser/parser.h"
+#include "system/sm_meta.h"
 
 typedef enum PlanTag{
     T_Invalid = 1,
@@ -63,26 +65,49 @@ public:
 class ScanPlan : public Plan
 {
     public:
-        ScanPlan(PlanTag tag, SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds, std::vector<std::string> index_col_names)
+        ScanPlan(SmManager *sm_manager, std::string tab_name, std::vector<Condition> all_conds,
+                 bool empty_result = false)
         {
-            Plan::tag = tag;
+            Plan::tag = T_SeqScan;
             tab_name_ = std::move(tab_name);
-            conds_ = std::move(conds);
             TabMeta &tab = sm_manager->db_.get_table(tab_name_);
             cols_ = tab.cols;
             len_ = cols_.back().offset + cols_.back().len;
-            fed_conds_ = conds_;
-            index_col_names_ = index_col_names;
-        
+            all_conds_ = std::move(all_conds);
+            empty_result_ = empty_result;
+        }
+
+        ScanPlan(SmManager *sm_manager, std::string tab_name, std::vector<Condition> index_lookup_conds,
+                 std::vector<Condition> residual_conds, std::vector<std::string> index_col_names,
+                 std::optional<IndexMeta> index_meta = std::nullopt)
+        {
+            Plan::tag = T_IndexScan;
+            tab_name_ = std::move(tab_name);
+            TabMeta &tab = sm_manager->db_.get_table(tab_name_);
+            cols_ = tab.cols;
+            len_ = cols_.back().offset + cols_.back().len;
+            index_lookup_conds_ = std::move(index_lookup_conds);
+            residual_conds_ = std::move(residual_conds);
+            all_conds_ = index_lookup_conds_;
+            all_conds_.insert(all_conds_.end(), residual_conds_.begin(), residual_conds_.end());
+            index_col_names_ = std::move(index_col_names);
+            if (index_meta.has_value()) {
+                index_meta_ = std::move(index_meta);
+            } else if (!index_col_names_.empty()) {
+                index_meta_ = *tab.get_index_meta(index_col_names_);
+            }
         }
         ~ScanPlan(){}
         // 以下变量同ScanExecutor中的变量
         std::string tab_name_;                     
         std::vector<ColMeta> cols_;                
-        std::vector<Condition> conds_;             
+        std::vector<Condition> index_lookup_conds_;
+        std::vector<Condition> residual_conds_;
+        std::vector<Condition> all_conds_;
         size_t len_;                               
-        std::vector<Condition> fed_conds_;
         std::vector<std::string> index_col_names_;
+        std::optional<IndexMeta> index_meta_;
+        bool empty_result_ = false;
     
 };
 
