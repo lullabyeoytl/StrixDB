@@ -72,7 +72,7 @@ class SeqScanExecutor : public AbstractExecutor {
 
 
     void nextTuple() override {
-        if(!scan_ || scan_ -> is_end()) {
+        if (!scan_ || scan_->is_end()) {
             set_end();
             return;
         }
@@ -92,6 +92,9 @@ class SeqScanExecutor : public AbstractExecutor {
     bool is_end() const override {
         return rid_.page_no == -1 && rid_.slot_no == -1;
     }
+
+    // Expose the scan kind so upper DML executors can choose their row consumption strategy.
+    std::string getType() override { return "SeqScanExecutor"; }
 
     size_t tupleLen() const override { return len_; }
 

@@ -14,28 +14,50 @@ See the Mulan PSL v2 for more details. */
 #include "executor_abstract.h"
 #include "index/ix.h"
 #include "system/sm.h"
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 class DeleteExecutor : public AbstractExecutor {
    private:
     TabMeta tab_;                   // 表的元数据
     std::vector<Condition> conds_;  // delete的条件
     RmFileHandle *fh_;              // 表的数据文件句柄
-    std::vector<Rid> rids_;         // 需要删除的记录的位置
     std::string tab_name_;          // 表名称
     SmManager *sm_manager_;
+    std::unique_ptr<AbstractExecutor> scan_executor_;  // 扫描子执行器，负责提供待删除记录与位置
+
+    /**
+     * @brief Delete index entries for a single record across all indexes.
+     */
+    void delete_index_entries(const std::vector<IxIndexHandle *> &index_handles, const RmRecord &rec, const Rid &rid) {
+        for (size_t i = 0; i < tab_.indexes.size(); ++i) {
+            auto &index = tab_.indexes[i];
+            auto key = std::make_unique<char[]>(index.col_tot_len);
+            index.build_key(key.get(), rec.data);
+            index_handles[i]->delete_entry(key.get(), rid, context_->txn_);
+        }
+    }
 
    public:
     DeleteExecutor(SmManager *sm_manager, const std::string &tab_name, std::vector<Condition> conds,
-                   std::vector<Rid> rids, Context *context) {
+                   std::unique_ptr<AbstractExecutor> scan_executor, Context *context) {
         sm_manager_ = sm_manager;
         tab_name_ = tab_name;
         tab_ = sm_manager_->db_.get_table(tab_name);
         fh_ = sm_manager_->fhs_.at(tab_name).get();
-        conds_ = conds;
-        rids_ = rids;
+        conds_ = std::move(conds);
+        scan_executor_ = std::move(scan_executor);
         context_ = context;
     }
 
+    /**
+     * @brief Execute hybrid delete consumption based on the child scan type.
+     *
+     * Sequential scans can delete rows as they are produced.
+     * Index scans must be drained first so index mutations do not destabilize iteration.
+     */
     std::unique_ptr<RmRecord> Next() override {
         // Pre-compute index handles (loop-invariant across rows)
         std::vector<IxIndexHandle *> index_handles;
@@ -44,17 +66,39 @@ class DeleteExecutor : public AbstractExecutor {
             index_handles.push_back(sm_manager_->get_ih(tab_name_, tab_.indexes[i].cols));
         }
 
-        for (auto &rid : rids_) {
-            auto rec = fh_->get_record(rid, context_);
-            for (size_t i = 0; i < tab_.indexes.size(); ++i) {
-                auto &index = tab_.indexes[i];
-                auto key = std::make_unique<char[]>(index.col_tot_len);
-                index.build_key(key.get(), rec->data);
-                index_handles[i]->delete_entry(key.get(), rid, context_->txn_);
+        if (scan_executor_->getType() == "SeqScanExecutor") {
+            // Sequential scans can stream records one by one because deleting the current row
+            // does not invalidate the remaining table scan order.
+            for (scan_executor_->beginTuple(); !scan_executor_->is_end(); scan_executor_->nextTuple()) {
+                Rid rid = scan_executor_->rid();
+                auto rec = scan_executor_->Next();
+                delete_index_entries(index_handles, *rec, rid);
+                fh_->delete_record(rid, context_);
             }
-            fh_->delete_record(rid, context_);
+            return nullptr;
         }
-        return nullptr;
+
+        if (scan_executor_->getType() == "IndexScanExecutor") {
+            struct DeleteCandidate {
+                Rid rid;
+                std::unique_ptr<RmRecord> rec;
+            };
+
+            std::vector<DeleteCandidate> candidates;
+            // Index scans must consume all visible tuples before any delete mutates index state,
+            // otherwise the underlying scan cursor may observe an unstable key space.
+            for (scan_executor_->beginTuple(); !scan_executor_->is_end(); scan_executor_->nextTuple()) {
+                candidates.push_back(DeleteCandidate{scan_executor_->rid(), scan_executor_->Next()});
+            }
+
+            for (auto &candidate : candidates) {
+                delete_index_entries(index_handles, *candidate.rec, candidate.rid);
+                fh_->delete_record(candidate.rid, context_);
+            }
+            return nullptr;
+        }
+
+        throw InternalError("DeleteExecutor requires a scan executor child");
     }
 
     Rid &rid() override { return _abstract_rid; }

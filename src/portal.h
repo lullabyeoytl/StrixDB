@@ -80,25 +80,19 @@ class Portal
                     
                 case T_Update:
                 {
-                    std::unique_ptr<AbstractExecutor> scan= convert_plan_executor(x->subplan_, context);
-                    std::vector<Rid> rids;
-                    for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
-                        rids.push_back(scan->rid());
-                    }
+                    // Row consumption strategy is delegated to the DML executor together with scan ownership.
+                    std::unique_ptr<AbstractExecutor> scan = convert_plan_executor(x->subplan_, context);
                     std::unique_ptr<AbstractExecutor> root =std::make_unique<UpdateExecutor>(sm_manager_, 
-                                                            x->tab_name_, x->set_clauses_, x->conds_, rids, context);
+                                                            x->tab_name_, x->set_clauses_, x->conds_, std::move(scan), context);
                     return std::make_shared<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<TabCol>(), std::move(root), plan);
                 }
                 case T_Delete:
                 {
-                    std::unique_ptr<AbstractExecutor> scan= convert_plan_executor(x->subplan_, context);
-                    std::vector<Rid> rids;
-                    for (scan->beginTuple(); !scan->is_end(); scan->nextTuple()) {
-                        rids.push_back(scan->rid());
-                    }
+                    // Row consumption strategy is delegated to the DML executor together with scan ownership.
+                    std::unique_ptr<AbstractExecutor> scan = convert_plan_executor(x->subplan_, context);
 
                     std::unique_ptr<AbstractExecutor> root =
-                        std::make_unique<DeleteExecutor>(sm_manager_, x->tab_name_, x->conds_, rids, context);
+                        std::make_unique<DeleteExecutor>(sm_manager_, x->tab_name_, x->conds_, std::move(scan), context);
 
                     return std::make_shared<PortalStmt>(PORTAL_DML_WITHOUT_SELECT, std::vector<TabCol>(), std::move(root), plan);
                 }

@@ -342,6 +342,9 @@ class IndexScanExecutor : public AbstractExecutor {
         return rid_.page_no == -1 && rid_.slot_no == -1;
     }
 
+    // Expose the scan kind so upper DML executors can choose their row consumption strategy.
+    std::string getType() override { return "IndexScanExecutor"; }
+
     size_t tupleLen() const override { return len_; }
 
     const std::vector<ColMeta> &cols() const override { return cols_; }
