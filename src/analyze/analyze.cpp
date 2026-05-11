@@ -68,9 +68,20 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         
         std::vector<ColMeta> all_cols;
         get_all_cols(query->tables, all_cols);
+        std::vector<std::string> visible_tables = query->tables;
+        bool all_semi_joins = !x->jointree.empty() &&
+                              std::all_of(x->jointree.begin(), x->jointree.end(),
+                                          [](const std::shared_ptr<ast::JoinExpr> &join_expr) {
+                                              return join_expr->type == SEMI_JOIN;
+                                          });
+        if (all_semi_joins) {
+            visible_tables = {x->jointree.front()->left};
+        }
+        std::vector<ColMeta> visible_cols;
+        get_all_cols(visible_tables, visible_cols);
         if (x->cols.empty()) {
             // select all columns
-            for (auto &col : all_cols) {
+            for (auto &col : visible_cols) {
                 TabCol sel_col = {.tab_name = col.tab_name, .col_name = col.name};
                 query->cols.push_back(sel_col);
                 query->select_items.push_back(sel_col);
@@ -78,7 +89,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         } else {
             // infer table name from column name
             for (auto &sel_col : query->cols) {
-                check_column(all_cols, sel_col);  // 列元数据校验
+                check_column(visible_cols, sel_col);  // 列元数据校验
             }
             query->select_items.clear();
             size_t col_idx = 0;
@@ -94,13 +105,13 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         }
         for (auto &agg : query->agg_infos) {
             if (!agg.is_star) {
-                check_column(all_cols, agg.col);
+                check_column(visible_cols, agg.col);
             }
         }
         if (x->has_group_by) {
             for (auto &sv_group_col : x->group_by->cols) {
                 TabCol group_col = {.tab_name = sv_group_col->tab_name, .col_name = sv_group_col->col_name};
-                check_column(all_cols, group_col);
+                check_column(visible_cols, group_col);
                 query->group_by_cols.push_back(group_col);
             }
         }
@@ -111,12 +122,12 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
             if (sv_having->is_agg) {
                 having_cond.agg = convert_agg_func(sv_having->agg);
                 if (!having_cond.agg.is_star) {
-                    check_column(all_cols, having_cond.agg.col);
+                    check_column(visible_cols, having_cond.agg.col);
                 }
                 append_unique_agg(query->agg_infos, having_cond.agg);
             } else {
                 having_cond.col = {.tab_name = sv_having->col->tab_name, .col_name = sv_having->col->col_name};
-                check_column(all_cols, having_cond.col);
+                check_column(visible_cols, having_cond.col);
             }
             auto rhs_val = std::dynamic_pointer_cast<ast::Value>(sv_having->rhs);
             if (rhs_val == nullptr) {
@@ -125,7 +136,12 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
             having_cond.rhs_val = convert_sv_value(rhs_val);
             query->having_conds.push_back(having_cond);
         }
-        check_aggregate(all_cols, *query);
+        check_aggregate(visible_cols, *query);
+        if (!x->jointree.empty()) {
+            for (auto &sv_join : x->jointree) {
+                normalize_sv_conds(sv_join->conds, all_cols);
+            }
+        }
         //处理where条件
         get_clause(x->conds, query->conds);
         check_clause(all_cols, query->conds);
@@ -222,6 +238,21 @@ void Analyze::get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv
             cond.rhs_col = {.tab_name = rhs_col->tab_name, .col_name = rhs_col->col_name};
         }
         conds.push_back(cond);
+    }
+}
+
+void Analyze::normalize_sv_conds(std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds, const std::vector<ColMeta> &all_cols) {
+    std::vector<Condition> conds;
+    get_clause(sv_conds, conds);
+    check_clause(all_cols, conds);
+    for (size_t i = 0; i < sv_conds.size(); ++i) {
+        sv_conds[i]->lhs->tab_name = conds[i].lhs_col.tab_name;
+        if (!conds[i].is_rhs_val) {
+            auto rhs_col = std::dynamic_pointer_cast<ast::Col>(sv_conds[i]->rhs);
+            if (rhs_col != nullptr) {
+                rhs_col->tab_name = conds[i].rhs_col.tab_name;
+            }
+        }
     }
 }
 

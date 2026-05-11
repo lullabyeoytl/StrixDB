@@ -9,6 +9,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
+#include <cstring>
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
@@ -19,41 +20,153 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
    private:
     std::unique_ptr<AbstractExecutor> left_;    // 左儿子节点（需要join的表）
     std::unique_ptr<AbstractExecutor> right_;   // 右儿子节点（需要join的表）
-    size_t len_;                                // join后获得的每条记录的长度
-    std::vector<ColMeta> cols_;                 // join后获得的记录的字段
+    JoinType join_type_ = INNER_JOIN;
+    size_t eval_len_ = 0;
+    std::vector<ColMeta> eval_cols_;
+    size_t output_len_ = 0;
+    std::vector<ColMeta> output_cols_;
 
     std::vector<Condition> fed_conds_;          // join条件
     bool isend;
+    size_t left_len_ = 0;
+    size_t right_len_ = 0;
+    Rid left_rid_{-1, -1};
+    std::unique_ptr<RmRecord> left_rec_;
+    std::unique_ptr<RmRecord> right_rec_;
+
+    void set_end() {
+        isend = true;
+        left_rid_ = Rid{-1, -1};
+        left_rec_.reset();
+        right_rec_.reset();
+    }
+
+    auto build_eval_record(const RmRecord &left_rec, const RmRecord &right_rec) const -> std::unique_ptr<RmRecord> {
+        auto out = std::make_unique<RmRecord>(static_cast<int>(eval_len_));
+        memcpy(out->data, left_rec.data, left_len_);
+        memcpy(out->data + left_len_, right_rec.data, right_len_);
+        return out;
+    }
+
+    auto current_pair_matches() const -> bool {
+        if (left_rec_ == nullptr || right_rec_ == nullptr) {
+            return false;
+        }
+        if (fed_conds_.empty()) {
+            return true;
+        }
+        auto joined = build_eval_record(*left_rec_, *right_rec_);
+        return evaluate_conditions(fed_conds_, *joined, eval_cols_);
+    }
+
+    void seek_next_match(bool advance_left) {
+        if (isend) {
+            return;
+        }
+
+        if (advance_left) {
+            left_->nextTuple();
+            if (left_->is_end()) {
+                set_end();
+                return;
+            }
+            left_rid_ = left_->rid();
+            left_rec_ = left_->Next();
+            right_->beginTuple();
+        }
+
+        while (!left_->is_end()) {
+            while (!right_->is_end()) {
+                right_rec_ = right_->Next();
+                if (current_pair_matches()) {
+                    isend = false;
+                    return;
+                }
+                right_->nextTuple();
+            }
+            left_->nextTuple();
+            if (left_->is_end()) {
+                break;
+            }
+            left_rid_ = left_->rid();
+            left_rec_ = left_->Next();
+            right_->beginTuple();
+        }
+
+        set_end();
+    }
 
    public:
     NestedLoopJoinExecutor(std::unique_ptr<AbstractExecutor> left, std::unique_ptr<AbstractExecutor> right, 
-                            std::vector<Condition> conds) {
+                            std::vector<Condition> conds, JoinType join_type = INNER_JOIN) {
         left_ = std::move(left);
         right_ = std::move(right);
-        len_ = left_->tupleLen() + right_->tupleLen();
-        cols_ = left_->cols();
+        join_type_ = join_type;
+        left_len_ = left_->tupleLen();
+        right_len_ = right_->tupleLen();
+        eval_len_ = left_len_ + right_len_;
+        eval_cols_ = left_->cols();
         auto right_cols = right_->cols();
         for (auto &col : right_cols) {
-            col.offset += left_->tupleLen();
+            col.offset += left_len_;
         }
 
-        cols_.insert(cols_.end(), right_cols.begin(), right_cols.end());
-        isend = false;
+        eval_cols_.insert(eval_cols_.end(), right_cols.begin(), right_cols.end());
+        if (join_type_ == SEMI_JOIN) {
+            output_len_ = left_len_;
+            output_cols_ = left_->cols();
+        } else {
+            output_len_ = eval_len_;
+            output_cols_ = eval_cols_;
+        }
+        isend = true;
         fed_conds_ = std::move(conds);
 
     }
 
     void beginTuple() override {
-
+        left_->beginTuple();
+        if (left_->is_end()) {
+            set_end();
+            return;
+        }
+        left_rid_ = left_->rid();
+        left_rec_ = left_->Next();
+        right_->beginTuple();
+        isend = false;
+        seek_next_match(false);
     }
 
     void nextTuple() override {
-        
+        if (isend) {
+            return;
+        }
+        if (join_type_ == SEMI_JOIN) {
+            seek_next_match(true);
+            return;
+        }
+        right_->nextTuple();
+        seek_next_match(false);
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        if (isend || left_rec_ == nullptr || right_rec_ == nullptr) {
+            return nullptr;
+        }
+        _abstract_rid = left_rid_;
+        if (join_type_ == SEMI_JOIN) {
+            auto out = std::make_unique<RmRecord>(static_cast<int>(output_len_));
+            memcpy(out->data, left_rec_->data, output_len_);
+            return out;
+        }
+        return build_eval_record(*left_rec_, *right_rec_);
     }
 
     Rid &rid() override { return _abstract_rid; }
+
+    bool is_end() const override { return isend; }
+
+    size_t tupleLen() const override { return output_len_; }
+
+    const std::vector<ColMeta> &cols() const override { return output_cols_; }
 };
