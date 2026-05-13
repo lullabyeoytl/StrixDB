@@ -9,12 +9,9 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #pragma once
-#include <cstring>
-#include "execution_defs.h"
-#include "execution_manager.h"
+#include "join_common.h"
+#include "execution_common.h"
 #include "executor_abstract.h"
-#include "index/ix.h"
-#include "system/sm.h"
 
 class NestedLoopJoinExecutor : public AbstractExecutor {
    private:
@@ -41,13 +38,6 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
         right_rec_.reset();
     }
 
-    auto build_eval_record(const RmRecord &left_rec, const RmRecord &right_rec) const -> std::unique_ptr<RmRecord> {
-        auto out = std::make_unique<RmRecord>(static_cast<int>(eval_len_));
-        memcpy(out->data, left_rec.data, left_len_);
-        memcpy(out->data + left_len_, right_rec.data, right_len_);
-        return out;
-    }
-
     auto current_pair_matches() const -> bool {
         if (left_rec_ == nullptr || right_rec_ == nullptr) {
             return false;
@@ -55,7 +45,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
         if (fed_conds_.empty()) {
             return true;
         }
-        auto joined = build_eval_record(*left_rec_, *right_rec_);
+        auto joined = build_join_eval_record(*left_rec_, *right_rec_, left_len_, right_len_);
         return evaluate_conditions(fed_conds_, *joined, eval_cols_);
     }
 
@@ -104,21 +94,11 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
         join_type_ = join_type;
         left_len_ = left_->tupleLen();
         right_len_ = right_->tupleLen();
-        eval_len_ = left_len_ + right_len_;
-        eval_cols_ = left_->cols();
-        auto right_cols = right_->cols();
-        for (auto &col : right_cols) {
-            col.offset += left_len_;
-        }
-
-        eval_cols_.insert(eval_cols_.end(), right_cols.begin(), right_cols.end());
-        if (join_type_ == SEMI_JOIN) {
-            output_len_ = left_len_;
-            output_cols_ = left_->cols();
-        } else {
-            output_len_ = eval_len_;
-            output_cols_ = eval_cols_;
-        }
+        auto layout = build_join_schema_layout(left_->cols(), left_len_, right_->cols(), right_len_, join_type_);
+        eval_len_ = layout.eval_len;
+        eval_cols_ = std::move(layout.eval_cols);
+        output_len_ = layout.output_len;
+        output_cols_ = std::move(layout.output_cols);
         isend = true;
         fed_conds_ = std::move(conds);
 
@@ -155,11 +135,9 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
         }
         _abstract_rid = left_rid_;
         if (join_type_ == SEMI_JOIN) {
-            auto out = std::make_unique<RmRecord>(static_cast<int>(output_len_));
-            memcpy(out->data, left_rec_->data, output_len_);
-            return out;
+            return build_semi_output_record(*left_rec_, output_len_);
         }
-        return build_eval_record(*left_rec_, *right_rec_);
+        return build_join_eval_record(*left_rec_, *right_rec_, left_len_, right_len_);
     }
 
     Rid &rid() override { return _abstract_rid; }
