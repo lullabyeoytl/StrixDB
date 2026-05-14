@@ -172,20 +172,23 @@ class Portal
                                                            x->residual_conds_, x->index_col_names_,
                                                            x->index_meta_, context);
             } 
-        } else if(auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
+        } else if(auto x = std::dynamic_pointer_cast<NestedLoopJoinPlan>(plan)) {
             std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_, context);
             std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_, context);
-            if (x->tag == T_SortMerge) {
-                return std::make_unique<SortMergeJoinExecutor>(std::move(left), std::move(right),
-                                                               std::move(x->merge_conds_),
-                                                               std::move(x->residual_conds_),
-                                                               x->type);
-            }
-            if (x->tag == T_NestLoop) {
-                return std::make_unique<NestedLoopJoinExecutor>(std::move(left), std::move(right),
-                                                                std::move(x->conds_), x->type);
-            }
-            throw InternalError("Unexpected join plan tag");
+            return std::make_unique<NestedLoopJoinExecutor>(std::move(left), std::move(right),
+                                                            std::move(x->conds_), x->join_type_);
+        } else if(auto x = std::dynamic_pointer_cast<SortMergeJoinPlan>(plan)) {
+            std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_, context);
+            std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_, context);
+            return std::make_unique<SortMergeJoinExecutor>(std::move(left), std::move(right),
+                                                           std::move(x->merge_conds_),
+                                                           std::move(x->residual_conds_),
+                                                           x->join_type_);
+        } else if(auto x = std::dynamic_pointer_cast<HashJoinPlan>(plan)) {
+            (void)x;
+            throw RMDBError("HashJoinExecutor is not implemented yet");
+        } else if(auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
+            throw InternalError("Logical JoinPlan must be physicalized before executor conversion");
         } else if(auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
             return std::make_unique<SortExecutor>(convert_plan_executor(x->subplan_, context), 
                                                   x->sort_cols_, x->is_descs_);

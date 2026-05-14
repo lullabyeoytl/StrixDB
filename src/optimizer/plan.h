@@ -43,8 +43,10 @@ typedef enum PlanTag{
     T_Transaction_rollback,
     T_SeqScan,
     T_IndexScan,
+    T_Join,
     T_NestLoop,
     T_SortMerge,    // sort merge join
+    T_HashJoin,     // hash join
     T_Sort,
     T_Projection,
     T_Aggregation
@@ -115,32 +117,89 @@ class ScanPlan : public Plan
 class JoinPlan : public Plan
 {
     public:
-        JoinPlan(PlanTag tag, std::shared_ptr<Plan> left, std::shared_ptr<Plan> right, std::vector<Condition> conds,
-                 JoinType type_ = INNER_JOIN)
+        JoinPlan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right, std::vector<Condition> conds,
+                 JoinType join_type = INNER_JOIN)
         {
-            Plan::tag = tag;
+            Plan::tag = T_Join;
             left_ = std::move(left);
             right_ = std::move(right);
             conds_ = std::move(conds);
-            type = type_;
+            join_type_ = join_type;
         }
         ~JoinPlan(){}
-        // 左节点
+        // Logical join children before physicalization.
         std::shared_ptr<Plan> left_;
-        // 右节点
         std::shared_ptr<Plan> right_;
-        // Generic join predicates. Nested Loop Join consumes this list directly.
-        // Sort Merge Join further splits it into merge keys and residual filters in the planner.
+        // Logical join predicates collected during join tree construction.
         std::vector<Condition> conds_;
-        // merge_conds_ stores equi-join keys only. Its order matches left/right sort key lists.
+        // The logical join type must survive physicalization because output schema depends on it.
+        JoinType join_type_;
+};
+
+class PhysicalJoinPlan : public Plan
+{
+    public:
+        PhysicalJoinPlan(PlanTag join_tag, std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
+                         JoinType join_type = INNER_JOIN)
+        {
+            Plan::tag = join_tag;
+            left_ = std::move(left);
+            right_ = std::move(right);
+            join_type_ = join_type;
+        }
+        ~PhysicalJoinPlan() override = default;
+        // Physical join nodes consume already-implemented children.
+        std::shared_ptr<Plan> left_;
+        std::shared_ptr<Plan> right_;
+        JoinType join_type_;
+};
+
+class NestedLoopJoinPlan : public PhysicalJoinPlan
+{
+    public:
+        NestedLoopJoinPlan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right, std::vector<Condition> conds,
+                           JoinType join_type = INNER_JOIN)
+            : PhysicalJoinPlan(T_NestLoop, std::move(left), std::move(right), join_type)
+        {
+            conds_ = std::move(conds);
+        }
+        ~NestedLoopJoinPlan() override = default;
+        // Nested Loop Join re-checks the full predicate list on each candidate pair.
+        std::vector<Condition> conds_;
+};
+
+class SortMergeJoinPlan : public PhysicalJoinPlan
+{
+    public:
+        SortMergeJoinPlan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
+                          std::vector<Condition> merge_conds, std::vector<Condition> residual_conds,
+                          JoinType join_type = INNER_JOIN)
+            : PhysicalJoinPlan(T_SortMerge, std::move(left), std::move(right), join_type)
+        {
+            merge_conds_ = std::move(merge_conds);
+            residual_conds_ = std::move(residual_conds);
+        }
+        ~SortMergeJoinPlan() override = default;
+        // Equi-join keys are used to drive the merge phase after the planner injects SortPlan nodes.
         std::vector<Condition> merge_conds_;
-        // residual_conds_ stores additional predicates to re-check on candidate pairs.
         std::vector<Condition> residual_conds_;
-        // Sort key orders required by SMJ on each input side.
-        std::vector<TabCol> left_sort_cols_;
-        std::vector<TabCol> right_sort_cols_;
-        // future TODO: 后续可以支持的连接类型
-        JoinType type;
+};
+
+class HashJoinPlan : public PhysicalJoinPlan
+{
+    public:
+        HashJoinPlan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
+                     std::vector<Condition> hash_conds, std::vector<Condition> residual_conds,
+                     JoinType join_type = INNER_JOIN)
+            : PhysicalJoinPlan(T_HashJoin, std::move(left), std::move(right), join_type)
+        {
+            hash_conds_ = std::move(hash_conds);
+            residual_conds_ = std::move(residual_conds);
+        }
+        ~HashJoinPlan() override = default;
+        // Hash Join will build hash tables from equi-join keys when the executor is introduced later.
+        std::vector<Condition> hash_conds_;
+        std::vector<Condition> residual_conds_;
 };
 
 class ProjectionPlan : public Plan

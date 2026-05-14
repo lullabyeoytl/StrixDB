@@ -27,17 +27,55 @@ See the Mulan PSL v2 for more details. */
 namespace {
 auto convert_join_expr_conds(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds) -> std::vector<Condition>;
 
-struct SortMergeLayout {
-    bool supported = false;
-    std::vector<Condition> merge_conds;
-    std::vector<Condition> residual_conds;
-    std::vector<TabCol> left_sort_cols;
-    std::vector<TabCol> right_sort_cols;
+enum class JoinImplementation {
+    NestedLoop,
+    SortMerge,
+    Hash
 };
 
-auto sortmerge_supports_join_type(JoinType type) -> bool;
-auto classify_sortmerge_layout(const std::vector<Condition> &conds, JoinType type) -> SortMergeLayout;
-void finalize_join_plan_tree(const std::shared_ptr<Plan> &plan, bool prefer_sortmerge);
+struct JoinPredicateAnalysis {
+    std::vector<Condition> all_conds;
+    std::vector<Condition> equi_conds;
+    std::vector<Condition> residual_conds;
+    std::vector<TabCol> left_key_cols;
+    std::vector<TabCol> right_key_cols;
+    bool has_equi_keys = false;
+};
+
+struct JoinImplementationConfig {
+    bool enable_nestedloop = true;
+    bool enable_sortmerge = true;
+    bool enable_hash = false;
+};
+
+struct JoinImplementationDecision {
+    JoinImplementation implementation = JoinImplementation::NestedLoop;
+    bool requires_left_sort = false;
+    bool requires_right_sort = false;
+    std::string fallback_reason;
+};
+
+auto build_join_implementation_config(bool enable_nestedloop_join, bool enable_sortmerge_join)
+    -> JoinImplementationConfig;
+auto supports_join_implementation(JoinImplementation implementation, JoinType join_type) -> bool;
+auto analyze_join_predicates(const std::vector<Condition> &conds) -> JoinPredicateAnalysis;
+auto choose_join_implementation(const JoinPredicateAnalysis &analysis, JoinType join_type,
+                                const JoinImplementationConfig &config) -> JoinImplementationDecision;
+void validate_join_executor_config(const JoinImplementationConfig &config);
+auto build_nestedloop_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
+                                const JoinPredicateAnalysis &analysis, JoinType join_type)
+    -> std::shared_ptr<Plan>;
+auto build_sortmerge_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
+                               const JoinPredicateAnalysis &analysis, JoinType join_type)
+    -> std::shared_ptr<Plan>;
+auto build_hash_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
+                          const JoinPredicateAnalysis &analysis, JoinType join_type)
+    -> std::shared_ptr<Plan>;
+auto physicalize_logical_join(const std::shared_ptr<JoinPlan> &join, std::shared_ptr<Plan> left,
+                              std::shared_ptr<Plan> right, const JoinImplementationConfig &config)
+    -> std::shared_ptr<Plan>;
+auto physicalize_join_tree(const std::shared_ptr<Plan> &plan, const JoinImplementationConfig &config)
+    -> std::shared_ptr<Plan>;
 }
 
 void prepare_index_lookup_values(const IndexMeta &index_meta, std::vector<Condition> &lookup_conds) {
@@ -190,18 +228,32 @@ auto convert_join_expr_conds(const std::vector<std::shared_ptr<ast::BinaryExpr>>
     return conds;
 }
 
-auto pick_join_tag(bool enable_nestedloop_join, bool enable_sortmerge_join) -> PlanTag {
-    if (enable_sortmerge_join) {
-        return T_SortMerge;
-    }
-    if (enable_nestedloop_join) {
-        return T_NestLoop;
-    }
-    throw RMDBError("No join executor selected!");
+auto build_join_implementation_config(bool enable_nestedloop_join, bool enable_sortmerge_join)
+    -> JoinImplementationConfig {
+    JoinImplementationConfig config;
+    config.enable_nestedloop = enable_nestedloop_join;
+    config.enable_sortmerge = enable_sortmerge_join;
+    // Hash Join stays disabled until the executor lands. The generic decision
+    // path is introduced first so later extensions do not reshape planner APIs.
+    config.enable_hash = false;
+    return config;
 }
 
-auto sortmerge_supports_join_type(JoinType type) -> bool {
-    switch (type) {
+void validate_join_executor_config(const JoinImplementationConfig &config) {
+    if (!config.enable_nestedloop && !config.enable_sortmerge && !config.enable_hash) {
+        throw RMDBError("No join executor selected!");
+    }
+}
+
+auto supports_join_implementation(JoinImplementation implementation, JoinType join_type) -> bool {
+    switch (implementation) {
+        case JoinImplementation::NestedLoop:
+            return true;
+        case JoinImplementation::SortMerge:
+        case JoinImplementation::Hash:
+            break;
+    }
+    switch (join_type) {
         case INNER_JOIN:
         case SEMI_JOIN:
             return true;
@@ -210,65 +262,105 @@ auto sortmerge_supports_join_type(JoinType type) -> bool {
     }
 }
 
-auto classify_sortmerge_layout(const std::vector<Condition> &conds, JoinType type) -> SortMergeLayout {
-    SortMergeLayout layout;
-    layout.residual_conds = conds;
-    if (!sortmerge_supports_join_type(type)) {
-        return layout;
-    }
+auto analyze_join_predicates(const std::vector<Condition> &conds) -> JoinPredicateAnalysis {
+    JoinPredicateAnalysis analysis;
+    analysis.all_conds = conds;
+    analysis.residual_conds = conds;
     for (const auto &cond : conds) {
         if (cond.is_rhs_val || cond.op != OP_EQ) {
             continue;
         }
-        layout.merge_conds.push_back(cond);
-        layout.left_sort_cols.push_back(cond.lhs_col);
-        layout.right_sort_cols.push_back(cond.rhs_col);
+        analysis.equi_conds.push_back(cond);
+        analysis.left_key_cols.push_back(cond.lhs_col);
+        analysis.right_key_cols.push_back(cond.rhs_col);
     }
-    if (!layout.merge_conds.empty()) {
-        layout.supported = true;
-        layout.residual_conds.erase(
-            std::remove_if(layout.residual_conds.begin(), layout.residual_conds.end(),
+    if (!analysis.equi_conds.empty()) {
+        analysis.has_equi_keys = true;
+        analysis.residual_conds.erase(
+            std::remove_if(analysis.residual_conds.begin(), analysis.residual_conds.end(),
                            [](const Condition &cond) { return !cond.is_rhs_val && cond.op == OP_EQ; }),
-            layout.residual_conds.end());
+            analysis.residual_conds.end());
     }
-    return layout;
+    return analysis;
 }
 
-void finalize_join_plan_tree(const std::shared_ptr<Plan> &plan, bool prefer_sortmerge) {
+auto choose_join_implementation(const JoinPredicateAnalysis &analysis, JoinType join_type,
+                                const JoinImplementationConfig &config) -> JoinImplementationDecision {
+    JoinImplementationDecision decision;
+    if (config.enable_hash && analysis.has_equi_keys &&
+        supports_join_implementation(JoinImplementation::Hash, join_type)) {
+        decision.implementation = JoinImplementation::Hash;
+        return decision;
+    }
+    if (config.enable_sortmerge && analysis.has_equi_keys &&
+        supports_join_implementation(JoinImplementation::SortMerge, join_type)) {
+        decision.implementation = JoinImplementation::SortMerge;
+        decision.requires_left_sort = true;
+        decision.requires_right_sort = true;
+        return decision;
+    }
+    if (config.enable_nestedloop) {
+        decision.implementation = JoinImplementation::NestedLoop;
+        decision.fallback_reason =
+            analysis.has_equi_keys ? "preferred implementations unavailable for join type" : "no equi-join keys";
+        return decision;
+    }
+    throw RMDBError("No join implementation available!");
+}
+
+auto build_nestedloop_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
+                                const JoinPredicateAnalysis &analysis, JoinType join_type)
+    -> std::shared_ptr<Plan> {
+    return std::make_shared<NestedLoopJoinPlan>(std::move(left), std::move(right), analysis.all_conds, join_type);
+}
+
+auto build_sortmerge_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
+                               const JoinPredicateAnalysis &analysis, JoinType join_type)
+    -> std::shared_ptr<Plan> {
+    auto left_sort_cols = analysis.left_key_cols;
+    auto right_sort_cols = analysis.right_key_cols;
+    auto sorted_left = std::make_shared<SortPlan>(T_Sort, std::move(left), left_sort_cols,
+                                                  std::vector<bool>(left_sort_cols.size(), false));
+    auto sorted_right = std::make_shared<SortPlan>(T_Sort, std::move(right), right_sort_cols,
+                                                   std::vector<bool>(right_sort_cols.size(), false));
+    return std::make_shared<SortMergeJoinPlan>(std::move(sorted_left), std::move(sorted_right),
+                                               analysis.equi_conds, analysis.residual_conds, join_type);
+}
+
+auto build_hash_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
+                          const JoinPredicateAnalysis &analysis, JoinType join_type)
+    -> std::shared_ptr<Plan> {
+    return std::make_shared<HashJoinPlan>(std::move(left), std::move(right), analysis.equi_conds,
+                                          analysis.residual_conds, join_type);
+}
+
+auto physicalize_logical_join(const std::shared_ptr<JoinPlan> &join, std::shared_ptr<Plan> left,
+                              std::shared_ptr<Plan> right, const JoinImplementationConfig &config)
+    -> std::shared_ptr<Plan> {
+    auto analysis = analyze_join_predicates(join->conds_);
+    auto decision = choose_join_implementation(analysis, join->join_type_, config);
+    switch (decision.implementation) {
+        case JoinImplementation::NestedLoop:
+            return build_nestedloop_join_plan(std::move(left), std::move(right), analysis, join->join_type_);
+        case JoinImplementation::SortMerge:
+            return build_sortmerge_join_plan(std::move(left), std::move(right), analysis, join->join_type_);
+        case JoinImplementation::Hash:
+            return build_hash_join_plan(std::move(left), std::move(right), analysis, join->join_type_);
+    }
+    throw InternalError("Unexpected join implementation decision");
+}
+
+auto physicalize_join_tree(const std::shared_ptr<Plan> &plan, const JoinImplementationConfig &config)
+    -> std::shared_ptr<Plan> {
     auto join = std::dynamic_pointer_cast<JoinPlan>(plan);
     if (join == nullptr) {
-        return;
-    }
-    finalize_join_plan_tree(join->left_, prefer_sortmerge);
-    finalize_join_plan_tree(join->right_, prefer_sortmerge);
-
-    join->merge_conds_.clear();
-    join->residual_conds_ = join->conds_;
-    join->left_sort_cols_.clear();
-    join->right_sort_cols_.clear();
-
-    if (!prefer_sortmerge) {
-        join->tag = T_NestLoop;
-        return;
+        return plan;
     }
 
-    auto layout = classify_sortmerge_layout(join->conds_, join->type);
-    if (!layout.supported) {
-        join->tag = T_NestLoop;
-        return;
-    }
-
-    join->tag = T_SortMerge;
-    join->merge_conds_ = std::move(layout.merge_conds);
-    join->residual_conds_ = std::move(layout.residual_conds);
-    join->left_sort_cols_ = std::move(layout.left_sort_cols);
-    join->right_sort_cols_ = std::move(layout.right_sort_cols);
-    // SortMergeJoin consumes sorted children. The planner injects explicit SortPlan
-    // nodes so the portal only needs to dispatch executors by PlanTag.
-    join->left_ = std::make_shared<SortPlan>(T_Sort, join->left_, join->left_sort_cols_,
-                                             std::vector<bool>(join->left_sort_cols_.size(), false));
-    join->right_ = std::make_shared<SortPlan>(T_Sort, join->right_, join->right_sort_cols_,
-                                              std::vector<bool>(join->right_sort_cols_.size(), false));
+    // Physicalization must recurse first so every physical join consumes already-implemented children instead of mutating the logical tree in place.
+    auto left = physicalize_join_tree(join->left_, config);
+    auto right = physicalize_join_tree(join->right_, config);
+    return physicalize_logical_join(join, std::move(left), std::move(right), config);
 }
 
 }  // namespace
@@ -401,7 +493,8 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
     // 获取where条件
     auto conds = std::move(pending_conds);
     std::shared_ptr<Plan> table_join_executors;
-    PlanTag join_tag = pick_join_tag(enable_nestedloop_join, enable_sortmerge_join);
+    auto join_impl_config = build_join_implementation_config(enable_nestedloop_join, enable_sortmerge_join);
+    validate_join_executor_config(join_impl_config);
     
     int scantbl[tables.size()];
     for(size_t i = 0; i < tables.size(); i++)
@@ -425,20 +518,20 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
             }
 
             if (table_join_executors == nullptr) {
-                table_join_executors = std::make_shared<JoinPlan>(join_tag, std::move(left), std::move(right),
+                table_join_executors = std::make_shared<JoinPlan>(std::move(left), std::move(right),
                                                                   std::vector<Condition>(), join_expr->type);
             } else if (left_joined && !right_joined) {
-                table_join_executors = std::make_shared<JoinPlan>(join_tag, std::move(table_join_executors),
+                table_join_executors = std::make_shared<JoinPlan>(std::move(table_join_executors),
                                                                   std::move(right), std::vector<Condition>(),
                                                                   join_expr->type);
             } else if (!left_joined && right_joined) {
-                table_join_executors = std::make_shared<JoinPlan>(join_tag, std::move(left),
+                table_join_executors = std::make_shared<JoinPlan>(std::move(left),
                                                                   std::move(table_join_executors),
                                                                   std::vector<Condition>(), join_expr->type);
             } else if (!left_joined && !right_joined) {
-                auto pair_join = std::make_shared<JoinPlan>(join_tag, std::move(left), std::move(right),
+                auto pair_join = std::make_shared<JoinPlan>(std::move(left), std::move(right),
                                                             std::vector<Condition>(), join_expr->type);
-                table_join_executors = std::make_shared<JoinPlan>(join_tag, std::move(pair_join),
+                table_join_executors = std::make_shared<JoinPlan>(std::move(pair_join),
                                                                   std::move(table_join_executors),
                                                                   std::vector<Condition>());
             }
@@ -457,9 +550,7 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
             right = pop_scan(scantbl, it->rhs_col.tab_name, joined_tables, table_scan_executors);
             std::vector<Condition> join_conds{*it};
             //建立join
-            table_join_executors = std::make_shared<JoinPlan>(join_tag, std::move(left), std::move(right), join_conds);
-
-            // table_join_executors = std::make_shared<JoinPlan>(T_NestLoop, std::move(left), std::move(right), join_conds);
+            table_join_executors = std::make_shared<JoinPlan>(std::move(left), std::move(right), join_conds);
             it = conds.erase(it);
             break;
         }
@@ -486,13 +577,11 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
 
             if(left_need_to_join_executors != nullptr && right_need_to_join_executors != nullptr) {
                 std::vector<Condition> join_conds{*it};
-                std::shared_ptr<Plan> temp_join_executors = std::make_shared<JoinPlan>(join_tag,
-                                                                    std::move(left_need_to_join_executors),
-                                                                    std::move(right_need_to_join_executors),
-                                                                    join_conds);
-                table_join_executors = std::make_shared<JoinPlan>(join_tag, std::move(temp_join_executors),
-                                                                    std::move(table_join_executors),
-                                                                    std::vector<Condition>());
+                std::shared_ptr<Plan> temp_join_executors = std::make_shared<JoinPlan>(
+                    std::move(left_need_to_join_executors), std::move(right_need_to_join_executors), join_conds);
+                table_join_executors = std::make_shared<JoinPlan>(std::move(temp_join_executors),
+                                                                  std::move(table_join_executors),
+                                                                  std::vector<Condition>());
             } else if(left_need_to_join_executors != nullptr || right_need_to_join_executors != nullptr) {
                 if(isneedreverse) {
                     std::swap(it->lhs_col, it->rhs_col);
@@ -500,8 +589,8 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
                     left_need_to_join_executors = std::move(right_need_to_join_executors);
                 }
                 std::vector<Condition> join_conds{*it};
-                table_join_executors = std::make_shared<JoinPlan>(join_tag, std::move(left_need_to_join_executors),
-                                                                    std::move(table_join_executors), join_conds);
+                table_join_executors = std::make_shared<JoinPlan>(std::move(left_need_to_join_executors),
+                                                                  std::move(table_join_executors), join_conds);
             } else if (!it->is_rhs_val) {
                 push_conds(std::move(&(*it)), table_join_executors);
             }
@@ -512,12 +601,13 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
     //连接剩余表
     for (size_t i = 0; i < tables.size(); i++) {
         if(scantbl[i] == -1) {
-            table_join_executors = std::make_shared<JoinPlan>(join_tag, std::move(table_scan_executors[i]), 
-                                                    std::move(table_join_executors), std::vector<Condition>());
+            table_join_executors = std::make_shared<JoinPlan>(std::move(table_scan_executors[i]),
+                                                              std::move(table_join_executors),
+                                                              std::vector<Condition>());
         }
     }
 
-    finalize_join_plan_tree(table_join_executors, enable_sortmerge_join);
+    table_join_executors = physicalize_join_tree(table_join_executors, join_impl_config);
 
     return table_join_executors;
 

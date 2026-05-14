@@ -1,6 +1,7 @@
 # Build directories
 build/
 cmake-build-*/
+.trae/
 
 # CMake generated files
 CMakeCache.txt
