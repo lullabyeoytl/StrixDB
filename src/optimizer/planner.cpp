@@ -26,6 +26,18 @@ See the Mulan PSL v2 for more details. */
 
 namespace {
 auto convert_join_expr_conds(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds) -> std::vector<Condition>;
+
+struct SortMergeLayout {
+    bool supported = false;
+    std::vector<Condition> merge_conds;
+    std::vector<Condition> residual_conds;
+    std::vector<TabCol> left_sort_cols;
+    std::vector<TabCol> right_sort_cols;
+};
+
+auto sortmerge_supports_join_type(JoinType type) -> bool;
+auto classify_sortmerge_layout(const std::vector<Condition> &conds, JoinType type) -> SortMergeLayout;
+void finalize_join_plan_tree(const std::shared_ptr<Plan> &plan, bool prefer_sortmerge);
 }
 
 void prepare_index_lookup_values(const IndexMeta &index_meta, std::vector<Condition> &lookup_conds) {
@@ -179,16 +191,84 @@ auto convert_join_expr_conds(const std::vector<std::shared_ptr<ast::BinaryExpr>>
 }
 
 auto pick_join_tag(bool enable_nestedloop_join, bool enable_sortmerge_join) -> PlanTag {
-    if (enable_nestedloop_join && enable_sortmerge_join) {
-        return T_NestLoop;
+    if (enable_sortmerge_join) {
+        return T_SortMerge;
     }
     if (enable_nestedloop_join) {
         return T_NestLoop;
     }
-    if (enable_sortmerge_join) {
-        return T_SortMerge;
-    }
     throw RMDBError("No join executor selected!");
+}
+
+auto sortmerge_supports_join_type(JoinType type) -> bool {
+    switch (type) {
+        case INNER_JOIN:
+        case SEMI_JOIN:
+            return true;
+        default:
+            return false;
+    }
+}
+
+auto classify_sortmerge_layout(const std::vector<Condition> &conds, JoinType type) -> SortMergeLayout {
+    SortMergeLayout layout;
+    layout.residual_conds = conds;
+    if (!sortmerge_supports_join_type(type)) {
+        return layout;
+    }
+    for (const auto &cond : conds) {
+        if (cond.is_rhs_val || cond.op != OP_EQ) {
+            continue;
+        }
+        layout.merge_conds.push_back(cond);
+        layout.left_sort_cols.push_back(cond.lhs_col);
+        layout.right_sort_cols.push_back(cond.rhs_col);
+    }
+    if (!layout.merge_conds.empty()) {
+        layout.supported = true;
+        layout.residual_conds.erase(
+            std::remove_if(layout.residual_conds.begin(), layout.residual_conds.end(),
+                           [](const Condition &cond) { return !cond.is_rhs_val && cond.op == OP_EQ; }),
+            layout.residual_conds.end());
+    }
+    return layout;
+}
+
+void finalize_join_plan_tree(const std::shared_ptr<Plan> &plan, bool prefer_sortmerge) {
+    auto join = std::dynamic_pointer_cast<JoinPlan>(plan);
+    if (join == nullptr) {
+        return;
+    }
+    finalize_join_plan_tree(join->left_, prefer_sortmerge);
+    finalize_join_plan_tree(join->right_, prefer_sortmerge);
+
+    join->merge_conds_.clear();
+    join->residual_conds_ = join->conds_;
+    join->left_sort_cols_.clear();
+    join->right_sort_cols_.clear();
+
+    if (!prefer_sortmerge) {
+        join->tag = T_NestLoop;
+        return;
+    }
+
+    auto layout = classify_sortmerge_layout(join->conds_, join->type);
+    if (!layout.supported) {
+        join->tag = T_NestLoop;
+        return;
+    }
+
+    join->tag = T_SortMerge;
+    join->merge_conds_ = std::move(layout.merge_conds);
+    join->residual_conds_ = std::move(layout.residual_conds);
+    join->left_sort_cols_ = std::move(layout.left_sort_cols);
+    join->right_sort_cols_ = std::move(layout.right_sort_cols);
+    // SortMergeJoin consumes sorted children. The planner injects explicit SortPlan
+    // nodes so the portal only needs to dispatch executors by PlanTag.
+    join->left_ = std::make_shared<SortPlan>(T_Sort, join->left_, join->left_sort_cols_,
+                                             std::vector<bool>(join->left_sort_cols_.size(), false));
+    join->right_ = std::make_shared<SortPlan>(T_Sort, join->right_, join->right_sort_cols_,
+                                              std::vector<bool>(join->right_sort_cols_.size(), false));
 }
 
 }  // namespace
@@ -437,6 +517,8 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
         }
     }
 
+    finalize_join_plan_tree(table_join_executors, enable_sortmerge_join);
+
     return table_join_executors;
 
 }
@@ -460,8 +542,8 @@ std::shared_ptr<Plan> Planner::generate_sort_plan(std::shared_ptr<Query> query, 
         if(col.name.compare(x->order->cols->col_name) == 0 )
         sel_col = {.tab_name = col.tab_name, .col_name = col.name};
     }
-    return std::make_shared<SortPlan>(T_Sort, std::move(plan), sel_col, 
-                                    x->order->orderby_dir == ast::OrderBy_DESC);
+    return std::make_shared<SortPlan>(T_Sort, std::move(plan), sel_col,
+                                      x->order->orderby_dir == ast::OrderBy_DESC);
 }
 
 

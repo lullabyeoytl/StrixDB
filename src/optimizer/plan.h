@@ -19,6 +19,7 @@ See the Mulan PSL v2 for more details. */
 #include "parser/ast.h"
 
 #include "parser/parser.h"
+#include "system/sm_manager.h"
 #include "system/sm_meta.h"
 
 typedef enum PlanTag{
@@ -128,8 +129,16 @@ class JoinPlan : public Plan
         std::shared_ptr<Plan> left_;
         // 右节点
         std::shared_ptr<Plan> right_;
-        // 连接条件
+        // Generic join predicates. Nested Loop Join consumes this list directly.
+        // Sort Merge Join further splits it into merge keys and residual filters in the planner.
         std::vector<Condition> conds_;
+        // merge_conds_ stores equi-join keys only. Its order matches left/right sort key lists.
+        std::vector<Condition> merge_conds_;
+        // residual_conds_ stores additional predicates to re-check on candidate pairs.
+        std::vector<Condition> residual_conds_;
+        // Sort key orders required by SMJ on each input side.
+        std::vector<TabCol> left_sort_cols_;
+        std::vector<TabCol> right_sort_cols_;
         // future TODO: 后续可以支持的连接类型
         JoinType type;
 };
@@ -152,17 +161,21 @@ class ProjectionPlan : public Plan
 class SortPlan : public Plan
 {
     public:
-        SortPlan(PlanTag tag, std::shared_ptr<Plan> subplan, TabCol sel_col, bool is_desc)
+        SortPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<TabCol> sort_cols, std::vector<bool> is_descs)
         {
             Plan::tag = tag;
             subplan_ = std::move(subplan);
-            sel_col_ = sel_col;
-            is_desc_ = is_desc;
+            sort_cols_ = std::move(sort_cols);
+            is_descs_ = std::move(is_descs);
         }
+        SortPlan(PlanTag tag, std::shared_ptr<Plan> subplan, TabCol sort_col, bool is_desc)
+            : SortPlan(tag, std::move(subplan), std::vector<TabCol>{std::move(sort_col)},
+                       std::vector<bool>{is_desc}) {}
         ~SortPlan(){}
         std::shared_ptr<Plan> subplan_;
-        TabCol sel_col_;
-        bool is_desc_;
+        // Multi-key sort spec. is_descs_[i] corresponds to sort_cols_[i].
+        std::vector<TabCol> sort_cols_;
+        std::vector<bool> is_descs_;
         
 };
 
