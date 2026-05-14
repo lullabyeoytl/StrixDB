@@ -11,13 +11,21 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <memory>
+#include <mutex>
 
 #include "ix_defs.h"
 #include "transaction/transaction.h"
 
 enum class Operation { FIND = 0, INSERT, DELETE };  // 三种操作：查找、插入、删除
+enum class LatchMode { SHARED, EXCLUSIVE };
 
 static const bool binary_search = false;
+
+struct ScanUpperBound {
+    bool has_bound = false;
+    std::vector<char> key;
+    bool inclusive = false;
+};
 
 inline int ix_compare(const char *a, const char *b, ColType type, int col_len) {
     switch (type) {
@@ -69,38 +77,46 @@ class IxNodeHandle {
         rids = reinterpret_cast<Rid *>(keys + file_hdr->keys_size_);
     }
 
-    int get_size() { return page_hdr->num_key; }
+    int get_size() const { return page_hdr->num_key; }
 
     void set_size(int size) { page_hdr->num_key = size; }
 
-    int get_max_size() { return file_hdr->btree_order_ + 1; }
+    int get_max_size() const { return file_hdr->btree_order_ + 1; }
 
-    int get_min_size() { return get_max_size() / 2; }
+    int get_min_size() const { return get_max_size() / 2; }
 
-    int key_at(int i) { return *(int *)get_key(i); }
+    int key_at(int i) const { return *(int *)get_key(i); }
 
     /* 得到第i个孩子结点的page_no */
-    page_id_t value_at(int i) { return get_rid(i)->page_no; }
+    page_id_t value_at(int i) const { return get_rid(i)->page_no; }
 
-    page_id_t get_page_no() { return page->get_page_id().page_no; }
+    page_id_t get_page_no() const { return page->get_page_id().page_no; }
 
-    PageId get_page_id() { return page->get_page_id(); }
+    PageId get_page_id() const { return page->get_page_id(); }
 
-    page_id_t get_next_leaf() { return page_hdr->next_leaf; }
+    void RLatch() { page->RLatch(); }
 
-    page_id_t get_prev_leaf() { return page_hdr->prev_leaf; }
+    void RUnlatch() { page->RUnlatch(); }
 
-    page_id_t get_parent_page_no() { return page_hdr->parent; }
+    void WLatch() { page->WLatch(); }
 
-    bool is_leaf_page() { return page_hdr->is_leaf; }
+    void WUnlatch() { page->WUnlatch(); }
 
-    bool is_root_page() { return get_parent_page_no() == INVALID_PAGE_ID; }
+    page_id_t get_next() const { return page_hdr->next; }
 
-    void set_next_leaf(page_id_t page_no) { page_hdr->next_leaf = page_no; }
+    page_id_t get_prev() const { return page_hdr->prev; }
 
-    void set_prev_leaf(page_id_t page_no) { page_hdr->prev_leaf = page_no; }
+    page_id_t get_parent() const { return page_hdr->parent; }
 
-    void set_parent_page_no(page_id_t parent) { page_hdr->parent = parent; }
+    bool is_leaf_page() const { return page_hdr->is_leaf; }
+
+    bool is_root_page() const { return get_parent() == INVALID_PAGE_ID; }
+
+    void set_next(page_id_t page_no) { page_hdr->next = page_no; }
+
+    void set_prev(page_id_t page_no) { page_hdr->prev = page_no; }
+
+    void set_parent(page_id_t parent) { page_hdr->parent = parent; }
 
     char *get_key(int key_idx) const { return keys + key_idx * file_hdr->col_tot_len_; }
 
@@ -109,6 +125,20 @@ class IxNodeHandle {
     void set_key(int key_idx, const char *key) { memcpy(keys + key_idx * file_hdr->col_tot_len_, key, file_hdr->col_tot_len_); }
 
     void set_rid(int rid_idx, const Rid &rid) { rids[rid_idx] = rid; }
+
+    char *get_high_key() const { return get_key(file_hdr->btree_order_); }
+
+    void set_high_key(const char *key) { memcpy(get_high_key(), key, file_hdr->col_tot_len_); }
+
+    bool has_next() const { return get_next() != IX_NO_PAGE && get_next() != IX_LEAF_HEADER_PAGE; }
+
+    /// has_right_link仅过滤IX_NO_PAGE，用于内部节点的B-link协议检查
+    /// 叶节点使用has_next()：IX_LEAF_HEADER_PAGE哨兵等价于"无右兄弟，high_key=+∞"
+    bool has_right_link() const { return get_next() != IX_NO_PAGE; }
+
+    bool is_safe_for_insert() const { return get_size() < get_max_size() - 1; }
+
+    bool is_safe_for_delete() const { return get_size() > get_min_size(); }
 
     int lower_bound(const char *target) const;
 
@@ -170,11 +200,12 @@ class IxIndexHandle {
     friend class IxManager;
 
    private:
-    DiskManager *disk_manager_;
-    BufferPoolManager *buffer_pool_manager_;
-    int fd_;                                    // 存储B+树的文件
-    IxFileHdr* file_hdr_;                       // 存了root_page，但其初始化为2（第0页存FILE_HDR_PAGE，第1页存LEAF_HEADER_PAGE）
-    std::mutex root_latch_;
+   DiskManager *disk_manager_;
+   BufferPoolManager *buffer_pool_manager_;
+   int fd_;                                    // 存储B+树的文件
+   IxFileHdr* file_hdr_;                       // 存了root_page，但其初始化为2（第0页存FILE_HDR_PAGE，第1页存LEAF_HEADER_PAGE）
+   mutable std::mutex file_hdr_latch_;
+    mutable std::mutex write_path_latch_;
 
    public:
     IxIndexHandle(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager, int fd);
@@ -197,7 +228,7 @@ class IxIndexHandle {
     bool delete_entry(const char *key, const Rid &rid, Transaction *transaction);
 
     bool coalesce_or_redistribute(IxNodeHandle *node, Transaction *transaction = nullptr,
-                                bool *root_is_latched = nullptr);
+                                bool *root_is_latched = nullptr, bool node_is_latched = false);
     bool adjust_root(IxNodeHandle *old_root_node);
 
     void redistribute(IxNodeHandle *neighbor_node, IxNodeHandle *node, IxNodeHandle *parent, int index);
@@ -217,9 +248,42 @@ class IxIndexHandle {
 
    private:
     // 辅助函数
-    void update_root_page_no(page_id_t root) { file_hdr_->root_page_ = root; }
+    void update_root_page_no(page_id_t root) {
+        std::lock_guard<std::mutex> guard(file_hdr_latch_);
+        file_hdr_->root_page_ = root;
+    }
 
-    bool is_empty() const { return file_hdr_->root_page_ == IX_NO_PAGE; }
+    page_id_t get_root_page_no() const {
+        std::lock_guard<std::mutex> guard(file_hdr_latch_);
+        return file_hdr_->root_page_;
+    }
+
+    page_id_t get_first_leaf_page_no() const {
+        std::lock_guard<std::mutex> guard(file_hdr_latch_);
+        return file_hdr_->first_leaf_;
+    }
+
+    page_id_t get_last_leaf_page_no() const {
+        std::lock_guard<std::mutex> guard(file_hdr_latch_);
+        return file_hdr_->last_leaf_;
+    }
+
+    void set_first_leaf_page_no(page_id_t page_no) {
+        std::lock_guard<std::mutex> guard(file_hdr_latch_);
+        file_hdr_->first_leaf_ = page_no;
+    }
+
+    void set_last_leaf_page_no(page_id_t page_no) {
+        std::lock_guard<std::mutex> guard(file_hdr_latch_);
+        file_hdr_->last_leaf_ = page_no;
+    }
+
+    void increment_num_pages() {
+        std::lock_guard<std::mutex> guard(file_hdr_latch_);
+        file_hdr_->num_pages_++;
+    }
+
+    bool is_empty() const { return get_root_page_no() == IX_NO_PAGE; }
 
     // for get/create node
     std::unique_ptr<IxNodeHandle> fetch_node(int page_no) const;
@@ -229,14 +293,31 @@ class IxIndexHandle {
     // for maintain data structure
     void maintain_parent(IxNodeHandle *node);
 
+    void maintain_parent(page_id_t child_page_no, page_id_t parent_page_no, const char *child_first_key);
+
     void erase_leaf(IxNodeHandle *leaf);
 
     void release_node_handle(IxNodeHandle &node);
 
+    void recycle_node_page(IxNodeHandle *node);
+
     void maintain_child(IxNodeHandle *node, int child_idx);
 
     // Walk backward from `start` to the first leaf whose last key is < `key`
-    std::unique_ptr<IxNodeHandle> backtrack_leaf(std::unique_ptr<IxNodeHandle> start, const char *key);
+    std::unique_ptr<IxNodeHandle> backtrack_leaf(std::unique_ptr<IxNodeHandle> start, const char *key,
+                                                LatchMode latch_mode);
+    
+    // Returns true if `key` should be moved to the right child of `node`
+    // 当并发分裂在右侧山城新节点，原节点high_key被提升，查询key可能右移
+    bool should_move_right(const IxNodeHandle *node, const char *key) const;
+
+    void unlatch_and_unpin_shared(std::unique_ptr<IxNodeHandle> &node) const;
+
+    void unlatch_and_unpin_exclusive(std::unique_ptr<IxNodeHandle> &node, bool is_dirty) const;
+
+    void move_right_with_shared_latch(std::unique_ptr<IxNodeHandle> &node) const;
+
+    void move_right_with_exclusive_latch(std::unique_ptr<IxNodeHandle> &node) const;
 
     // for index test
     Rid get_rid(const Iid &iid) const;

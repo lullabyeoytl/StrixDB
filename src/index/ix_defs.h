@@ -22,6 +22,16 @@ constexpr int IX_INIT_ROOT_PAGE = 2;
 constexpr int IX_INIT_NUM_PAGES = 3;
 constexpr int IX_MAX_COL_LEN = 512;
 
+class IxPageHdr {
+public:
+    page_id_t next_free_page_no;    // free-list chain pointer, IX_NO_PAGE when end
+    page_id_t parent;               // 父亲节点所在页面的叶号
+    int num_key;                    // # current keys (always equals to #child - 1) 已插入的keys数量，key_idx∈[0,num_key)
+    bool is_leaf;                   // 是否为叶节点
+    page_id_t prev;                 // previous sibling page_no, leaf layer uses it as hint
+    page_id_t next;                 // right-link page_no, all layers may use it
+};
+
 class IxFileHdr {
 public: 
     page_id_t first_free_page_no_;      // 文件中第一个空闲的磁盘页面的页面号
@@ -105,10 +115,12 @@ public:
 
     void deserialize(char* src) {
         int offset = 0;
+        col_types_.clear();
+        col_lens_.clear();
         tot_len_ = *reinterpret_cast<const int*>(src + offset);
         offset += sizeof(int);
         first_free_page_no_ = *reinterpret_cast<const page_id_t*>(src + offset);
-        offset += sizeof(int);
+        offset += sizeof(page_id_t);
         num_pages_ = *reinterpret_cast<const int*>(src + offset);
         offset += sizeof(int);
         root_page_ = *reinterpret_cast<const page_id_t*>(src + offset);
@@ -129,6 +141,9 @@ public:
         for(int i = 0; i < col_num_; ++i) {
             int len = *reinterpret_cast<const int*>(src + offset);
             offset += sizeof(int);
+            if (len <= 0 || len > IX_MAX_COL_LEN) {
+                throw InternalError("IxFileHdr layout mismatch");
+            }
             col_lens_.push_back(len);
         }
         col_tot_len_ = *reinterpret_cast<const int*>(src + offset);
@@ -141,28 +156,29 @@ public:
         offset += sizeof(page_id_t);
         last_leaf_ = *reinterpret_cast<const page_id_t*>(src + offset);
         offset += sizeof(page_id_t);
+
+        int expected_col_tot_len = 0;
+        for (int len : col_lens_) {
+            expected_col_tot_len += len;
+        }
+        int expected_btree_order =
+            static_cast<int>((PAGE_SIZE - sizeof(IxPageHdr)) / (col_tot_len_ + static_cast<int>(sizeof(Rid))) - 1);
+        int expected_keys_size = (btree_order_ + 1) * col_tot_len_;
         int expected_tot_len = sizeof(page_id_t) * 4 + sizeof(int) * 6 +
                                static_cast<int>(sizeof(ColType)) * col_num_
                              + static_cast<int>(sizeof(int)) * col_num_
                              + sizeof(bool);
 
-        if (tot_len_ != expected_tot_len) {
+        if (tot_len_ != expected_tot_len || col_tot_len_ <= 0 || col_tot_len_ > IX_MAX_COL_LEN ||
+            col_tot_len_ != expected_col_tot_len || btree_order_ <= 2 || btree_order_ != expected_btree_order ||
+            keys_size_ <= 0 || keys_size_ != expected_keys_size ||
+            sizeof(IxPageHdr) + keys_size_ + static_cast<int>(sizeof(Rid)) * (btree_order_ + 1) > PAGE_SIZE) {
             throw InternalError("IxFileHdr layout mismatch");
         }
         unique_ = *reinterpret_cast<const bool*>(src + offset);
         offset += sizeof(bool);
         assert(offset == tot_len_);
     }
-};
-
-class IxPageHdr {
-public:
-    page_id_t next_free_page_no;    // unused
-    page_id_t parent;               // 父亲节点所在页面的叶号
-    int num_key;                    // # current keys (always equals to #child - 1) 已插入的keys数量，key_idx∈[0,num_key)
-    bool is_leaf;                   // 是否为叶节点
-    page_id_t prev_leaf;            // previous leaf node's page_no, effective only when is_leaf is true
-    page_id_t next_leaf;            // next leaf node's page_no, effective only when is_leaf is true
 };
 
 class Iid {

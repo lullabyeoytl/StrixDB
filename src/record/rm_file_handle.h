@@ -13,6 +13,8 @@ See the Mulan PSL v2 for more details. */
 #include <assert.h>
 
 #include <memory>
+#include <mutex>
+#include <unordered_set>
 
 #include "bitmap.h"
 #include "common/context.h"
@@ -56,6 +58,8 @@ class RmFileHandle {
     BufferPoolManager *buffer_pool_manager_;
     int fd_;        // 打开文件后产生的文件句柄
     RmFileHdr file_hdr_;    // 文件头，维护当前表文件的元数据
+    mutable std::mutex file_latch_;
+    mutable std::unordered_set<int64_t> reserved_slots_;
 
    public:
     RmFileHandle(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager, int fd)
@@ -81,6 +85,8 @@ class RmFileHandle {
 
     std::unique_ptr<RmRecord> get_record(const Rid &rid, Context *context) const;
 
+    Rid next_insert_rid();
+
     Rid insert_record(char *buf, Context *context);
 
     void insert_record(const Rid &rid, char *buf);
@@ -94,6 +100,11 @@ class RmFileHandle {
     RmPageHandle fetch_page_handle(int page_no) const;
 
    private:
+    static int64_t encode_rid(const Rid &rid) {
+        return (static_cast<int64_t>(rid.page_no) << 32) |
+               static_cast<uint32_t>(rid.slot_no);
+    }
+
     RmPageHandle create_page_handle();
 
     void release_page_handle(RmPageHandle &page_handle);

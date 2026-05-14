@@ -21,18 +21,30 @@ See the Mulan PSL v2 for more details. */
 class IxScan : public RecScan {
     const IxIndexHandle *ih_;
     Iid iid_;  // 初始为lower（用于遍历的指针）
-    Iid end_;  // 初始为upper
+    ScanUpperBound upper_bound_;
+    std::unique_ptr<IxNodeHandle> current_node_;
     BufferPoolManager *bpm_;
+    bool is_end_ = false;
 
    public:
-    IxScan(const IxIndexHandle *ih, const Iid &lower, const Iid &upper, BufferPoolManager *bpm)
-        : ih_(ih), iid_(lower), end_(upper), bpm_(bpm) {}
+    IxScan(const IxIndexHandle *ih, const Iid &lower, ScanUpperBound upper_bound, BufferPoolManager *bpm);
+
+    ~IxScan() override;
 
     void next() override;
 
-    bool is_end() const override { return iid_ == end_; }
+    bool is_end() const override { return is_end_; }
 
     Rid rid() const override;
 
     const Iid &iid() const { return iid_; }
+
+   private:
+    void release_current();
+
+    void move_to_next_leaf();
+
+    void advance_to_valid_record();
+
+    bool exceeds_upper_bound() const;
 };

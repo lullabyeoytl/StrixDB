@@ -238,6 +238,30 @@ class IndexScanExecutor : public AbstractExecutor {
         return key;
     }
 
+    auto build_scan_upper_bound(const LookupLayout &layout) -> ScanUpperBound {
+        ScanUpperBound upper_bound;
+        if (layout.range_col_idx == -1) {
+            upper_bound.has_bound = true;
+            upper_bound.key = build_key(layout, true, false);
+            upper_bound.inclusive = true;
+            return upper_bound;
+        }
+
+        if (layout.upper.has_value) {
+            upper_bound.has_bound = true;
+            upper_bound.key = build_key(layout, true, true);
+            upper_bound.inclusive = !layout.upper.exclusive;
+            return upper_bound;
+        }
+
+        if (layout.eq_prefix_len > 0) {
+            upper_bound.has_bound = true;
+            upper_bound.key = build_key(layout, true, false);
+            upper_bound.inclusive = true;
+        }
+        return upper_bound;
+    }
+
    public:
     IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> index_lookup_conds,
                       std::vector<Condition> residual_conds, std::vector<std::string> index_col_names,
@@ -291,13 +315,11 @@ class IndexScanExecutor : public AbstractExecutor {
         }
 
         Iid lower = ih->leaf_begin();
-        Iid upper = ih->leaf_end();
+        ScanUpperBound upper_bound = build_scan_upper_bound(layout);
 
         if (layout.range_col_idx == -1) {
             auto lower_key = build_key(layout, false, false);
-            auto upper_key = build_key(layout, true, false);
             lower = ih->lower_bound(lower_key.data());
-            upper = ih->upper_bound(upper_key.data());
         } else {
             if (layout.lower.has_value) {
                 auto lower_key = build_key(layout, false, true);
@@ -307,16 +329,9 @@ class IndexScanExecutor : public AbstractExecutor {
                 lower = ih->lower_bound(lower_key.data());
             }
 
-            if (layout.upper.has_value) {
-                auto upper_key = build_key(layout, true, true);
-                upper = layout.upper.exclusive ? ih->lower_bound(upper_key.data()) : ih->upper_bound(upper_key.data());
-            } else if (layout.eq_prefix_len > 0) {
-                auto upper_key = build_key(layout, true, false);
-                upper = ih->upper_bound(upper_key.data());
-            }
         }
 
-        scan_ = std::make_unique<IxScan>(ih, lower, upper, sm_manager_->get_bpm());
+        scan_ = std::make_unique<IxScan>(ih, lower, std::move(upper_bound), sm_manager_->get_bpm());
         seek_to_next_valid();
     }
 

@@ -10,7 +10,10 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <cstring>
+
 #include "common/config.h"
+#include "page_latch.h"
 
 /**
  * @description: 存储层每个Page的id的声明
@@ -63,6 +66,14 @@ class Page {
 
     bool is_dirty() const { return is_dirty_; }
 
+    void WLatch() { latch_.lock_exclusive(); }
+
+    void WUnlatch() { latch_.unlock_exclusive(); }
+
+    void RLatch() { latch_.lock_shared(); }
+
+    void RUnlatch() { latch_.unlock_shared(); }
+
     static constexpr size_t OFFSET_PAGE_START = 0;
     static constexpr size_t OFFSET_LSN = 0;
     static constexpr size_t OFFSET_PAGE_HDR = 4;
@@ -87,4 +98,6 @@ class Page {
 
     /** The pin count of this page. */
     int pin_count_ = 0;
+
+    PageLatch latch_;
 };

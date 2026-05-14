@@ -112,8 +112,8 @@ class IxManager {
                 .parent = IX_NO_PAGE,
                 .num_key = 0,
                 .is_leaf = true,
-                .prev_leaf = IX_INIT_ROOT_PAGE,
-                .next_leaf = IX_INIT_ROOT_PAGE,
+                .prev = IX_INIT_ROOT_PAGE,
+                .next = IX_INIT_ROOT_PAGE,
             };
             disk_manager_->write_page(fd, IX_LEAF_HEADER_PAGE, page_buf, PAGE_SIZE);
         }
@@ -126,8 +126,8 @@ class IxManager {
                 .parent = IX_NO_PAGE,
                 .num_key = 0,
                 .is_leaf = true,
-                .prev_leaf = IX_LEAF_HEADER_PAGE,
-                .next_leaf = IX_LEAF_HEADER_PAGE,
+                .prev = IX_LEAF_HEADER_PAGE,
+                .next = IX_LEAF_HEADER_PAGE,
             };
             disk_manager_->write_page(fd, IX_INIT_ROOT_PAGE, page_buf, PAGE_SIZE);
         }

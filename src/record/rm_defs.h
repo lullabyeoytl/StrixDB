@@ -87,11 +87,15 @@ struct RmRecord {
 
     void Deserialize(const char* data_) {
         size = *reinterpret_cast<const int*>(data_);
+        if (size < 0 || size > RM_MAX_RECORD_SIZE) {
+            throw InternalError("RmRecord deserialize size out of range");
+        }
         if(allocated_) {
             delete[] data;
         }
         data = new char[size];
         memcpy(data, data_ + sizeof(int), size);
+        allocated_ = true;
     }
 
     ~RmRecord() {
