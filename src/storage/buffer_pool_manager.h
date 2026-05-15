@@ -24,8 +24,11 @@ See the Mulan PSL v2 for more details. */
 #include "page.h"
 #include "replacer/lru_replacer.h"
 #include "replacer/replacer.h"
+#include "common/noncopyable.h"
 
-class BufferPoolManager {
+class LogManager;
+
+class BufferPoolManager: public NonCopyable {
    private:
    // Free: no usefule page, can be used directly
    // Ready: page is ready to be used, can be fetched
@@ -60,6 +63,7 @@ class BufferPoolManager {
     std::condition_variable cv_;
     std::vector<FrameState> frame_states_;
     std::vector<PageKey> frame_keys_;
+    LogManager *log_manager_ = nullptr;
 
    public:
     BufferPoolManager(size_t pool_size, DiskManager *disk_manager)
@@ -95,6 +99,8 @@ class BufferPoolManager {
     static void mark_dirty(Page* page) { page->is_dirty_ = true; }
 
    public: 
+    void set_log_manager(LogManager *log_manager) { log_manager_ = log_manager; }
+
     Page* fetch_page(PageId page_id);
 
     bool unpin_page(PageId page_id, bool is_dirty);
@@ -115,4 +121,6 @@ class BufferPoolManager {
     PageKey make_page_key(PageId page_id);
 
     void write_page_data(const PageKey &page_key, const char *data);
+
+    void flush_wal_before_page_write(const char *data);
 };

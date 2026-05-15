@@ -22,12 +22,13 @@ See the Mulan PSL v2 for more details. */
 #include <unordered_map>
 
 #include "common/config.h"
+#include "common/noncopyable.h"
 #include "errors.h"
 
 /**
  * @description: DiskManager的作用主要是根据上层的需要对磁盘文件进行操作
  */
-class DiskManager {
+class DiskManager: public NonCopyable {
    public:
     explicit DiskManager();
 
@@ -71,6 +72,8 @@ class DiskManager {
     int read_log(char *log_data, int size, int offset);
 
     void write_log(char *log_data, int size);
+
+    void sync_log();
 
     void SetLogFd(int log_fd) { log_fd_ = log_fd; }
 

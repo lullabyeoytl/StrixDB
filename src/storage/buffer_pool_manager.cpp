@@ -14,6 +14,8 @@ See the Mulan PSL v2 for more details. */
 #include <mutex>
 #include <vector>
 
+#include "recovery/log_manager.h"
+
 /**
  * @description: 从free_list或replacer中得到可淘汰帧页的 *frame_id
  * @return {bool} true: 可替换帧查找成功 , false: 可替换帧查找失败
@@ -56,11 +58,20 @@ BufferPoolManager::PageKey BufferPoolManager::make_page_key(PageId page_id) {
     return PageKey{disk_manager_->get_file_name(page_id.fd), page_id.page_no};
 }
 
+void BufferPoolManager::flush_wal_before_page_write(const char *data) {
+    if (log_manager_ == nullptr || data == nullptr) {
+        return;
+    }
+    lsn_t page_lsn = *reinterpret_cast<const lsn_t *>(data + Page::OFFSET_LSN);
+    log_manager_->flush_log_to_lsn(page_lsn);
+}
+
 void BufferPoolManager::write_page_data(const PageKey &page_key, const char *data) {
     if (page_key.page_no == INVALID_PAGE_ID) {
         return;
     }
 
+    flush_wal_before_page_write(data);
     const bool was_open = disk_manager_->is_file_open(page_key.file_name);
     int fd = disk_manager_->get_file_fd(page_key.file_name);
     disk_manager_->write_page(fd, page_key.page_no, data, PAGE_SIZE);

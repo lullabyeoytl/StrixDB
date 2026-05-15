@@ -19,8 +19,6 @@ See the Mulan PSL v2 for more details. */
 
 #include "defs.h"
 
-namespace {
-
 void write_all_at(int fd, const char *data, int num_bytes, off_t offset) {
     int total_written = 0;
     while (total_written < num_bytes) {
@@ -57,8 +55,6 @@ int read_at(int fd, char *data, int num_bytes, off_t offset) {
     }
     return total_read;
 }
-
-}  // namespace
 
 DiskManager::DiskManager() {
     for (int i = 0; i < MAX_FD; ++i) {
@@ -328,4 +324,18 @@ void DiskManager::write_log(char *log_data, int size) {
     // write from the file_end
     const int file_size = get_file_size(LOG_FILE_NAME);
     write_all_at(log_fd_, log_data, size, file_size);
+}
+
+void DiskManager::sync_log() {
+    std::lock_guard<std::mutex> log_lock(log_latch_);
+    if (log_fd_ == -1) {
+        log_fd_ = open_file(LOG_FILE_NAME);
+    }
+
+    while (fdatasync(log_fd_) < 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        throw UnixError();
+    }
 }

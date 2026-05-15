@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstring>
 
 #include "common/config.h"
+#include "common/noncopyable.h"
 #include "page_latch.h"
 
 /**
@@ -51,7 +52,7 @@ struct std::hash<PageId> {
  * @description: Page类声明, Page是RMDB数据块的单位、是负责数据操作Record模块的操作对象，
  * Page对象在磁盘上有文件存储, 若在Buffer中则有帧偏移, 并非特指Buffer或Disk上的数据
  */
-class Page {
+class Page : public NonCopyable {
     friend class BufferPoolManager;
 
    public:
