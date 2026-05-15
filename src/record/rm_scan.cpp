@@ -20,7 +20,7 @@ RmScan::RmScan(const RmFileHandle *file_handle) : file_handle_(file_handle) {
     rid_.page_no = RM_FIRST_RECORD_PAGE;
     rid_.slot_no = -1;
     // 如果存在数据页，则定位到第一条记录
-    if (file_handle_->file_hdr_.num_pages > RM_FIRST_RECORD_PAGE) {
+    if (file_handle_->file_hdr_.num_pages.load(std::memory_order_acquire) > RM_FIRST_RECORD_PAGE) {
         next();
     }
 }
@@ -30,7 +30,7 @@ RmScan::RmScan(const RmFileHandle *file_handle) : file_handle_(file_handle) {
  */
 void RmScan::next() {
     // 找到文件中下一个存放了记录的非空闲位置，用rid_来指向这个位置
-    while (rid_.page_no < file_handle_->file_hdr_.num_pages) {
+    while (rid_.page_no < file_handle_->file_hdr_.num_pages.load(std::memory_order_acquire)) {
         RmPageHandle page_handle = file_handle_->fetch_page_handle(rid_.page_no);
         int slot_no = Bitmap::next_bit(true, page_handle.bitmap,
                                         file_handle_->file_hdr_.num_records_per_page,
@@ -52,7 +52,7 @@ void RmScan::next() {
  * @brief ​ 判断是否到达文件末尾
  */
 bool RmScan::is_end() const {
-    return rid_.page_no >= file_handle_->file_hdr_.num_pages;
+    return rid_.page_no >= file_handle_->file_hdr_.num_pages.load(std::memory_order_acquire);
 }
 
 /**

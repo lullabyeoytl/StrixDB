@@ -121,7 +121,7 @@ Rid RmFileHandle::insert_record(char* buf, Context* context) {
  * @param {Rid&} rid 要插入记录的位置
  * @param {char*} buf 要插入记录的数据
  */
-void RmFileHandle::insert_record(const Rid& rid, char* buf) {
+void RmFileHandle::insert_record(const Rid& rid, char* buf, lsn_t page_lsn) {
     std::lock_guard<std::mutex> guard(file_latch_);
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
     if (Bitmap::is_set(page_handle.bitmap, rid.slot_no)) {
@@ -138,6 +138,9 @@ void RmFileHandle::insert_record(const Rid& rid, char* buf) {
             page_handle.page_hdr->next_free_page_no = RM_NO_PAGE;
         }
     }
+    if (page_lsn != INVALID_LSN) {
+        page_handle.page->set_page_lsn(page_lsn);
+    }
     buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, true);
 }
 
@@ -146,7 +149,7 @@ void RmFileHandle::insert_record(const Rid& rid, char* buf) {
  * @param {Rid&} rid 要删除的记录的记录号（位置）
  * @param {Context*} context
  */
-void RmFileHandle::delete_record(const Rid& rid, Context* context) {
+void RmFileHandle::delete_record(const Rid& rid, Context* context, lsn_t page_lsn) {
     std::lock_guard<std::mutex> guard(file_latch_);
     // 1. 获取指定记录所在的page handle
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
@@ -162,6 +165,9 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
     if (was_full && page_handle.page_hdr->num_records < file_hdr_.num_records_per_page) {
         release_page_handle(page_handle);
     }
+    if (page_lsn != INVALID_LSN) {
+        page_handle.page->set_page_lsn(page_lsn);
+    }
     buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, true);
 }
 
@@ -172,7 +178,8 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
  * @param {char*} buf 新记录的数据
  * @param {Context*} context
  */
-void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
+void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context, lsn_t page_lsn) {
+    std::lock_guard<std::mutex> guard(file_latch_);
     // 1. 获取指定记录所在的page handle
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
     if (!Bitmap::is_set(page_handle.bitmap, rid.slot_no)) {
@@ -181,6 +188,9 @@ void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
     }
     // 2. 更新记录
     memcpy(page_handle.get_slot(rid.slot_no), buf, file_hdr_.record_size);
+    if (page_lsn != INVALID_LSN) {
+        page_handle.page->set_page_lsn(page_lsn);
+    }
     buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, true);
 }
 
@@ -195,7 +205,7 @@ void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
 RmPageHandle RmFileHandle::fetch_page_handle(int page_no) const {
     // 使用缓冲池获取指定页面，并生成page_handle返回给上层
     // if page_no is invalid, throw PageNotExistError exception
-    if (page_no < RM_FIRST_RECORD_PAGE || page_no >= file_hdr_.num_pages) {
+    if (page_no < RM_FIRST_RECORD_PAGE || page_no >= file_hdr_.num_pages.load(std::memory_order_acquire)) {
         throw PageNotExistError("Table", page_no);
     }
     Page *page = buffer_pool_manager_->fetch_page(PageId{fd_, page_no});
@@ -223,8 +233,15 @@ RmPageHandle RmFileHandle::create_new_page_handle() {
     // 3.更新file_hdr_，将新页面加入空闲链表头部
     handle.page_hdr->next_free_page_no = file_hdr_.first_free_page_no;
     file_hdr_.first_free_page_no = page_id.page_no;
-    file_hdr_.num_pages++;
+    file_hdr_.num_pages.fetch_add(1, std::memory_order_release);
     return handle;
+}
+
+void RmFileHandle::ensure_page_exists(int page_no) {
+    while (file_hdr_.num_pages.load(std::memory_order_acquire) <= page_no) {
+        RmPageHandle handle = create_new_page_handle();
+        buffer_pool_manager_->unpin_page(PageId{fd_, handle.page->get_page_id().page_no}, true);
+    }
 }
 
 /**
@@ -252,4 +269,17 @@ void RmFileHandle::release_page_handle(RmPageHandle&page_handle) {
     // 2. file_hdr_.first_free_page_no
     page_handle.page_hdr->next_free_page_no = file_hdr_.first_free_page_no;
     file_hdr_.first_free_page_no = page_handle.page->get_page_id().page_no;
+}
+
+void RmFileHandle::set_page_lsn(const Rid &rid, lsn_t lsn) {
+    RmPageHandle page_handle = fetch_page_handle(rid.page_no);
+    page_handle.page->set_page_lsn(lsn);
+    buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, true);
+}
+
+lsn_t RmFileHandle::get_page_lsn(const Rid &rid) const {
+    RmPageHandle page_handle = fetch_page_handle(rid.page_no);
+    lsn_t lsn = page_handle.page->get_page_lsn();
+    buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
+    return lsn;
 }

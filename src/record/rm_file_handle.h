@@ -49,7 +49,7 @@ struct RmPageHandle {
 };
 
 /* 每个RmFileHandle对应一个表的数据文件，里面有多个page，每个page的数据封装在RmPageHandle中 */
-class RmFileHandle {      
+class RmFileHandle: public NonCopyable {      
     friend class RmScan;    
     friend class RmManager;
 
@@ -69,7 +69,7 @@ class RmFileHandle {
         // init file_hdr_
         disk_manager_->read_page(fd, RM_FILE_HDR_PAGE, (char *)&file_hdr_, sizeof(file_hdr_));
         // disk_manager管理的fd对应的文件中，设置从file_hdr_.num_pages开始分配page_no
-        disk_manager_->set_fd2pageno(fd, file_hdr_.num_pages);
+        disk_manager_->set_fd2pageno(fd, file_hdr_.num_pages.load(std::memory_order_acquire));
     }
 
     RmFileHdr get_file_hdr() { return file_hdr_; }
@@ -89,15 +89,21 @@ class RmFileHandle {
 
     Rid insert_record(char *buf, Context *context);
 
-    void insert_record(const Rid &rid, char *buf);
+    void insert_record(const Rid &rid, char *buf, lsn_t page_lsn = INVALID_LSN);
 
-    void delete_record(const Rid &rid, Context *context);
+    void set_page_lsn(const Rid &rid, lsn_t lsn);
 
-    void update_record(const Rid &rid, char *buf, Context *context);
+    lsn_t get_page_lsn(const Rid &rid) const;
+
+    void delete_record(const Rid &rid, Context *context, lsn_t page_lsn = INVALID_LSN);
+
+    void update_record(const Rid &rid, char *buf, Context *context, lsn_t page_lsn = INVALID_LSN);
 
     RmPageHandle create_new_page_handle();
 
     RmPageHandle fetch_page_handle(int page_no) const;
+
+    void ensure_page_exists(int page_no);
 
    private:
     static int64_t encode_rid(const Rid &rid) {

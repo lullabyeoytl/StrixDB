@@ -10,6 +10,8 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <atomic>
+
 #include "defs.h"
 #include "storage/buffer_pool_manager.h"
 
@@ -32,10 +34,28 @@ struct TupleMeta {
 /* 文件头，记录表数据文件的元信息，写入磁盘中文件的第0号页面 */
 struct RmFileHdr {
     int record_size;            // 表中每条记录的大小，由于不包含变长字段，因此当前字段初始化后保持不变
-    int num_pages;              // 文件中分配的页面个数（初始化为1）
+    std::atomic<int> num_pages; // 文件中分配的页面个数（初始化为1），atomic 避免 fetch_page_handle 无锁读与 create_new_page_handle 加锁写之间的 data race
     int num_records_per_page;   // 每个页面最多能存储的元组个数
     int first_free_page_no;     // 文件中当前第一个包含空闲空间的页面号（初始化为-1）
     int bitmap_size;            // 每个页面bitmap大小
+
+    RmFileHdr() : record_size(0), num_pages(0), num_records_per_page(0), first_free_page_no(RM_NO_PAGE), bitmap_size(0) {}
+
+    RmFileHdr(const RmFileHdr &other)
+        : record_size(other.record_size)
+        , num_pages(other.num_pages.load(std::memory_order_acquire))
+        , num_records_per_page(other.num_records_per_page)
+        , first_free_page_no(other.first_free_page_no)
+        , bitmap_size(other.bitmap_size) {}
+
+    RmFileHdr &operator=(const RmFileHdr &other) {
+        record_size = other.record_size;
+        num_pages.store(other.num_pages.load(std::memory_order_acquire), std::memory_order_release);
+        num_records_per_page = other.num_records_per_page;
+        first_free_page_no = other.first_free_page_no;
+        bitmap_size = other.bitmap_size;
+        return *this;
+    }
 };
 
 /* 表数据文件中每个页面的页头，记录每个页面的元信息 */
@@ -61,6 +81,12 @@ struct RmRecord {
 
 
     RmRecord &operator=(const RmRecord& other) {
+        if (this == &other) {
+            return *this;
+        }
+        if (allocated_) {
+            delete[] data;
+        }
         size = other.size;
         data = new char[size];
         memcpy(data, other.data, size);
