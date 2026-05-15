@@ -122,12 +122,27 @@ class UpdateExecutor : public AbstractExecutor {
      * @brief Apply index maintenance and record replacement for one row.
      */
     void apply_row_update(const PreparedIndexState &state, const Rid &rid, const RmRecord &old_rec, const RmRecord &new_rec) {
+        if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
+            context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd());
+        }
+        lsn_t op_lsn = INVALID_LSN;
+        if (context_ != nullptr && context_->txn_ != nullptr && context_->log_mgr_ != nullptr) {
+            lsn_t prev_lsn = context_->txn_->get_prev_lsn();
+            UpdateLogRecord log_record(context_->txn_->get_transaction_id(), old_rec, new_rec, rid, tab_name_);
+            log_record.prev_lsn_ = prev_lsn;
+            op_lsn = context_->log_mgr_->add_log_to_buffer(&log_record);
+            context_->txn_->set_prev_lsn(op_lsn);
+            context_->txn_->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab_name_, rid, old_rec, prev_lsn));
+        }
         for (size_t i = 0; i < tab_.indexes.size(); ++i) {
             auto old_key = build_index_key(tab_.indexes[i], old_rec);
             state.index_handles[i]->delete_entry(old_key.get(), rid, context_->txn_);
         }
 
         fh_->update_record(rid, new_rec.data, context_);
+        if (op_lsn != INVALID_LSN) {
+            fh_->set_page_lsn(rid, op_lsn);
+        }
 
         for (size_t i = 0; i < tab_.indexes.size(); ++i) {
             auto new_key = build_index_key(tab_.indexes[i], new_rec);
@@ -258,6 +273,9 @@ class UpdateExecutor : public AbstractExecutor {
         conds_ = conds;
         scan_executor_ = std::move(scan_executor);
         context_ = context;
+        if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
+            context_->lock_mgr_->lock_IX_on_table(context_->txn_, fh_->GetFd());
+        }
     }
 
     /**

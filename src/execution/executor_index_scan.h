@@ -28,14 +28,14 @@ class IndexScanExecutor : public AbstractExecutor {
    private:
    // bound for range scan
     struct RangeBound {
-        bool has_value = false;       
+        bool has_value = false;
         Value value;
-        // '>' '<' -> true, '>=','<=' -> false 
-        bool exclusive = false;     
+        // '>' '<' -> true, '>=','<=' -> false
+        bool exclusive = false;
     };
 
     struct LookupLayout {
-        int eq_prefix_len = 0;  // EQ prefix cols nums 
+        int eq_prefix_len = 0;  // EQ prefix cols nums
         int range_col_idx = -1; // range cond pos
         RangeBound lower;
         RangeBound upper;
@@ -63,46 +63,29 @@ class IndexScanExecutor : public AbstractExecutor {
 
     void seek_to_next_valid() {
         if (!seek_to_next_valid_tuple(scan_.get(), rid_, residual_conds_, cols_, [&](const Rid &rid) {
+                if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
+                    context_->lock_mgr_->lock_shared_on_record(context_->txn_, rid, fh_->GetFd());
+                }
                 return fh_->get_record(rid, context_);
             })) {
             set_end();
         }
     }
 
-    static void fill_min_value(const ColMeta &col, char *dest) {
+    static void fill_extreme_value(const ColMeta &col, char *dest, bool use_max) {
         switch (col.type) {
             case TYPE_INT: {
-                int val = INT_MIN;
+                int val = use_max ? INT_MAX : INT_MIN;
                 memcpy(dest, &val, sizeof(int));
                 break;
             }
             case TYPE_FLOAT: {
-                float val = -FLT_MAX;
+                float val = use_max ? FLT_MAX : -FLT_MAX;
                 memcpy(dest, &val, sizeof(float));
                 break;
             }
             case TYPE_STRING:
-                memset(dest, 0, col.len);
-                break;
-            default:
-                throw InternalError("Unexpected column type");
-        }
-    }
-    
-    static void fill_max_value(const ColMeta &col, char *dest) {
-        switch (col.type) {
-            case TYPE_INT: {
-                int val = INT_MAX;
-                memcpy(dest, &val, sizeof(int));
-                break;
-            }
-            case TYPE_FLOAT: {
-                float val = FLT_MAX;
-                memcpy(dest, &val, sizeof(float));
-                break;
-            }
-            case TYPE_STRING:
-                memset(dest, 0xFF, col.len);
+                memset(dest, use_max ? 0xFF : 0, col.len);
                 break;
             default:
                 throw InternalError("Unexpected column type");
@@ -194,6 +177,16 @@ class IndexScanExecutor : public AbstractExecutor {
         return cmp == 0 && (layout.lower.exclusive || layout.upper.exclusive);
     }
 
+    static void normalize_conds(std::vector<Condition> &conds, const std::string &tab_name) {
+        for (auto &cond : conds) {
+            if (cond.lhs_col.tab_name != tab_name) {
+                assert(!cond.is_rhs_val && cond.rhs_col.tab_name == tab_name);
+                std::swap(cond.lhs_col, cond.rhs_col);
+                cond.op = kSwapOp.at(cond.op);
+            }
+        }
+    }
+
     auto build_key(const LookupLayout &layout, bool upper_side, bool use_bound_value) -> std::vector<char> {
         std::vector<char> key(index_meta_.col_tot_len, 0);
         int offset = 0;
@@ -206,15 +199,15 @@ class IndexScanExecutor : public AbstractExecutor {
                     const auto &bound = upper_side ? layout.upper : layout.lower;
                     write_value(index_col, bound.value, key.data() + offset);
                 } else if (upper_side) {
-                    fill_max_value(index_col, key.data() + offset);
+                    fill_extreme_value(index_col, key.data() + offset, true);
                 } else {
-                    fill_min_value(index_col, key.data() + offset);
+                    fill_extreme_value(index_col, key.data() + offset, false);
                 }
             } else if (layout.range_col_idx == -1 && static_cast<int>(i) >= layout.eq_prefix_len) {
                 if (upper_side) {
-                    fill_max_value(index_col, key.data() + offset);
+                    fill_extreme_value(index_col, key.data() + offset, true);
                 } else {
-                    fill_min_value(index_col, key.data() + offset);
+                    fill_extreme_value(index_col, key.data() + offset, false);
                 }
             } else if (layout.range_col_idx != -1 && static_cast<int>(i) > layout.range_col_idx) {
                 bool use_upper_fill = upper_side;
@@ -226,9 +219,9 @@ class IndexScanExecutor : public AbstractExecutor {
                     }
                 }
                 if (use_upper_fill) {
-                    fill_max_value(index_col, key.data() + offset);
+                    fill_extreme_value(index_col, key.data() + offset, true);
                 } else {
-                    fill_min_value(index_col, key.data() + offset);
+                    fill_extreme_value(index_col, key.data() + offset, false);
                 }
             } else {
                 throw InternalError("Unexpected index key layout in IndexScanExecutor::build_key");
@@ -272,7 +265,7 @@ class IndexScanExecutor : public AbstractExecutor {
         tab_ = sm_manager_->db_.get_table(tab_name_);
         index_lookup_conds_ = std::move(index_lookup_conds);
         residual_conds_ = std::move(residual_conds);
-        index_col_names_ = std::move(index_col_names); 
+        index_col_names_ = std::move(index_col_names);
         if (index_meta.has_value()) {
             index_meta_ = *index_meta;
         } else {
@@ -281,25 +274,13 @@ class IndexScanExecutor : public AbstractExecutor {
         fh_ = sm_manager_->fhs_.at(tab_name_).get();
         cols_ = tab_.cols;
         len_ = cols_.back().offset + cols_.back().len;
-        
-        // normalize conds
-        for (auto &cond : index_lookup_conds_) {
-            if (cond.lhs_col.tab_name != tab_name_) {
-                // lhs is on other table, now rhs must be on this table
-                assert(!cond.is_rhs_val && cond.rhs_col.tab_name == tab_name_);
-                // swap lhs and rhs
-                std::swap(cond.lhs_col, cond.rhs_col);
-                cond.op = kSwapOp.at(cond.op);
-            }
-        }
-        for (auto &cond : residual_conds_) {
-            if (cond.lhs_col.tab_name != tab_name_) {
-                assert(!cond.is_rhs_val && cond.rhs_col.tab_name == tab_name_);
-                std::swap(cond.lhs_col, cond.rhs_col);
-                cond.op = kSwapOp.at(cond.op);
-            }
-        }
+
+        normalize_conds(index_lookup_conds_, tab_name_);
+        normalize_conds(residual_conds_, tab_name_);
         prepare_lookup_values();
+        if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
+            context_->lock_mgr_->lock_IS_on_table(context_->txn_, fh_->GetFd());
+        }
         set_end();
     }
 

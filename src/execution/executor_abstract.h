@@ -16,7 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "system/sm.h"
 
-class AbstractExecutor {
+class AbstractExecutor: public NonCopyable {
    public:
     Rid _abstract_rid;
 

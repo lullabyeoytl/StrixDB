@@ -38,6 +38,9 @@ class SeqScanExecutor : public AbstractExecutor {
     // add filter conds
     void seek_to_next_valid() {
         if (!seek_to_next_valid_tuple(scan_.get(), rid_, conds_, cols_, [&](const Rid &rid) {
+                if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
+                    context_->lock_mgr_->lock_shared_on_record(context_->txn_, rid, fh_->GetFd());
+                }
                 return fh_->get_record(rid, context_);
             })) {
             set_end();
@@ -56,6 +59,9 @@ class SeqScanExecutor : public AbstractExecutor {
         len_ = cols_.back().offset + cols_.back().len;
 
         context_ = context;
+        if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
+            context_->lock_mgr_->lock_IS_on_table(context_->txn_, fh_->GetFd());
+        }
         empty_result_ = empty_result;
         set_end();
     }

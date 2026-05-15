@@ -50,6 +50,9 @@ class DeleteExecutor : public AbstractExecutor {
         conds_ = std::move(conds);
         scan_executor_ = std::move(scan_executor);
         context_ = context;
+        if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
+            context_->lock_mgr_->lock_IX_on_table(context_->txn_, fh_->GetFd());
+        }
     }
 
     /**
@@ -71,9 +74,25 @@ class DeleteExecutor : public AbstractExecutor {
             // does not invalidate the remaining table scan order.
             for (scan_executor_->beginTuple(); !scan_executor_->is_end(); scan_executor_->nextTuple()) {
                 Rid rid = scan_executor_->rid();
+                if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
+                    context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd());
+                }
                 auto rec = scan_executor_->Next();
+                lsn_t op_lsn = INVALID_LSN;
+                if (context_ != nullptr && context_->txn_ != nullptr && context_->log_mgr_ != nullptr) {
+                    lsn_t prev_lsn = context_->txn_->get_prev_lsn();
+                    DeleteLogRecord log_record(context_->txn_->get_transaction_id(), *rec, rid, tab_name_);
+                    log_record.prev_lsn_ = prev_lsn;
+                    op_lsn = context_->log_mgr_->add_log_to_buffer(&log_record);
+                    context_->txn_->set_prev_lsn(op_lsn);
+                    context_->txn_->append_write_record(
+                        new WriteRecord(WType::DELETE_TUPLE, tab_name_, rid, *rec, prev_lsn));
+                }
                 delete_index_entries(index_handles, *rec, rid);
                 fh_->delete_record(rid, context_);
+                if (op_lsn != INVALID_LSN) {
+                    fh_->set_page_lsn(rid, op_lsn);
+                }
             }
             return nullptr;
         }
@@ -92,8 +111,25 @@ class DeleteExecutor : public AbstractExecutor {
             }
 
             for (auto &candidate : candidates) {
+                if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
+                    context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, candidate.rid, fh_->GetFd());
+                }
+                lsn_t op_lsn = INVALID_LSN;
+                if (context_ != nullptr && context_->txn_ != nullptr && context_->log_mgr_ != nullptr) {
+                    lsn_t prev_lsn = context_->txn_->get_prev_lsn();
+                    DeleteLogRecord log_record(context_->txn_->get_transaction_id(), *candidate.rec, candidate.rid,
+                                               tab_name_);
+                    log_record.prev_lsn_ = prev_lsn;
+                    op_lsn = context_->log_mgr_->add_log_to_buffer(&log_record);
+                    context_->txn_->set_prev_lsn(op_lsn);
+                    context_->txn_->append_write_record(
+                        new WriteRecord(WType::DELETE_TUPLE, tab_name_, candidate.rid, *candidate.rec, prev_lsn));
+                }
                 delete_index_entries(index_handles, *candidate.rec, candidate.rid);
                 fh_->delete_record(candidate.rid, context_);
+                if (op_lsn != INVALID_LSN) {
+                    fh_->set_page_lsn(candidate.rid, op_lsn);
+                }
             }
             return nullptr;
         }

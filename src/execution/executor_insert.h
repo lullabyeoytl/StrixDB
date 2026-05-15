@@ -21,7 +21,7 @@ class InsertExecutor : public AbstractExecutor {
     std::vector<Value> values_;     // 需要插入的数据
     RmFileHandle *fh_;              // 表的数据文件句柄
     std::string tab_name_;          // 表名称
-    Rid rid_;                       // 插入的位置，由于系统默认插入时不指定位置，因此当前rid_在插入后才赋值
+    Rid rid_;                       // 插入的位置，在 Next() 中通过 next_insert_rid() 赋值后再写入记录
     SmManager *sm_manager_;
 
    public:
@@ -35,6 +35,9 @@ class InsertExecutor : public AbstractExecutor {
         }
         fh_ = sm_manager_->fhs_.at(tab_name).get();
         context_ = context;
+        if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
+            context_->lock_mgr_->lock_IX_on_table(context_->txn_, fh_->GetFd());
+        }
     };
 
     std::unique_ptr<RmRecord> Next() override {
@@ -64,8 +67,34 @@ class InsertExecutor : public AbstractExecutor {
             }
         }
 
+        while (true) {
+            rid_ = fh_->next_insert_rid();
+            if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
+                context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid_, fh_->GetFd());
+            }
+            // avoid insert duplicate slot
+            if (!fh_->is_record(rid_)) {
+                break;
+            }
+        }
+        // WAL
+        lsn_t op_prev_lsn = context_ != nullptr && context_->txn_ != nullptr ? context_->txn_->get_prev_lsn() : INVALID_LSN;
+        lsn_t op_lsn = INVALID_LSN;
+        if (context_ != nullptr && context_->txn_ != nullptr && context_->log_mgr_ != nullptr) {
+            InsertLogRecord log_record(context_->txn_->get_transaction_id(), rec, rid_, tab_name_);
+            log_record.prev_lsn_ = op_prev_lsn;
+            op_lsn = context_->log_mgr_->add_log_to_buffer(&log_record);
+            context_->txn_->set_prev_lsn(op_lsn);
+        }
+
         // Insert into record file
-        rid_ = fh_->insert_record(rec.data, context_);
+        fh_->insert_record(rid_, rec.data);
+        if (op_lsn != INVALID_LSN) {
+            fh_->set_page_lsn(rid_, op_lsn);
+        }
+        if (context_ != nullptr && context_->txn_ != nullptr) {
+            context_->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name_, rid_, op_prev_lsn));
+        }
 
         // Insert into index (uniqueness already pre-checked above)
         for (size_t i = 0; i < tab_.indexes.size(); ++i) {
