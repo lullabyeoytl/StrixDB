@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <atomic>
 #include <cstdio>
+#include <memory>
 #include <netinet/in.h>
 #include <readline/history.h>
 #include <readline/readline.h>
@@ -45,7 +46,6 @@ auto log_manager = std::make_unique<LogManager>(disk_manager.get());
 auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_pool_manager.get(), sm_manager.get());
 auto portal = std::make_unique<Portal>(sm_manager.get());
 auto analyze = std::make_unique<Analyze>(sm_manager.get());
-pthread_mutex_t *buffer_mutex;
 pthread_mutex_t *sockfd_mutex;
 
 static jmp_buf jmpbuf;
@@ -73,13 +73,17 @@ void *client_handler(void *sock_fd) {
 
     int i_recvBytes;
     // 接收客户端发送的请求
-    char data_recv[BUFFER_LENGTH];
+    char data_recv[BUFFER_LENGTH + 1];
     // 需要返回给客户端的结果
-    char *data_send = new char[BUFFER_LENGTH];
+    auto data_send = std::make_unique<char[]>(BUFFER_LENGTH);
     // 需要返回给客户端的结果的长度
     int offset = 0;
     // 记录客户端当前正在执行的事务ID
     txn_id_t txn_id = INVALID_TXN_ID;
+
+    // 初始化可重入解析器扫描器
+    yyscan_t yyscanner;
+    yylex_init(&yyscanner);
 
     std::string output = "establish client connection, sockfd: " + std::to_string(fd) + "\n";
     std::cout << output;
@@ -89,6 +93,10 @@ void *client_handler(void *sock_fd) {
         memset(data_recv, 0, BUFFER_LENGTH);
 
         i_recvBytes = read(fd, data_recv, BUFFER_LENGTH);
+
+        if (i_recvBytes > 0) {
+            data_recv[i_recvBytes] = '\0';
+        }
 
         if (i_recvBytes == 0) {
             std::cout << "Maybe the client has closed" << std::endl;
@@ -112,37 +120,36 @@ void *client_handler(void *sock_fd) {
 
         std::cout << "Read from client " << fd << ": " << data_recv << std::endl;
 
-        memset(data_send, '\0', BUFFER_LENGTH);
+        memset(data_send.get(), '\0', BUFFER_LENGTH);
         offset = 0;
 
         // 开启事务，初始化系统所需的上下文信息（包括事务对象指针、锁管理器指针、日志管理器指针、存放结果的buffer、记录结果长度的变量）
-        Context *context = new Context(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
-        SetTransaction(&txn_id, context);
+        auto context = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send.get(), &offset);
+        SetTransaction(&txn_id, context.get());
 
         // 用于判断是否已经调用了yy_delete_buffer来删除buf
         bool finish_analyze = false;
         bool has_error = false;
-        pthread_mutex_lock(buffer_mutex);
-        YY_BUFFER_STATE buf = yy_scan_string(data_recv);
-        if (yyparse() == 0) {
-            if (ast::parse_tree != nullptr) {
+        std::shared_ptr<ast::TreeNode> parse_tree;
+        YY_BUFFER_STATE buf = yy_scan_string(data_recv, yyscanner);
+        if (yyparse(&parse_tree, yyscanner) == 0) {
+            if (parse_tree != nullptr) {
                 try {
                     // analyze and rewrite
-                    std::shared_ptr<Query> query = analyze->do_analyze(ast::parse_tree);
-                    yy_delete_buffer(buf);
+                    std::shared_ptr<Query> query = analyze->do_analyze(parse_tree);
+                    yy_delete_buffer(buf, yyscanner);
                     finish_analyze = true;
-                    pthread_mutex_unlock(buffer_mutex);
                     // 优化器
-                    std::shared_ptr<Plan> plan = optimizer->plan_query(query, context);
+                    std::shared_ptr<Plan> plan = optimizer->plan_query(query, context.get());
                     // portal
-                    std::shared_ptr<PortalStmt> portalStmt = portal->start(plan, context);
-                    portal->run(portalStmt, ql_manager.get(), &txn_id, context);
+                    std::shared_ptr<PortalStmt> portalStmt = portal->start(plan, context.get());
+                    portal->run(portalStmt, ql_manager.get(), &txn_id, context.get());
                     portal->drop();
                 } catch (TransactionAbortException &e) {
                     has_error = true;
                     // 事务需要回滚，需要把abort信息返回给客户端并写入output.txt文件中
                     std::string str = "abort\n";
-                    memcpy(data_send, str.c_str(), str.length());
+                    memcpy(data_send.get(), str.c_str(), str.length());
                     data_send[str.length()] = '\0';
                     offset = str.length();
 
@@ -159,10 +166,14 @@ void *client_handler(void *sock_fd) {
                     // 遇到异常，需要打印failure到output.txt文件中，并发异常信息返回给客户端
                     std::cerr << e.what() << std::endl;
 
-                    memcpy(data_send, e.what(), e.get_msg_len());
-                    data_send[e.get_msg_len()] = '\n';
-                    data_send[e.get_msg_len() + 1] = '\0';
-                    offset = e.get_msg_len() + 1;
+                    int msg_len = e.get_msg_len();
+                    if (msg_len > BUFFER_LENGTH - 2) {
+                        msg_len = BUFFER_LENGTH - 2;
+                    }
+                    memcpy(data_send.get(), e.what(), msg_len);
+                    data_send[msg_len] = '\n';
+                    data_send[msg_len + 1] = '\0';
+                    offset = msg_len + 1;
 
                     // 将报错信息写入output.txt
                     std::fstream outfile;
@@ -173,12 +184,11 @@ void *client_handler(void *sock_fd) {
             }
         }
         if(finish_analyze == false) {
-            yy_delete_buffer(buf);
-            pthread_mutex_unlock(buffer_mutex);
+            yy_delete_buffer(buf, yyscanner);
         }
         // future TODO: 格式化 sql_handler.result, 传给客户端
         // send result with fixed format, use protobuf in the future
-        if (write(fd, data_send, offset + 1) == -1) {
+        if (write(fd, data_send.get(), offset + 1) == -1) {
             break;
         }
         // 如果是单条语句，需要按照一个完整的事务来执行，所以执行完当前语句后，自动提交事务
@@ -186,7 +196,10 @@ void *client_handler(void *sock_fd) {
         if(context->txn_->get_txn_mode() == false)
         {
             if (has_error) {
-                txn_manager->abort(context->txn_, log_manager.get());
+                if (context->txn_->get_state() != TransactionState::ABORTED &&
+                    context->txn_->get_state() != TransactionState::COMMITTED) {
+                    txn_manager->abort(context->txn_, log_manager.get());
+                }
             } else {
                 txn_manager->commit(context->txn_, context->log_mgr_);
             }
@@ -195,15 +208,14 @@ void *client_handler(void *sock_fd) {
 
     // Clear
     std::cout << "Terminating current client_connection..." << std::endl;
+    yylex_destroy(yyscanner);
     close(fd);           // close a file descriptor.
     pthread_exit(NULL);  // terminate calling thread!
 }
 
 void start_server() {
     // init mutex
-    buffer_mutex = (pthread_mutex_t *)malloc(sizeof(pthread_mutex_t));
     sockfd_mutex = (pthread_mutex_t *)malloc(sizeof(pthread_mutex_t));
-    pthread_mutex_init(buffer_mutex, nullptr);
     pthread_mutex_init(sockfd_mutex, nullptr);
 
     int sockfd_server;
@@ -298,11 +310,13 @@ int main(int argc, char **argv) {
         }
         // Open database
         sm_manager->open_db(db_name);
+        buffer_pool_manager->set_log_manager(log_manager.get());
 
         // recovery database
         recovery->analyze();
         recovery->redo();
         recovery->undo();
+        log_manager->sync_global_lsn_with_disk();
         
         // 开启服务端，开始接受客户端连接
         start_server();

@@ -359,8 +359,6 @@ struct SemValue {
     SetKnobType sv_setKnobType;
 };
 
-extern std::shared_ptr<ast::TreeNode> parse_tree;
-
 }
 
 #define YYSTYPE ast::SemValue

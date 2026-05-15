@@ -4,9 +4,11 @@
 #include <iostream>
 #include <memory>
 
-int yylex(YYSTYPE *yylval, YYLTYPE *yylloc);
+int yylex(YYSTYPE *yylval, YYLTYPE *yylloc, yyscan_t yyscanner);
 
-void yyerror(YYLTYPE *locp, const char* s) {
+void yyerror(YYLTYPE *locp, std::shared_ptr<ast::TreeNode> *result, yyscan_t yyscanner, const char* s) {
+    (void)result;
+    (void)yyscanner;
     std::cerr << "Parser Error at line " << locp->first_line << " column " << locp->first_column << ": " << s << std::endl;
 }
 
@@ -19,6 +21,13 @@ using namespace ast;
 %locations
 // enable verbose syntax error message
 %define parse.error verbose
+// expose yyscan_t in generated header for reentrant lexer
+%code requires {
+    typedef void* yyscan_t;
+}
+// thread-safe: pass result pointer (yyparse+yyerror only) and scanner (all)
+%parse-param {std::shared_ptr<ast::TreeNode> *result}
+%param {yyscan_t yyscanner}
 
 // keywords
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
@@ -65,22 +74,22 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX UNIQUE AND ON SEMI JOIN EXIT HELP T
 start:
         stmt ';'
     {
-        parse_tree = $1;
+        *result = $1;
         YYACCEPT;
     }
     |   HELP
     {
-        parse_tree = std::make_shared<Help>();
+        *result = std::make_shared<Help>();
         YYACCEPT;
     }
     |   EXIT
     {
-        parse_tree = nullptr;
+        *result = nullptr;
         YYACCEPT;
     }
     |   T_EOF
     {
-        parse_tree = nullptr;
+        *result = nullptr;
         YYACCEPT;
     }
     ;
@@ -407,22 +416,22 @@ agg_func:
     }
     |   SUM '(' '*' ')'
     {
-        yyerror(&@1, "SUM(*) is not supported");
+        yyerror(&@1, result, yyscanner, "SUM(*) is not supported");
         YYERROR;
     }
     |   AVG '(' '*' ')'
     {
-        yyerror(&@1, "AVG(*) is not supported");
+        yyerror(&@1, result, yyscanner, "AVG(*) is not supported");
         YYERROR;
     }
     |   MIN '(' '*' ')'
     {
-        yyerror(&@1, "MIN(*) is not supported");
+        yyerror(&@1, result, yyscanner, "MIN(*) is not supported");
         YYERROR;
     }
     |   MAX '(' '*' ')'
     {
-        yyerror(&@1, "MAX(*) is not supported");
+        yyerror(&@1, result, yyscanner, "MAX(*) is not supported");
         YYERROR;
     }
     ;

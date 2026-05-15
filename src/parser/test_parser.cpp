@@ -41,18 +41,21 @@ int main() {
         "help;",
         "",
     };
+    yyscan_t yyscanner;
+    yylex_init(&yyscanner);
     for (auto &sql : sqls) {
         std::cout << sql << std::endl;
-        YY_BUFFER_STATE buf = yy_scan_string(sql.c_str());
-        assert(yyparse() == 0);
-        if (ast::parse_tree != nullptr) {
-            ast::TreePrinter::print(ast::parse_tree);
-            yy_delete_buffer(buf);
+        std::shared_ptr<ast::TreeNode> parse_tree;
+        YY_BUFFER_STATE buf = yy_scan_string(sql.c_str(), yyscanner);
+        assert(yyparse(&parse_tree, yyscanner) == 0);
+        if (parse_tree != nullptr) {
+            ast::TreePrinter::print(parse_tree);
+            yy_delete_buffer(buf, yyscanner);
             std::cout << std::endl;
         } else {
             std::cout << "exit/EOF" << std::endl;
         }
     }
-    ast::parse_tree.reset();
+    yylex_destroy(yyscanner);
     return 0;
 }

@@ -10,12 +10,27 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <memory>
+
 #include "defs.h"
 
-int yyparse();
+// Forward-declare AST types for parser API
+namespace ast {
+class TreeNode;
+}
+
+// Reentrant scanner type (opaque, defined by flex)
+typedef void* yyscan_t;
+
+// Reentrant parser: result is written to *result, scanner passed explicitly
+int yyparse(std::shared_ptr<ast::TreeNode> *result, yyscan_t yyscanner);
+
+// Reentrant lexer API
+int yylex_init(yyscan_t *scanner);
+int yylex_destroy(yyscan_t yyscanner);
 
 typedef struct yy_buffer_state *YY_BUFFER_STATE;
 
-YY_BUFFER_STATE yy_scan_string(const char *str);
+YY_BUFFER_STATE yy_scan_string(const char *str, yyscan_t yyscanner);
 
-void yy_delete_buffer(YY_BUFFER_STATE buffer);
+void yy_delete_buffer(YY_BUFFER_STATE buffer, yyscan_t yyscanner);

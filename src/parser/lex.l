@@ -9,6 +9,8 @@
     /* enable location */
 %option bison-bridge
 %option bison-locations
+    /* enable reentrant scanner (no global state) */
+%option reentrant
 
 %{
 #include "ast.h"
