@@ -12,16 +12,10 @@ See the Mulan PSL v2 for more details. */
 
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include "log_manager.h"
 #include "storage/disk_manager.h"
 #include "system/sm_manager.h"
-
-class RedoLogsInPage {
-public:
-    RedoLogsInPage() { table_file_ = nullptr; }
-    RmFileHandle* table_file_;
-    std::vector<lsn_t> redo_logs_;   // 在该page上需要redo的操作的lsn
-};
 
 class RecoveryManager {
 public:
@@ -39,4 +33,7 @@ private:
     DiskManager* disk_manager_;                                     // 用来读写文件
     BufferPoolManager* buffer_pool_manager_;                        // 对页面进行读写
     SmManager* sm_manager_;                                         // 访问数据库元数据
+    std::unordered_set<txn_id_t> winner_set_;                       // transaction committed, only for analyze now      
+    std::unordered_set<txn_id_t> loser_set_;                        // transaction not finished
+    std::unordered_map<txn_id_t, lsn_t> last_lsn_;                  // last lsn of the transaction
 };
