@@ -10,6 +10,7 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include "common/noncopyable.h"
 #include <iostream>
 #include <map>
 
@@ -52,7 +53,7 @@ inline std::string coltype2str(ColType type) {
     return m.at(type);
 }
 
-class RecScan {
+class RecScan: NonCopyable {
 public:
     virtual ~RecScan() = default;
 

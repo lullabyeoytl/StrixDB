@@ -13,7 +13,6 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 
-namespace {
 
 AggInfo convert_agg_func(const std::shared_ptr<ast::AggFunc> &sv_agg) {
     AggInfo agg;
@@ -34,12 +33,11 @@ void append_unique_agg(std::vector<AggInfo> &agg_infos, const AggInfo &agg) {
     }
 }
 
-}  // namespace
 
 /**
  * @description: 分析器，进行语义分析和查询重写，需要检查不符合语义规定的部分
  * @param {shared_ptr<ast::TreeNode>} parse parser生成的结果集
- * @return {shared_ptr<Query>} Query 
+ * @return {shared_ptr<Query>} Query
  */
 std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
 {
@@ -65,7 +63,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
                 throw InternalError("Unexpected select expression type");
             }
         }
-        
+
         std::vector<ColMeta> all_cols;
         get_all_cols(query->tables, all_cols);
         std::vector<std::string> visible_tables = query->tables;

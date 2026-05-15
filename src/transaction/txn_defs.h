@@ -16,7 +16,14 @@ See the Mulan PSL v2 for more details. */
 #include "defs.h"
 #include "record/rm_defs.h"
 
-/* 标识事务状态 */
+/**
+ * @brief 事务状态
+ * @enum DEFAULT: 事务初始状态
+ * @enum GROWING: 事务正在进行中， 可以获取新锁
+ * @enum SHRINKING: 事务正在提交或回滚，开始释放锁
+ * @enum COMMITTED: 事务提交成功
+ * @enum ABORTED: 事务已中止
+ */
 enum class TransactionState { DEFAULT, GROWING, SHRINKING, COMMITTED, ABORTED };
 
 /* 系统的隔离级别，当前赛题中为可串行化隔离级别 */
@@ -41,12 +48,13 @@ class WriteRecord {
     WriteRecord() = default;
 
     // constructor for insert operation
-    WriteRecord(WType wtype, const std::string &tab_name, const Rid &rid)
-        : wtype_(wtype), tab_name_(tab_name), rid_(rid) {}
+    WriteRecord(WType wtype, const std::string &tab_name, const Rid &rid, lsn_t op_prev_lsn = INVALID_LSN)
+        : wtype_(wtype), tab_name_(tab_name), rid_(rid), op_prev_lsn_(op_prev_lsn) {}
 
     // constructor for delete & update operation
-    WriteRecord(WType wtype, const std::string &tab_name, const Rid &rid, const RmRecord &record)
-        : wtype_(wtype), tab_name_(tab_name), rid_(rid), record_(record) {}
+    WriteRecord(WType wtype, const std::string &tab_name, const Rid &rid, const RmRecord &record,
+                lsn_t op_prev_lsn = INVALID_LSN)
+        : wtype_(wtype), tab_name_(tab_name), rid_(rid), record_(record), op_prev_lsn_(op_prev_lsn) {}
 
     ~WriteRecord() = default;
 
@@ -58,11 +66,14 @@ class WriteRecord {
 
     inline std::string &GetTableName() { return tab_name_; }
 
+    inline lsn_t GetOpPrevLsn() const { return op_prev_lsn_; }
+
    private:
     WType wtype_;
     std::string tab_name_;
     Rid rid_;
     RmRecord record_;
+    lsn_t op_prev_lsn_ = INVALID_LSN;      // 回滚补偿, last lsn of the operation
 };
 
 /* 多粒度锁，加锁对象的类型，包括记录和表 */

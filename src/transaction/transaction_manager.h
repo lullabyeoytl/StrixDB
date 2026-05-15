@@ -27,6 +27,7 @@ See the Mulan PSL v2 for more details. */
 enum class ConcurrencyMode { TWO_PHASE_LOCKING = 0, BASIC_TO, MVCC };
 
 /// 版本链中的第一个撤销链接，将表堆元组链接到撤销日志。
+/// VersionChain
 struct VersionUndoLink {
     /** 版本链中的下一个版本。 */
     UndoLink prev_;
@@ -46,7 +47,7 @@ struct VersionUndoLink {
     }
 };
 
-class TransactionManager{
+class TransactionManager: public NonCopyable {
 public:
     explicit TransactionManager(LockManager *lock_manager, SmManager *sm_manager,
                              ConcurrencyMode concurrency_mode = ConcurrencyMode::TWO_PHASE_LOCKING) {

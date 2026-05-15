@@ -15,6 +15,9 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include <vector>
 
+#include "common/config.h"
+#include "defs.h"
+
 static inline std::string format_index_msg(const std::string &prefix, const std::string &tab_name,
                                           const std::vector<std::string> &col_names) {
     std::string result = prefix + tab_name + ".(";
@@ -80,6 +83,13 @@ class RecordNotFoundError : public RMDBError {
 class InvalidRecordSizeError : public RMDBError {
    public:
     InvalidRecordSizeError(int record_size) : RMDBError("Invalid record size: " + std::to_string(record_size)) {}
+};
+
+class UndoError : public RMDBError {
+   public:
+    UndoError(txn_id_t txn_id, const std::string &tab_name, const Rid &rid, const std::string &reason)
+        : RMDBError("Undo failed for txn " + std::to_string(txn_id) + ", table " + tab_name + ", rid (" +
+                    std::to_string(rid.page_no) + "," + std::to_string(rid.slot_no) + "): " + reason) {}
 };
 
 // IX errors
@@ -174,7 +184,7 @@ class AmbiguousColumnError : public RMDBError {
 class PageNotExistError : public RMDBError {
    public:
     PageNotExistError(const std::string &table_name, int page_no)
-        : RMDBError("Page " + std::to_string(page_no) + " in table " + table_name + "not exits") {}
+        : RMDBError("Page " + std::to_string(page_no) + " in table " + table_name + " not exists") {}
 };
 
 class BufferPoolExhaustedError : public RMDBError {

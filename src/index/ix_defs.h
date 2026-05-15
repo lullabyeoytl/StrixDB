@@ -26,14 +26,14 @@ class IxPageHdr {
 public:
     page_id_t next_free_page_no;    // free-list chain pointer, IX_NO_PAGE when end
     page_id_t parent;               // 父亲节点所在页面的叶号
-    int num_key;                    // # current keys (always equals to #child - 1) 已插入的keys数量，key_idx∈[0,num_key)
+    int num_key;                    // # current keys 已插入的keys数量，key_idx∈[0,num_key)
     bool is_leaf;                   // 是否为叶节点
     page_id_t prev;                 // previous sibling page_no, leaf layer uses it as hint
     page_id_t next;                 // right-link page_no, all layers may use it
 };
 
 class IxFileHdr {
-public: 
+public:
     page_id_t first_free_page_no_;      // 文件中第一个空闲的磁盘页面的页面号
     int num_pages_;                     // 磁盘文件中页面的数量
     page_id_t root_page_;               // B+树根节点对应的页面号
@@ -42,8 +42,8 @@ public:
     std::vector<int> col_lens_;         // 字段的长度
     int col_tot_len_;                   // 索引包含的字段的总长度
     int btree_order_;                   // # children per page 每个结点最多可插入的键值对数量
-    int keys_size_;                     // keys_size = (btree_order + 1) * col_tot_len, 节点预留一个草欸用于分裂插入时的空位
-    // first_leaf初始化之后没有进行修改，只不过是在测试文件中遍历叶子结点的时候用了
+    int keys_size_;                     // keys_size = (btree_order + 1) * col_tot_len, 节点预留一个槽位用于分裂插入时的空位
+    // 首叶节点对应的页号，在 adjust_root 和 erase_leaf 中会更新
     page_id_t first_leaf_;              // 首叶节点对应的页号，在上层IxManager的open函数进行初始化，初始化为root page_no
     page_id_t last_leaf_;               // 尾叶节点对应的页号
     int tot_len_;                       // 记录结构体的整体长度
@@ -65,17 +65,18 @@ public:
     void set_unique(bool v) { unique_ = v; }
     bool is_unique() const { return unique_; }
 
+    static auto serialized_size_for(int col_num) -> int {
+        return sizeof(page_id_t) * 4 + sizeof(int) * 6 +
+               static_cast<int>(sizeof(ColType)) * col_num +
+               static_cast<int>(sizeof(int)) * col_num +
+               sizeof(bool);
+    }
+
     void update_tot_len() {
-        tot_len_ = sizeof(page_id_t) * 4 + sizeof(int) * 6;
-        if (col_num_ > 0) {
-            // Guard against integer overflow from crafted col_num_
-            if (col_num_ > 256) {
-                throw InternalError("Column count overflow in IxFileHdr");
-            }
-            tot_len_ += static_cast<int>(sizeof(ColType)) * col_num_
-                      + static_cast<int>(sizeof(int)) * col_num_;
+        if (col_num_ > 256) {
+            throw InternalError("Column count overflow in IxFileHdr");
         }
-        tot_len_ += sizeof(bool);
+        tot_len_ = serialized_size_for(col_num_);
     }
 
     void serialize(char* dest) {
@@ -113,6 +114,28 @@ public:
         assert(offset == tot_len_);
     }
 
+    void validate() const {
+        int expected_col_tot_len = 0;
+        for (int len : col_lens_) {
+            if (len <= 0 || len > IX_MAX_COL_LEN) {
+                throw InternalError("IxFileHdr layout mismatch");
+            }
+            expected_col_tot_len += len;
+        }
+
+        int expected_btree_order =
+            static_cast<int>((PAGE_SIZE - sizeof(IxPageHdr)) / (col_tot_len_ + static_cast<int>(sizeof(Rid))) - 1);
+        int expected_keys_size = (btree_order_ + 1) * col_tot_len_;
+        int expected_tot_len = serialized_size_for(col_num_);
+
+        if (tot_len_ != expected_tot_len || col_tot_len_ <= 0 || col_tot_len_ > IX_MAX_COL_LEN ||
+            col_tot_len_ != expected_col_tot_len || btree_order_ <= 2 || btree_order_ != expected_btree_order ||
+            keys_size_ <= 0 || keys_size_ != expected_keys_size ||
+            sizeof(IxPageHdr) + keys_size_ + static_cast<int>(sizeof(Rid)) * (btree_order_ + 1) > PAGE_SIZE) {
+            throw InternalError("IxFileHdr layout mismatch");
+        }
+    }
+
     void deserialize(char* src) {
         int offset = 0;
         col_types_.clear();
@@ -128,7 +151,6 @@ public:
         col_num_ = *reinterpret_cast<const int*>(src + offset);
         offset += sizeof(int);
 
-        // Validate col_num_ BEFORE any allocation to prevent OOM / negative bypass
         if (col_num_ < 0 || col_num_ > 256) {
             throw InternalError("IxFileHdr layout mismatch");
         }
@@ -141,9 +163,6 @@ public:
         for(int i = 0; i < col_num_; ++i) {
             int len = *reinterpret_cast<const int*>(src + offset);
             offset += sizeof(int);
-            if (len <= 0 || len > IX_MAX_COL_LEN) {
-                throw InternalError("IxFileHdr layout mismatch");
-            }
             col_lens_.push_back(len);
         }
         col_tot_len_ = *reinterpret_cast<const int*>(src + offset);
@@ -157,26 +176,9 @@ public:
         last_leaf_ = *reinterpret_cast<const page_id_t*>(src + offset);
         offset += sizeof(page_id_t);
 
-        int expected_col_tot_len = 0;
-        for (int len : col_lens_) {
-            expected_col_tot_len += len;
-        }
-        int expected_btree_order =
-            static_cast<int>((PAGE_SIZE - sizeof(IxPageHdr)) / (col_tot_len_ + static_cast<int>(sizeof(Rid))) - 1);
-        int expected_keys_size = (btree_order_ + 1) * col_tot_len_;
-        int expected_tot_len = sizeof(page_id_t) * 4 + sizeof(int) * 6 +
-                               static_cast<int>(sizeof(ColType)) * col_num_
-                             + static_cast<int>(sizeof(int)) * col_num_
-                             + sizeof(bool);
-
-        if (tot_len_ != expected_tot_len || col_tot_len_ <= 0 || col_tot_len_ > IX_MAX_COL_LEN ||
-            col_tot_len_ != expected_col_tot_len || btree_order_ <= 2 || btree_order_ != expected_btree_order ||
-            keys_size_ <= 0 || keys_size_ != expected_keys_size ||
-            sizeof(IxPageHdr) + keys_size_ + static_cast<int>(sizeof(Rid)) * (btree_order_ + 1) > PAGE_SIZE) {
-            throw InternalError("IxFileHdr layout mismatch");
-        }
         unique_ = *reinterpret_cast<const bool*>(src + offset);
         offset += sizeof(bool);
+        validate();
         assert(offset == tot_len_);
     }
 };

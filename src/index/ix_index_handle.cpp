@@ -35,8 +35,7 @@ int IxNodeHandle::lower_bound(const char *target) const {
 /**
  * @brief 在当前node中查找第一个>target的key_idx
  *
- * @return key_idx，范围为[1,num_key)，如果返回的key_idx=num_key，则表示target大于等于最后一个key
- * @note 注意此处的范围从1开始
+ * @return key_idx，叶节点范围为[0,num_key)，内部节点范围为[1,num_key)。如果返回的key_idx=num_key，则表示target大于等于最后一个key
  */
 int IxNodeHandle::upper_bound(const char *target) const {
     // 二分查找第一个 > target 的 key
@@ -85,7 +84,7 @@ page_id_t IxNodeHandle::internal_lookup_ub(const char *key) {
 }
 
 page_id_t IxNodeHandle::internal_lookup_lb(const char *key) {
-    // lower_bound 搜索 [1, num_key)，返回第一个 >= key 的路由 key 位置
+    // lower_bound 搜索 [0, num_key)，返回第一个 >= key 的路由 key 位置
     // 若命中分隔键，则目标孩子节点在 value_at(pos)
     // 否则应当落到其左侧孩子 value_at(pos - 1)
     int pos = lower_bound(key);

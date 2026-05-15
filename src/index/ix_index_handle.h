@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "ix_defs.h"
 #include "transaction/transaction.h"
+#include "common/noncopyable.h"
 
 enum class Operation { FIND = 0, INSERT, DELETE };  // 三种操作：查找、插入、删除
 enum class LatchMode { SHARED, EXCLUSIVE };
@@ -65,7 +66,7 @@ class IxNodeHandle {
     const IxFileHdr *file_hdr;      // 节点所在文件的头部信息
     Page *page;                     // 存储节点的页面
     IxPageHdr *page_hdr;            // page->data的第一部分，指针指向首地址，长度为sizeof(IxPageHdr)
-    char *keys;                     // page->data的第二部分，指针指向首地址，长度为file_hdr->keys_size，每个key的长度为file_hdr->col_len
+    char *keys;                     // page->data的第二部分，指针指向首地址，长度为file_hdr->keys_size_，每个key的长度为file_hdr->col_tot_len_
     Rid *rids;                      // page->data的第三部分，指针指向首地址
 
    public:
@@ -195,7 +196,7 @@ class IxNodeHandle {
 };
 
 /* B+树 */
-class IxIndexHandle {
+class IxIndexHandle : public NonCopyable {
     friend class IxScan;
     friend class IxManager;
 

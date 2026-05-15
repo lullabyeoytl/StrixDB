@@ -10,13 +10,15 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
-#include <mutex>
 #include <condition_variable>
+#include <list>
+#include <mutex>
+#include <unordered_map>
 #include "transaction/transaction.h"
 
-static const std::string GroupLockModeStr[10] = {"NON_LOCK", "IS", "IX", "S", "X", "SIX"};
+static const std::string GroupLockModeStr[6] = {"NON_LOCK", "IS", "IX", "S", "X", "SIX"};
 
-class LockManager {
+class LockManager: public NonCopyable {
     /* 加锁类型，包括共享锁、排他锁、意向共享锁、意向排他锁、SIX（意向排他锁+共享锁） */
     enum class LockMode { SHARED, EXLUCSIVE, INTENTION_SHARED, INTENTION_EXCLUSIVE, S_IX };
 
@@ -28,10 +30,13 @@ class LockManager {
     public:
         LockRequest(txn_id_t txn_id, LockMode lock_mode)
             : txn_id_(txn_id), lock_mode_(lock_mode), granted_(false) {}
+        LockRequest(txn_id_t txn_id, LockMode lock_mode, bool is_upgrade)
+            : txn_id_(txn_id), lock_mode_(lock_mode), granted_(false), is_upgrade_(is_upgrade) {}
 
         txn_id_t txn_id_;   // 申请加锁的事务ID
         LockMode lock_mode_;    // 事务申请加锁的类型
         bool granted_;          // 该事务是否已经被赋予锁
+        bool is_upgrade_ = false;   // 是否是升级锁
     };
 
     /* 数据项上的加锁队列 */
@@ -39,7 +44,8 @@ class LockManager {
     public:
         std::list<LockRequest> request_queue_;  // 加锁队列
         std::condition_variable cv_;            // 条件变量，用于唤醒正在等待加锁的申请，在no-wait策略下无需使用
-        GroupLockMode group_lock_mode_ = GroupLockMode::NON_LOCK;   // 加锁队列的锁模式
+        // GroupLockMode group_lock_mode_ = GroupLockMode::NON_LOCK;   // 加锁队列的锁模式
+        bool upgrading_ = false;    // 是否有进行中的升级操作
     };
 
 public:
@@ -62,6 +68,20 @@ public:
     bool unlock(Transaction* txn, LockDataId lock_data_id);
 
 private:
+    int lock_mode_index(LockMode mode) const;
+    bool is_compatible(const LockRequestQueue &queue, txn_id_t requester_id, LockMode mode) const;
+    bool has_prior_upgrade_request(const LockRequestQueue &queue, txn_id_t requester_id) const;
+    bool can_wait(const LockRequestQueue &queue, txn_id_t requester_id) const;
+    bool is_at_least_as_strong(LockMode held, LockMode requested) const;
+    // void recompute_group_mode(LockRequestQueue &queue);
+    bool acquire_lock(std::unique_lock<std::mutex> &lock, LockRequestQueue &queue, Transaction *txn, LockMode mode,
+                      const LockDataId &lock_data_id);
+    bool acquire_new_lock(std::unique_lock<std::mutex> &lock, LockRequestQueue &queue, Transaction *txn, LockMode mode,
+                          const LockDataId &lock_data_id);
+    bool perform_upgrade(std::unique_lock<std::mutex> &lock, LockRequestQueue &queue, Transaction *txn,
+                         std::list<LockRequest>::iterator request_it, LockMode mode,
+                         const LockDataId &lock_data_id);
+
     std::mutex latch_;      // 用于锁表的并发
     std::unordered_map<LockDataId, LockRequestQueue> lock_table_;   // 全局锁表
 };

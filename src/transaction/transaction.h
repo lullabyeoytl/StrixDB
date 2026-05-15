@@ -42,7 +42,7 @@ struct UndoLink {
 struct UndoLog {
   /* 此日志是否为删除标记 */
   bool is_deleted_;
-  /* 此撤销日志修改的字段 */
+  // a map of whether each field is modified in table
   std::vector<bool> modified_fields_;
   /* 修改后的字段 */
   std::vector<Value> tuple_;
@@ -54,7 +54,7 @@ struct UndoLog {
 };
 
 
-class Transaction {
+class Transaction: public NonCopyable {
    public:
     explicit Transaction(txn_id_t txn_id, IsolationLevel isolation_level = IsolationLevel::SERIALIZABLE)
         : state_(TransactionState::DEFAULT), isolation_level_(isolation_level), txn_id_(txn_id) {

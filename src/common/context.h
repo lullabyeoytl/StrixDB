@@ -19,6 +19,9 @@ See the Mulan PSL v2 for more details. */
 // used for data_send
 static int const_offset = -1;
 
+/**
+ * @brief Carries per-statement runtime state shared by database components.
+ */
 class Context {
 public:
     Context (LockManager *lock_mgr, LogManager *log_mgr, 
@@ -34,5 +37,6 @@ public:
     Transaction *txn_;
     char *data_send_;
     int *offset_;
+    // @brief Marks whether formatted output has exceeded the client buffer.
     bool ellipsis_;
 };
