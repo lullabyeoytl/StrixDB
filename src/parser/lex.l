@@ -103,6 +103,7 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "HAVING" { return HAVING; }
 "ENABLE_NESTLOOP" { return ENABLE_NESTLOOP; }
 "ENABLE_SORTMERGE" { return ENABLE_SORTMERGE; }
+"ENABLE_HASHJOIN" { return ENABLE_HASHJOIN; }
 "TRUE" { 
     yylval->sv_bool = true;
     return VALUE_BOOL; 

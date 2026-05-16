@@ -153,6 +153,10 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
             planner_->set_enable_sortmerge_join(x->bool_value_);
             break;
         }
+        case ast::SetKnobType::EnableHashJoin: {
+            planner_->set_enable_hash_join(x->bool_value_);
+            break;
+        }
         default: {
             throw RMDBError("Not implemented!\n");
             break;

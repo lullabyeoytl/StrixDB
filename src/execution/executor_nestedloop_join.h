@@ -10,7 +10,6 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 #include "join_common.h"
-#include "execution_common.h"
 #include "executor_abstract.h"
 
 class NestedLoopJoinExecutor : public AbstractExecutor {
@@ -42,11 +41,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
         if (left_rec_ == nullptr || right_rec_ == nullptr) {
             return false;
         }
-        if (fed_conds_.empty()) {
-            return true;
-        }
-        auto joined = build_join_eval_record(*left_rec_, *right_rec_, left_len_, right_len_);
-        return evaluate_conditions(fed_conds_, *joined, eval_cols_);
+        return evaluate_join_pair_conditions(fed_conds_, *left_rec_, *right_rec_, left_len_, right_len_, eval_cols_);
     }
 
     void seek_next_match(bool advance_left) {

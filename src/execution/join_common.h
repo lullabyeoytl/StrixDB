@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 
+#include "execution_common.h"
 #include "parser/ast.h"
 
 struct JoinSchemaLayout {
@@ -56,4 +57,37 @@ inline auto build_semi_output_record(const RmRecord &left_rec, size_t left_len) 
     auto out = std::make_unique<RmRecord>(static_cast<int>(left_len));
     memcpy(out->data, left_rec.data, left_len);
     return out;
+}
+
+inline auto extract_join_key_values(const RmRecord &record, const std::vector<ColMeta> &key_metas)
+    -> std::vector<Value> {
+    std::vector<Value> key_values;
+    key_values.reserve(key_metas.size());
+    for (const auto &meta : key_metas) {
+        key_values.push_back(get_col_value(record, meta));
+    }
+    return key_values;
+}
+
+inline auto compare_join_keys(const RmRecord &left_rec, const std::vector<ColMeta> &left_key_metas,
+                              const RmRecord &right_rec, const std::vector<ColMeta> &right_key_metas) -> int {
+    auto left_key_values = extract_join_key_values(left_rec, left_key_metas);
+    auto right_key_values = extract_join_key_values(right_rec, right_key_metas);
+    for (size_t i = 0; i < left_key_values.size(); ++i) {
+        int cmp = left_key_values[i].compare(right_key_values[i]);
+        if (cmp != 0) {
+            return cmp;
+        }
+    }
+    return 0;
+}
+
+inline auto evaluate_join_pair_conditions(const std::vector<Condition> &conds, const RmRecord &left_rec,
+                                          const RmRecord &right_rec, size_t left_len, size_t right_len,
+                                          const std::vector<ColMeta> &eval_cols) -> bool {
+    if (conds.empty()) {
+        return true;
+    }
+    auto joined = build_join_eval_record(left_rec, right_rec, left_len, right_len);
+    return evaluate_conditions(conds, *joined, eval_cols);
 }

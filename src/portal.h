@@ -16,6 +16,7 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm_manager.h"
 #include "optimizer/plan.h"
 #include "execution/executor_abstract.h"
+#include "execution/executor_hash_join.h"
 #include "execution/executor_nestedloop_join.h"
 #include "execution/executor_sortmerge_join.h"
 #include "execution/executor_projection.h"
@@ -185,8 +186,12 @@ class Portal
                                                            std::move(x->residual_conds_),
                                                            x->join_type_);
         } else if(auto x = std::dynamic_pointer_cast<HashJoinPlan>(plan)) {
-            (void)x;
-            throw RMDBError("HashJoinExecutor is not implemented yet");
+            std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_, context);
+            std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_, context);
+            return std::make_unique<HashJoinExecutor>(std::move(left), std::move(right),
+                                                      std::move(x->hash_conds_),
+                                                      std::move(x->residual_conds_),
+                                                      x->join_type_);
         } else if(auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
             throw InternalError("Logical JoinPlan must be physicalized before executor conversion");
         } else if(auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {

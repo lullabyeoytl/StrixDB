@@ -34,7 +34,7 @@ enum OrderByDir {
 };
 
 enum SetKnobType {
-    EnableNestLoop, EnableSortMerge
+    EnableNestLoop, EnableSortMerge, EnableHashJoin
 };
 
 // Base class for tree nodes
