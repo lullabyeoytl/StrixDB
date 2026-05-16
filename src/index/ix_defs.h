@@ -21,6 +21,19 @@ constexpr int IX_LEAF_HEADER_PAGE = 1;
 constexpr int IX_INIT_ROOT_PAGE = 2;
 constexpr int IX_INIT_NUM_PAGES = 3;
 constexpr int IX_MAX_COL_LEN = 512;
+constexpr int IX_PAGE_RECYCLE_DELAY = 1;
+
+enum class IxPageSplitState : int {
+    NORMAL = 0,
+    SPLIT_INCOMPLETE = 1,
+};
+
+enum class IxPageRecycleState : int {
+    LIVE = 0,
+    HALF_DEAD = 1,
+    DELETED = 2,
+    REUSABLE = 3,
+};
 
 class IxPageHdr {
 public:
@@ -30,6 +43,9 @@ public:
     bool is_leaf;                   // 是否为叶节点
     page_id_t prev;                 // previous sibling page_no, leaf layer uses it as hint
     page_id_t next;                 // right-link page_no, all layers may use it
+    IxPageSplitState split_state;   // B-link split publication state
+    IxPageRecycleState recycle_state;
+    page_id_t deleted_epoch;
 };
 
 class IxFileHdr {
@@ -47,10 +63,12 @@ public:
     page_id_t first_leaf_;              // 首叶节点对应的页号，在上层IxManager的open函数进行初始化，初始化为root page_no
     page_id_t last_leaf_;               // 尾叶节点对应的页号
     int tot_len_;                       // 记录结构体的整体长度
+    int page_hdr_size_;                 // serialized sizeof(IxPageHdr) for layout compatibility
     bool unique_;                       // 是否为唯一索引
 
     IxFileHdr() {
         tot_len_ = col_num_ = 0;
+        page_hdr_size_ = static_cast<int>(sizeof(IxPageHdr));
         unique_ = false;
     }
 
@@ -58,6 +76,7 @@ public:
                 int col_tot_len, int btree_order, int keys_size, page_id_t first_leaf, page_id_t last_leaf)
                 : first_free_page_no_(first_free_page_no), num_pages_(num_pages), root_page_(root_page), col_num_(col_num),
                 col_tot_len_(col_tot_len), btree_order_(btree_order), keys_size_(keys_size), first_leaf_(first_leaf), last_leaf_(last_leaf),
+                page_hdr_size_(static_cast<int>(sizeof(IxPageHdr))),
                 unique_(false) {
                     tot_len_ = 0;
                 }
@@ -66,7 +85,7 @@ public:
     bool is_unique() const { return unique_; }
 
     static auto serialized_size_for(int col_num) -> int {
-        return sizeof(page_id_t) * 4 + sizeof(int) * 6 +
+        return sizeof(page_id_t) * 4 + sizeof(int) * 7 +
                static_cast<int>(sizeof(ColType)) * col_num +
                static_cast<int>(sizeof(int)) * col_num +
                sizeof(bool);
@@ -111,6 +130,8 @@ public:
         offset += sizeof(page_id_t);
         memcpy(dest + offset, &unique_, sizeof(bool));
         offset += sizeof(bool);
+        memcpy(dest + offset, &page_hdr_size_, sizeof(int));
+        offset += sizeof(int);
         assert(offset == tot_len_);
     }
 
@@ -130,6 +151,7 @@ public:
 
         if (tot_len_ != expected_tot_len || col_tot_len_ <= 0 || col_tot_len_ > IX_MAX_COL_LEN ||
             col_tot_len_ != expected_col_tot_len || btree_order_ <= 2 || btree_order_ != expected_btree_order ||
+            page_hdr_size_ != static_cast<int>(sizeof(IxPageHdr)) ||
             keys_size_ <= 0 || keys_size_ != expected_keys_size ||
             sizeof(IxPageHdr) + keys_size_ + static_cast<int>(sizeof(Rid)) * (btree_order_ + 1) > PAGE_SIZE) {
             throw InternalError("IxFileHdr layout mismatch");
@@ -141,6 +163,9 @@ public:
         col_types_.clear();
         col_lens_.clear();
         tot_len_ = *reinterpret_cast<const int*>(src + offset);
+        if (tot_len_ <= 0 || tot_len_ > PAGE_SIZE) {
+            throw InternalError("IxFileHdr deserialize: tot_len out of range");
+        }
         offset += sizeof(int);
         first_free_page_no_ = *reinterpret_cast<const page_id_t*>(src + offset);
         offset += sizeof(page_id_t);
@@ -178,6 +203,8 @@ public:
 
         unique_ = *reinterpret_cast<const bool*>(src + offset);
         offset += sizeof(bool);
+        page_hdr_size_ = *reinterpret_cast<const int*>(src + offset);
+        offset += sizeof(int);
         validate();
         assert(offset == tot_len_);
     }

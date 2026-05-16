@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 IxScan::IxScan(const IxIndexHandle *ih, const Iid &lower, ScanUpperBound upper_bound, BufferPoolManager *bpm)
     : ih_(ih), iid_(lower), upper_bound_(std::move(upper_bound)), bpm_(bpm) {
+    ih_->active_accessors_.fetch_add(1);
     if (iid_.page_no == INVALID_PAGE_ID) {
         is_end_ = true;
         return;
@@ -24,6 +25,7 @@ IxScan::IxScan(const IxIndexHandle *ih, const Iid &lower, ScanUpperBound upper_b
 
 IxScan::~IxScan() {
     release_current();
+    ih_->active_accessors_.fetch_sub(1);
 }
 
 void IxScan::release_current() {
@@ -68,6 +70,16 @@ bool IxScan::exceeds_upper_bound() const {
 void IxScan::advance_to_valid_record() {
     while (current_node_) {
         assert(current_node_->is_leaf_page());
+
+        while (current_node_ && current_node_->is_deleted()) {
+            if (!current_node_->has_next()) {
+                release_current();
+                iid_ = Iid{INVALID_PAGE_ID, -1};
+                is_end_ = true;
+                return;
+            }
+            move_to_next_leaf();
+        }
 
         while (iid_.slot_no >= current_node_->get_size()) {
             if (!current_node_->has_next()) {

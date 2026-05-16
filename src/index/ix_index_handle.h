@@ -12,6 +12,9 @@ See the Mulan PSL v2 for more details. */
 
 #include <memory>
 #include <mutex>
+#include <thread>
+#include <vector>
+#include <atomic>
 
 #include "ix_defs.h"
 #include "transaction/transaction.h"
@@ -113,11 +116,42 @@ class IxNodeHandle {
 
     bool is_root_page() const { return get_parent() == INVALID_PAGE_ID; }
 
+    bool is_split_incomplete() const { return page_hdr->split_state == IxPageSplitState::SPLIT_INCOMPLETE; }
+
+    bool is_live() const { return page_hdr->recycle_state == IxPageRecycleState::LIVE; }
+
+    bool is_half_dead() const { return page_hdr->recycle_state == IxPageRecycleState::HALF_DEAD; }
+
+    bool is_deleted() const { return page_hdr->recycle_state == IxPageRecycleState::DELETED; }
+
+    bool is_reusable() const { return page_hdr->recycle_state == IxPageRecycleState::REUSABLE; }
+
     void set_next(page_id_t page_no) { page_hdr->next = page_no; }
 
     void set_prev(page_id_t page_no) { page_hdr->prev = page_no; }
 
     void set_parent(page_id_t parent) { page_hdr->parent = parent; }
+
+    void mark_split_incomplete() { page_hdr->split_state = IxPageSplitState::SPLIT_INCOMPLETE; }
+
+    void clear_split_incomplete() { page_hdr->split_state = IxPageSplitState::NORMAL; }
+
+    void mark_live() {
+        page_hdr->recycle_state = IxPageRecycleState::LIVE;
+        page_hdr->deleted_epoch = 0;
+    }
+
+    void mark_half_dead(page_id_t epoch) {
+        page_hdr->recycle_state = IxPageRecycleState::HALF_DEAD;
+        page_hdr->deleted_epoch = epoch;
+    }
+
+    void mark_deleted(page_id_t epoch) {
+        page_hdr->recycle_state = IxPageRecycleState::DELETED;
+        page_hdr->deleted_epoch = epoch;
+    }
+
+    void mark_reusable() { page_hdr->recycle_state = IxPageRecycleState::REUSABLE; }
 
     char *get_key(int key_idx) const { return keys + key_idx * file_hdr->col_tot_len_; }
 
@@ -131,11 +165,8 @@ class IxNodeHandle {
 
     void set_high_key(const char *key) { memcpy(get_high_key(), key, file_hdr->col_tot_len_); }
 
+    // Internal pages never use IX_LEAF_HEADER_PAGE as a right link.
     bool has_next() const { return get_next() != IX_NO_PAGE && get_next() != IX_LEAF_HEADER_PAGE; }
-
-    /// has_right_link仅过滤IX_NO_PAGE，用于内部节点的B-link协议检查
-    /// 叶节点使用has_next()：IX_LEAF_HEADER_PAGE哨兵等价于"无右兄弟，high_key=+∞"
-    bool has_right_link() const { return get_next() != IX_NO_PAGE; }
 
     bool is_safe_for_insert() const { return get_size() < get_max_size() - 1; }
 
@@ -171,10 +202,14 @@ class IxNodeHandle {
      * @return the last child
      */
     page_id_t remove_and_return_only_child() {
-        assert(get_size() == 1);
+        if (get_size() != 1) {
+            throw InternalError("remove_and_return_only_child: expected size 1");
+        }
         page_id_t child_page_no = value_at(0);
         erase_pair(0);
-        assert(get_size() == 0);
+        if (get_size() != 0) {
+            throw InternalError("remove_and_return_only_child: size not 0 after erase");
+        }
         return child_page_no;
     }
 
@@ -190,7 +225,9 @@ class IxNodeHandle {
                 break;
             }
         }
-        assert(rid_idx < page_hdr->num_key);
+        if (rid_idx >= page_hdr->num_key) {
+            throw InternalError("find_child: child not found");
+        }
         return rid_idx;
     }
 };
@@ -206,7 +243,10 @@ class IxIndexHandle : public NonCopyable {
    int fd_;                                    // 存储B+树的文件
    IxFileHdr* file_hdr_;                       // 存了root_page，但其初始化为2（第0页存FILE_HDR_PAGE，第1页存LEAF_HEADER_PAGE）
    mutable std::mutex file_hdr_latch_;
-    mutable std::mutex write_path_latch_;
+   mutable std::mutex create_node_latch_;
+   mutable std::mutex cleanup_latch_;
+   page_id_t cleanup_epoch_ = 0;
+   mutable std::atomic<int> active_accessors_{0};
 
    public:
     IxIndexHandle(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager, int fd);
@@ -215,7 +255,7 @@ class IxIndexHandle : public NonCopyable {
     // for search
     bool get_value(const char *key, std::vector<Rid> *result, Transaction *transaction);
 
-    std::pair<std::unique_ptr<IxNodeHandle>, bool> find_leaf_page(const char *key, Operation operation, Transaction *transaction,
+    std::unique_ptr<IxNodeHandle> find_leaf_page(const char *key, Operation operation, Transaction *transaction,
                                                  bool find_first = false);
 
     // for insert
@@ -228,15 +268,6 @@ class IxIndexHandle : public NonCopyable {
     // for delete
     bool delete_entry(const char *key, const Rid &rid, Transaction *transaction);
 
-    bool coalesce_or_redistribute(IxNodeHandle *node, Transaction *transaction = nullptr,
-                                bool *root_is_latched = nullptr, bool node_is_latched = false);
-    bool adjust_root(IxNodeHandle *old_root_node);
-
-    void redistribute(IxNodeHandle *neighbor_node, IxNodeHandle *node, IxNodeHandle *parent, int index);
-
-    bool coalesce(IxNodeHandle **neighbor_node, IxNodeHandle **node, IxNodeHandle **parent, int index,
-                  Transaction *transaction, bool *root_is_latched);
-
     Iid lower_bound(const char *key);
 
     Iid upper_bound(const char *key);
@@ -247,7 +278,20 @@ class IxIndexHandle : public NonCopyable {
 
     bool has_duplicate_keys() const;
 
+    int cleanup_empty_leaf_pages();
+
    private:
+    class AccessGuard : public NonCopyable {
+       public:
+        explicit AccessGuard(const IxIndexHandle *ih) : ih_(ih) { ih_->active_accessors_.fetch_add(1); }
+        ~AccessGuard() { ih_->active_accessors_.fetch_sub(1); }
+
+       private:
+        const IxIndexHandle *ih_;
+    };
+
+    AccessGuard guard_access() const { return AccessGuard(this); }
+
     // 辅助函数
     void update_root_page_no(page_id_t root) {
         std::lock_guard<std::mutex> guard(file_hdr_latch_);
@@ -269,6 +313,11 @@ class IxIndexHandle : public NonCopyable {
         return file_hdr_->last_leaf_;
     }
 
+    int get_num_pages() const {
+        std::lock_guard<std::mutex> guard(file_hdr_latch_);
+        return file_hdr_->num_pages_;
+    }
+
     void set_first_leaf_page_no(page_id_t page_no) {
         std::lock_guard<std::mutex> guard(file_hdr_latch_);
         file_hdr_->first_leaf_ = page_no;
@@ -284,6 +333,39 @@ class IxIndexHandle : public NonCopyable {
         file_hdr_->num_pages_++;
     }
 
+    page_id_t advance_cleanup_epoch() {
+        std::lock_guard<std::mutex> guard(file_hdr_latch_);
+        return ++cleanup_epoch_;
+    }
+
+    page_id_t pop_free_page_no() {
+        std::lock_guard<std::mutex> guard(file_hdr_latch_);
+        page_id_t free_page_no = file_hdr_->first_free_page_no_;
+        if (free_page_no != IX_NO_PAGE) {
+            Page *page = buffer_pool_manager_->fetch_page(PageId{fd_, free_page_no});
+            if (page == nullptr) {
+                throw BufferPoolExhaustedError();
+            }
+            IxNodeHandle free_node(file_hdr_, page);
+            file_hdr_->first_free_page_no_ = free_node.page_hdr->next_free_page_no;
+            buffer_pool_manager_->unpin_page(free_node.get_page_id(), false);
+        }
+        return free_page_no;
+    }
+
+    void push_free_page_no(page_id_t page_no) {
+        std::lock_guard<std::mutex> guard(file_hdr_latch_);
+        Page *page = buffer_pool_manager_->fetch_page(PageId{fd_, page_no});
+        if (page == nullptr) {
+            throw BufferPoolExhaustedError();
+        }
+        IxNodeHandle node(file_hdr_, page);
+        node.page_hdr->next_free_page_no = file_hdr_->first_free_page_no_;
+        node.mark_reusable();
+        file_hdr_->first_free_page_no_ = page_no;
+        buffer_pool_manager_->unpin_page(node.get_page_id(), true);
+    }
+
     bool is_empty() const { return get_root_page_no() == IX_NO_PAGE; }
 
     // for get/create node
@@ -296,7 +378,29 @@ class IxIndexHandle : public NonCopyable {
 
     void maintain_parent(page_id_t child_page_no, page_id_t parent_page_no, const char *child_first_key);
 
+    struct VerifiedParent {
+        std::unique_ptr<IxNodeHandle> parent;
+        int child_idx;
+    };
+
+    VerifiedParent latch_parent_containing_child(page_id_t child_page_no, const char *separator_key,
+                                                 page_id_t parent_hint);
+
+    page_id_t locate_parent_page_from_root(page_id_t child_page_no, const char *separator_key);
+
+    page_id_t locate_parent_page_from(page_id_t page_no, page_id_t child_page_no, const char *separator_key);
+
+    int find_child_index(const IxNodeHandle *parent, page_id_t child_page_no) const;
+
     void erase_leaf(IxNodeHandle *leaf);
+
+    bool can_delete_leaf(const IxNodeHandle *leaf) const;
+
+    bool try_delete_empty_leaf(page_id_t leaf_page_no, page_id_t epoch);
+
+    bool try_recycle_deleted_page(page_id_t page_no, page_id_t epoch);
+
+    bool unlink_half_dead_leaf(IxNodeHandle *leaf, IxNodeHandle *parent, int parent_idx, page_id_t epoch);
 
     void release_node_handle(IxNodeHandle &node);
 

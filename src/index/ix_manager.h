@@ -114,6 +114,9 @@ class IxManager {
                 .is_leaf = true,
                 .prev = IX_INIT_ROOT_PAGE,
                 .next = IX_INIT_ROOT_PAGE,
+                .split_state = IxPageSplitState::NORMAL,
+                .recycle_state = IxPageRecycleState::LIVE,
+                .deleted_epoch = 0,
             };
             disk_manager_->write_page(fd, IX_LEAF_HEADER_PAGE, page_buf, PAGE_SIZE);
         }
@@ -128,6 +131,9 @@ class IxManager {
                 .is_leaf = true,
                 .prev = IX_LEAF_HEADER_PAGE,
                 .next = IX_LEAF_HEADER_PAGE,
+                .split_state = IxPageSplitState::NORMAL,
+                .recycle_state = IxPageRecycleState::LIVE,
+                .deleted_epoch = 0,
             };
             disk_manager_->write_page(fd, IX_INIT_ROOT_PAGE, page_buf, PAGE_SIZE);
         }
