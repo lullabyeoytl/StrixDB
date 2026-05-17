@@ -214,10 +214,18 @@ struct HavingCond : public TreeNode {
 
 struct OrderBy : public TreeNode
 {
-    std::shared_ptr<Col> cols;
-    OrderByDir orderby_dir;
-    OrderBy( std::shared_ptr<Col> cols_, OrderByDir orderby_dir_) :
-       cols(std::move(cols_)), orderby_dir(std::move(orderby_dir_)) {}
+    struct Item : public TreeNode {
+        std::shared_ptr<Col> col;
+        OrderByDir orderby_dir;
+
+        Item(std::shared_ptr<Col> col_, OrderByDir orderby_dir_) :
+            col(std::move(col_)), orderby_dir(orderby_dir_) {}
+    };
+
+    // Preserve the original user-specified key order for lexicographic sorting.
+    std::vector<std::shared_ptr<Item>> items;
+
+    explicit OrderBy(std::vector<std::shared_ptr<Item>> items_) : items(std::move(items_)) {}
 };
 
 struct InsertStmt : public TreeNode {
@@ -348,6 +356,8 @@ struct SemValue {
     std::vector<std::shared_ptr<JoinExpr>> sv_join_exprs;
     JoinType sv_join_type;
 
+    std::shared_ptr<OrderBy::Item> sv_orderby_item;
+    std::vector<std::shared_ptr<OrderBy::Item>> sv_orderby_items;
     std::shared_ptr<OrderBy> sv_orderby;
     
     // aggregation concerning

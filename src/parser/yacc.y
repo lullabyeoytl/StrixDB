@@ -63,7 +63,9 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX UNIQUE AND ON SEMI JOIN EXIT HELP T
 %type <sv_set_clauses> setClauses
 %type <sv_cond> condition
 %type <sv_conds> whereClause optWhereClause
-%type <sv_orderby>  order_clause opt_order_clause
+%type <sv_orderby> opt_order_clause
+%type <sv_orderby_items> order_clause
+%type <sv_orderby_item> order_item
 %type <sv_orderby_dir> opt_asc_desc
 %type <sv_group_by> opt_group_clause
 %type <sv_having_cond> having_cond
@@ -535,17 +537,29 @@ tableList:
 opt_order_clause:
     ORDER BY order_clause      
     { 
-        $$ = $3; 
+        $$ = std::make_shared<OrderBy>($3); 
     }
-    |   /* epsilon */ { /* ignore*/ }
+    |   /* epsilon */ { $$ = nullptr; }
     ;
 
 order_clause:
-      col  opt_asc_desc 
+      order_item
     { 
-        $$ = std::make_shared<OrderBy>($1, $2);
+        $$ = std::vector<std::shared_ptr<OrderBy::Item>>{$1};
     }
-    ;   
+    |   order_clause ',' order_item
+    {
+        $1.push_back($3);
+        $$ = std::move($1);
+    }
+    ;
+
+order_item:
+      col opt_asc_desc
+    {
+        $$ = std::make_shared<OrderBy::Item>($1, $2);
+    }
+    ;
 
 opt_asc_desc:
     ASC          { $$ = OrderBy_ASC;     }

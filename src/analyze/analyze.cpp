@@ -113,6 +113,14 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
                 query->group_by_cols.push_back(group_col);
             }
         }
+        if (x->has_sort) {
+            for (const auto &sv_order_item : x->order->items) {
+                TabCol order_col = {.tab_name = sv_order_item->col->tab_name, .col_name = sv_order_item->col->col_name};
+                check_column(visible_cols, order_col);
+                query->order_by_cols.push_back(order_col);
+                query->order_by_descs.push_back(sv_order_item->orderby_dir == ast::OrderBy_DESC);
+            }
+        }
         for (auto &sv_having : x->having_conds) {
             HavingCond having_cond;
             having_cond.is_agg = sv_having->is_agg;

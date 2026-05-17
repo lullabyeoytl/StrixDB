@@ -153,8 +153,10 @@ private:
             print_node(x->rhs, offset);
         } else if (auto x = std::dynamic_pointer_cast<OrderBy>(node)) {
             std::cout << "ORDER_BY\n";
-            print_node(x->cols, offset);
-            print_val(orderby2str(x->orderby_dir), offset);
+            for (const auto &item : x->items) {
+                print_node(item->col, offset);
+                print_val(orderby2str(item->orderby_dir), offset);
+            }
         } else if (auto x = std::dynamic_pointer_cast<TypeLen>(node)) {
             std::cout << "TYPE_LEN\n";
             print_val(type2str(x->type), offset);
