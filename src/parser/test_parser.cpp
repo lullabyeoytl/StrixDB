@@ -36,7 +36,7 @@ int main() {
         "select x.a, y.b from x join y where x.a = y.b and c = d;",
         "select count(*), sum(a), avg(b), min(c), max(c) from tb;",
         "select a, count(*) from tb group by a;",
-        "select a, count(*) from tb group by a having count(*) > 1 and a = 2 order by a asc;",
+        "select a, count(*) from tb group by a having count(*) > 1 and a = 2 order by a asc, c desc;",
         "exit;",
         "help;",
         "",

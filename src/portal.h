@@ -196,7 +196,7 @@ class Portal
             throw InternalError("Logical JoinPlan must be physicalized before executor conversion");
         } else if(auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
             return std::make_unique<SortExecutor>(convert_plan_executor(x->subplan_, context), 
-                                                  x->sort_cols_, x->is_descs_);
+                                                  x->sort_keys_);
         }
         return nullptr;
     }

@@ -37,8 +37,12 @@ See the Mulan PSL v2 for more details. */
 #include <unordered_map>
 #include <vector>
 
+#include "analyze/analyze.h"
+#include "execution/execution_sort.h"
 #include "execution/executor_hash_join.h"
 #include "gtest/gtest.h"
+#include "optimizer/planner.h"
+#include "parser/parser.h"
 #include "replacer/lru_replacer.h"
 #include "storage/disk_manager.h"
 
@@ -171,6 +175,33 @@ auto make_int_record(std::initializer_list<int> values) -> RmRecord {
 
 auto read_int_field(const RmRecord &record, int offset) -> int {
     return *reinterpret_cast<const int *>(record.data + offset);
+}
+
+auto parse_sql(const std::string &sql) -> std::shared_ptr<ast::TreeNode> {
+    yyscan_t yyscanner;
+    if (yylex_init(&yyscanner) != 0) {
+        throw std::runtime_error("failed to initialize scanner");
+    }
+    std::shared_ptr<ast::TreeNode> parse_tree;
+    YY_BUFFER_STATE buf = yy_scan_string(sql.c_str(), yyscanner);
+    int parse_result = yyparse(&parse_tree, yyscanner);
+    yy_delete_buffer(buf, yyscanner);
+    yylex_destroy(yyscanner);
+    if (parse_result != 0) {
+        throw std::runtime_error("failed to parse SQL");
+    }
+    return parse_tree;
+}
+
+auto make_int_table(const std::string &table_name, std::initializer_list<std::string> col_names) -> TabMeta {
+    TabMeta table;
+    table.name = table_name;
+    int offset = 0;
+    for (const auto &col_name : col_names) {
+        table.cols.push_back(make_int_col(table_name, col_name, offset));
+        offset += static_cast<int>(sizeof(int));
+    }
+    return table;
 }
 
 /**
@@ -1102,6 +1133,68 @@ TEST(RecordManagerTest, SimpleTest) {
     // clean up
     rm_manager->close_file(file_handle.get());
     rm_manager->destroy_file(filename);
+}
+
+TEST(OrderByParserTest, ParsesMultiKeyDirections) {
+    auto parse_tree = parse_sql("select * from t order by a desc, b asc, c;");
+    auto select = std::dynamic_pointer_cast<ast::SelectStmt>(parse_tree);
+    ASSERT_NE(nullptr, select);
+    ASSERT_TRUE(select->has_sort);
+    ASSERT_NE(nullptr, select->order);
+    ASSERT_EQ(3, select->order->items.size());
+
+    EXPECT_EQ("a", select->order->items[0]->col->col_name);
+    EXPECT_EQ(ast::OrderBy_DESC, select->order->items[0]->orderby_dir);
+    EXPECT_EQ("b", select->order->items[1]->col->col_name);
+    EXPECT_EQ(ast::OrderBy_ASC, select->order->items[1]->orderby_dir);
+    EXPECT_EQ("c", select->order->items[2]->col->col_name);
+    EXPECT_EQ(ast::OrderBy_DEFAULT, select->order->items[2]->orderby_dir);
+}
+
+TEST(OrderByPlannerTest, PreservesNormalizedSortKeysAcrossAnalyzeAndPlanner) {
+    SmManager sm_manager(nullptr, nullptr, nullptr, nullptr);
+    sm_manager.db_.SetTabMeta("t", make_int_table("t", {"a", "b", "c"}));
+
+    Analyze analyze(&sm_manager);
+    Planner planner(&sm_manager);
+
+    auto query = analyze.do_analyze(parse_sql("select * from t order by b desc, a asc, b asc;"));
+    ASSERT_EQ(3, query->order_by_keys.size());
+    EXPECT_EQ("b", query->order_by_keys[0].col.col_name);
+    EXPECT_TRUE(query->order_by_keys[0].is_desc);
+    EXPECT_EQ("a", query->order_by_keys[1].col.col_name);
+    EXPECT_FALSE(query->order_by_keys[1].is_desc);
+    EXPECT_EQ("b", query->order_by_keys[2].col.col_name);
+    EXPECT_FALSE(query->order_by_keys[2].is_desc);
+
+    auto dml_plan = std::dynamic_pointer_cast<DMLPlan>(planner.do_planner(query, nullptr));
+    ASSERT_NE(nullptr, dml_plan);
+    auto projection = std::dynamic_pointer_cast<ProjectionPlan>(dml_plan->subplan_);
+    ASSERT_NE(nullptr, projection);
+    auto sort_plan = std::dynamic_pointer_cast<SortPlan>(projection->subplan_);
+    ASSERT_NE(nullptr, sort_plan);
+    ASSERT_EQ(query->order_by_keys.size(), sort_plan->sort_keys_.size());
+    for (size_t i = 0; i < query->order_by_keys.size(); ++i) {
+        EXPECT_TRUE(query->order_by_keys[i].equals(sort_plan->sort_keys_[i]));
+    }
+}
+
+TEST(SortExecutorTest, AppliesMultiKeySortSpecsWithMixedDirections) {
+    std::vector<ColMeta> cols = {make_int_col("t", "a", 0), make_int_col("t", "b", 4), make_int_col("t", "payload", 8)};
+    auto input = std::make_unique<MockExecutor>(
+        cols, std::vector<RmRecord>{make_int_record({1, 10, 100}), make_int_record({1, 20, 200}),
+                                    make_int_record({0, 15, 300}), make_int_record({1, 20, 150})});
+
+    SortExecutor executor(
+        std::move(input),
+        std::vector<SortKeySpec>{{TabCol{"t", "a"}, false}, {TabCol{"t", "b"}, true}});
+
+    auto rows = collect_executor_rows(executor);
+    ASSERT_EQ(4, rows.size());
+    EXPECT_EQ(300, read_int_field(rows[0], 8));
+    EXPECT_EQ(200, read_int_field(rows[1], 8));
+    EXPECT_EQ(150, read_int_field(rows[2], 8));
+    EXPECT_EQ(100, read_int_field(rows[3], 8));
 }
 
 TEST(HashJoinExecutorTest, InnerJoinMatchesAllTuplesInBucket) {

@@ -315,12 +315,8 @@ auto build_nestedloop_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan
 auto build_sortmerge_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
                                const JoinPredicateAnalysis &analysis, JoinType join_type)
     -> std::shared_ptr<Plan> {
-    auto left_sort_cols = analysis.left_key_cols;
-    auto right_sort_cols = analysis.right_key_cols;
-    auto sorted_left = std::make_shared<SortPlan>(T_Sort, std::move(left), left_sort_cols,
-                                                  std::vector<bool>(left_sort_cols.size(), false));
-    auto sorted_right = std::make_shared<SortPlan>(T_Sort, std::move(right), right_sort_cols,
-                                                   std::vector<bool>(right_sort_cols.size(), false));
+    auto sorted_left = std::make_shared<SortPlan>(T_Sort, std::move(left), make_sort_key_specs(analysis.left_key_cols));
+    auto sorted_right = std::make_shared<SortPlan>(T_Sort, std::move(right), make_sort_key_specs(analysis.right_key_cols));
     return std::make_shared<SortMergeJoinPlan>(std::move(sorted_left), std::move(sorted_right),
                                                analysis.equi_conds, analysis.residual_conds, join_type);
 }
@@ -615,10 +611,10 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
 
 std::shared_ptr<Plan> Planner::generate_sort_plan(std::shared_ptr<Query> query, std::shared_ptr<Plan> plan)
 {
-    if (query->order_by_cols.empty()) {
+    if (query->order_by_keys.empty()) {
         return plan;
     }
-    return std::make_shared<SortPlan>(T_Sort, std::move(plan), query->order_by_cols, query->order_by_descs);
+    return std::make_shared<SortPlan>(T_Sort, std::move(plan), query->order_by_keys);
 }
 
 

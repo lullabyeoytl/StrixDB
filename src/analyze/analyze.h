@@ -38,9 +38,8 @@ class Query{
     std::vector<TabCol> select_items;
     std::vector<TabCol> group_by_cols;
     std::vector<HavingCond> having_conds;
-    // ORDER BY keys are normalized during analysis so planner can reuse them directly.
-    std::vector<TabCol> order_by_cols;
-    std::vector<bool> order_by_descs;
+    // ORDER BY keys are normalized during analysis so downstream layers share one spec model.
+    std::vector<SortKeySpec> order_by_keys;
 
     Query(){}
 

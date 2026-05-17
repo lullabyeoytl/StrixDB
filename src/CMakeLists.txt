@@ -22,4 +22,6 @@ target_link_libraries(rmdb parser execution readline pthread planner analyze)
 
 # unit_test
 add_executable(unit_test unit_test.cpp)
-target_link_libraries(unit_test storage lru_replacer record index gtest_main)  # add gtest
+target_link_libraries(unit_test storage lru_replacer record index parser analyze planner execution system gtest_main)
+add_test(NAME orderby_unit_test COMMAND unit_test --gtest_filter=OrderBy*:*SortExecutorTest.*
+        WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})

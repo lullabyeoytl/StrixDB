@@ -220,21 +220,17 @@ class ProjectionPlan : public Plan
 class SortPlan : public Plan
 {
     public:
-        SortPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<TabCol> sort_cols, std::vector<bool> is_descs)
+        SortPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<SortKeySpec> sort_keys)
         {
             Plan::tag = tag;
             subplan_ = std::move(subplan);
-            sort_cols_ = std::move(sort_cols);
-            is_descs_ = std::move(is_descs);
+            sort_keys_ = std::move(sort_keys);
         }
-        SortPlan(PlanTag tag, std::shared_ptr<Plan> subplan, TabCol sort_col, bool is_desc)
-            : SortPlan(tag, std::move(subplan), std::vector<TabCol>{std::move(sort_col)},
-                       std::vector<bool>{is_desc}) {}
+        SortPlan(PlanTag tag, std::shared_ptr<Plan> subplan, SortKeySpec sort_key)
+            : SortPlan(tag, std::move(subplan), std::vector<SortKeySpec>{std::move(sort_key)}) {}
         ~SortPlan(){}
         std::shared_ptr<Plan> subplan_;
-        // Multi-key sort spec. is_descs_[i] corresponds to sort_cols_[i].
-        std::vector<TabCol> sort_cols_;
-        std::vector<bool> is_descs_;
+        std::vector<SortKeySpec> sort_keys_;
         
 };
 

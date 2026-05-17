@@ -117,8 +117,8 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
             for (const auto &sv_order_item : x->order->items) {
                 TabCol order_col = {.tab_name = sv_order_item->col->tab_name, .col_name = sv_order_item->col->col_name};
                 check_column(visible_cols, order_col);
-                query->order_by_cols.push_back(order_col);
-                query->order_by_descs.push_back(sv_order_item->orderby_dir == ast::OrderBy_DESC);
+                query->order_by_keys.push_back(
+                    SortKeySpec{std::move(order_col), sv_order_item->orderby_dir == ast::OrderBy_DESC});
             }
         }
         for (auto &sv_having : x->having_conds) {

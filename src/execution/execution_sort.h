@@ -25,8 +25,8 @@ class SortExecutor : public AbstractExecutor {
    private:
     std::unique_ptr<AbstractExecutor> prev_;
     std::vector<ColMeta> cols_;
+    std::vector<SortKeySpec> sort_keys_;
     std::vector<ColMeta> sort_key_metas_;
-    std::vector<bool> is_descs_;
     size_t len_ = 0;
     size_t cursor_ = 0;
     std::vector<RmRecord> tuples_;
@@ -41,32 +41,29 @@ class SortExecutor : public AbstractExecutor {
             if (cmp == 0) {
                 continue;
             }
-            return is_descs_[i] ? (cmp > 0) : (cmp < 0);
+            return sort_keys_[i].is_desc ? (cmp > 0) : (cmp < 0);
         }
         return false;
     }
 
    public:
-    SortExecutor(std::unique_ptr<AbstractExecutor> prev, std::vector<TabCol> sort_cols, std::vector<bool> is_descs) {
+    SortExecutor(std::unique_ptr<AbstractExecutor> prev, std::vector<SortKeySpec> sort_keys) {
         prev_ = std::move(prev);
         cols_ = prev_->cols();
-        if (sort_cols.empty()) {
+        if (sort_keys.empty()) {
             throw InternalError("SortExecutor requires at least one sort key");
         }
-        if (sort_cols.size() != is_descs.size()) {
-            throw InternalError("SortExecutor key count does not match direction count");
+        sort_keys_ = std::move(sort_keys);
+        for (const auto &sort_key : sort_keys_) {
+            sort_key_metas_.push_back(find_col_meta(cols_, sort_key.col));
         }
-        for (const auto &sort_col : sort_cols) {
-            sort_key_metas_.push_back(find_col_meta(cols_, sort_col));
-        }
-        is_descs_ = std::move(is_descs);
         if (!cols_.empty()) {
             len_ = cols_.back().offset + cols_.back().len;
         }
     }
 
-    SortExecutor(std::unique_ptr<AbstractExecutor> prev, TabCol sort_col, bool is_desc)
-        : SortExecutor(std::move(prev), std::vector<TabCol>{std::move(sort_col)}, std::vector<bool>{is_desc}) {
+    SortExecutor(std::unique_ptr<AbstractExecutor> prev, SortKeySpec sort_key)
+        : SortExecutor(std::move(prev), std::vector<SortKeySpec>{std::move(sort_key)}) {
     }
 
     void beginTuple() override { 
