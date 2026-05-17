@@ -32,10 +32,12 @@ See the Mulan PSL v2 for more details. */
 #include <random>
 #include <set>
 #include <string>
+#include <stdexcept>
 #include <thread>  // NOLINT
 #include <unordered_map>
 #include <vector>
 
+#include "execution/executor_hash_join.h"
 #include "gtest/gtest.h"
 #include "replacer/lru_replacer.h"
 #include "storage/disk_manager.h"
@@ -145,6 +147,103 @@ void check_equal(const RmFileHandle *file_handle,
 std::ostream &operator<<(std::ostream &os, const Rid &rid) {
     return os << '(' << rid.page_no << ", " << rid.slot_no << ')';
 }
+
+namespace {
+
+auto make_int_col(const std::string &table_name, const std::string &col_name, int offset) -> ColMeta {
+    return ColMeta{.tab_name = table_name,
+                   .name = col_name,
+                   .type = TYPE_INT,
+                   .len = static_cast<int>(sizeof(int)),
+                   .offset = offset,
+                   .index = false};
+}
+
+auto make_int_record(std::initializer_list<int> values) -> RmRecord {
+    RmRecord record(static_cast<int>(values.size() * sizeof(int)));
+    int offset = 0;
+    for (int value : values) {
+        memcpy(record.data + offset, &value, sizeof(int));
+        offset += static_cast<int>(sizeof(int));
+    }
+    return record;
+}
+
+auto read_int_field(const RmRecord &record, int offset) -> int {
+    return *reinterpret_cast<const int *>(record.data + offset);
+}
+
+/**
+ * Minimal in-memory executor used to unit test join executors without
+ * depending on the storage layer or planner pipeline.
+ */
+class MockExecutor : public AbstractExecutor {
+   public:
+    MockExecutor(std::vector<ColMeta> cols, std::vector<RmRecord> rows)
+        : cols_(std::move(cols)), rows_(std::move(rows)) {
+        tuple_len_ = 0;
+        for (const auto &col : cols_) {
+            tuple_len_ = std::max(tuple_len_, static_cast<size_t>(col.offset + col.len));
+        }
+    }
+
+    void beginTuple() override { cursor_ = 0; }
+
+    void nextTuple() override {
+        if (cursor_ < rows_.size()) {
+            ++cursor_;
+        }
+    }
+
+    bool is_end() const override { return cursor_ >= rows_.size(); }
+
+    std::unique_ptr<RmRecord> Next() override {
+        if (is_end()) {
+            return nullptr;
+        }
+        return std::make_unique<RmRecord>(rows_[cursor_]);
+    }
+
+    Rid &rid() override {
+        current_rid_ = Rid{0, static_cast<int>(cursor_)};
+        return current_rid_;
+    }
+
+    size_t tupleLen() const override { return tuple_len_; }
+
+    const std::vector<ColMeta> &cols() const override { return cols_; }
+
+   private:
+    std::vector<ColMeta> cols_;
+    std::vector<RmRecord> rows_;
+    size_t tuple_len_ = 0;
+    size_t cursor_ = 0;
+    Rid current_rid_{-1, -1};
+};
+
+auto make_eq_condition(const std::string &left_table, const std::string &left_col, const std::string &right_table,
+                       const std::string &right_col) -> Condition {
+    Condition cond;
+    cond.lhs_col = TabCol{left_table, left_col};
+    cond.op = OP_EQ;
+    cond.is_rhs_val = false;
+    cond.rhs_col = TabCol{right_table, right_col};
+    return cond;
+}
+
+auto collect_executor_rows(AbstractExecutor &executor) -> std::vector<RmRecord> {
+    std::vector<RmRecord> rows;
+    for (executor.beginTuple(); !executor.is_end(); executor.nextTuple()) {
+        auto record = executor.Next();
+        if (record == nullptr) {
+            throw std::runtime_error("Executor returned null record before end");
+        }
+        rows.push_back(*record);
+    }
+    return rows;
+}
+
+}  // namespace
 
 /** 注意：每个测试点只测试了单个文件！
  * 对于每个测试点，先创建和进入目录TEST_DB_NAME
@@ -777,19 +876,17 @@ TEST(IndexManagerRegressionTest, ReopenRestoresNextPageNumber) {
     local_index_manager->create_index(table_name, index_cols);
 
     auto index_handle = local_index_manager->open_index(table_name, index_cols);
-    IxNodeHandle *first_node = index_handle->create_node();
+    auto first_node = index_handle->create_node();
     ASSERT_NE(nullptr, first_node);
     EXPECT_EQ(IX_INIT_NUM_PAGES, first_node->get_page_no());
     ASSERT_TRUE(local_buffer_pool_manager->unpin_page(first_node->get_page_id(), true));
-    delete first_node;
     local_index_manager->close_index(index_handle.get());
 
     index_handle = local_index_manager->open_index(table_name, index_cols);
-    IxNodeHandle *second_node = index_handle->create_node();
+    auto second_node = index_handle->create_node();
     ASSERT_NE(nullptr, second_node);
     EXPECT_EQ(IX_INIT_NUM_PAGES + 1, second_node->get_page_no());
     ASSERT_TRUE(local_buffer_pool_manager->unpin_page(second_node->get_page_id(), true));
-    delete second_node;
     local_index_manager->close_index(index_handle.get());
 
     local_index_manager->destroy_index(table_name, index_cols);
@@ -843,7 +940,7 @@ class IndexHandleRegressionTest : public ::testing::Test {
     }
 
     static bool delete_int(IxIndexHandle *ih, int key) {
-        return ih->delete_entry(reinterpret_cast<const char *>(&key), nullptr);
+        return ih->delete_entry(reinterpret_cast<const char *>(&key), Rid{key, key + 1000}, nullptr);
     }
 
     static void expect_find_int(IxIndexHandle *ih, int key) {
@@ -902,11 +999,10 @@ TEST_F(IndexHandleRegressionTest, RootWithSingleChildIsPromotedAfterCoalesce) {
         ASSERT_TRUE(delete_int(ih.get(), key));
     }
 
-    IxNodeHandle *root = ih->fetch_node(ih->file_hdr_->root_page_);
+    auto root = ih->fetch_node(ih->file_hdr_->root_page_);
     EXPECT_TRUE(root->is_leaf_page());
-    EXPECT_EQ(IX_NO_PAGE, root->get_parent_page_no());
+    EXPECT_EQ(IX_NO_PAGE, root->get_parent());
     ASSERT_TRUE(buffer_pool_manager_->unpin_page(root->get_page_id(), false));
-    delete root;
 
     expect_find_int(ih.get(), 1);
 
@@ -1006,4 +1102,90 @@ TEST(RecordManagerTest, SimpleTest) {
     // clean up
     rm_manager->close_file(file_handle.get());
     rm_manager->destroy_file(filename);
+}
+
+TEST(HashJoinExecutorTest, InnerJoinMatchesAllTuplesInBucket) {
+    std::vector<ColMeta> left_cols = {make_int_col("left", "k1", 0), make_int_col("left", "k2", 4),
+                                      make_int_col("left", "payload", 8)};
+    std::vector<ColMeta> right_cols = {make_int_col("right", "k1", 0), make_int_col("right", "k2", 4),
+                                       make_int_col("right", "payload", 8)};
+
+    auto left = std::make_unique<MockExecutor>(
+        left_cols, std::vector<RmRecord>{make_int_record({1, 10, 100}), make_int_record({2, 20, 200}),
+                                         make_int_record({1, 30, 300})});
+    auto right = std::make_unique<MockExecutor>(
+        right_cols, std::vector<RmRecord>{make_int_record({1, 99, 1000}), make_int_record({3, 88, 3000}),
+                                          make_int_record({1, 77, 1100})});
+
+    HashJoinExecutor executor(std::move(left), std::move(right),
+                              std::vector<Condition>{make_eq_condition("left", "k1", "right", "k1")},
+                              std::vector<Condition>{}, INNER_JOIN);
+
+    auto rows = collect_executor_rows(executor);
+    ASSERT_EQ(4, rows.size());
+    EXPECT_EQ(100, read_int_field(rows[0], 8));
+    EXPECT_EQ(1000, read_int_field(rows[0], 20));
+    EXPECT_EQ(100, read_int_field(rows[1], 8));
+    EXPECT_EQ(1100, read_int_field(rows[1], 20));
+    EXPECT_EQ(300, read_int_field(rows[2], 8));
+    EXPECT_EQ(1000, read_int_field(rows[2], 20));
+    EXPECT_EQ(300, read_int_field(rows[3], 8));
+    EXPECT_EQ(1100, read_int_field(rows[3], 20));
+}
+
+TEST(HashJoinExecutorTest, MultiKeyJoinRechecksResidualPredicates) {
+    std::vector<ColMeta> left_cols = {make_int_col("left", "k1", 0), make_int_col("left", "k2", 4),
+                                      make_int_col("left", "payload", 8)};
+    std::vector<ColMeta> right_cols = {make_int_col("right", "k1", 0), make_int_col("right", "k2", 4),
+                                       make_int_col("right", "payload", 8)};
+
+    Condition residual;
+    residual.lhs_col = TabCol{"left", "payload"};
+    residual.op = OP_GT;
+    residual.is_rhs_val = false;
+    residual.rhs_col = TabCol{"right", "payload"};
+
+    auto left = std::make_unique<MockExecutor>(
+        left_cols, std::vector<RmRecord>{make_int_record({1, 1, 5}), make_int_record({1, 2, 7}),
+                                         make_int_record({2, 1, 4})});
+    auto right = std::make_unique<MockExecutor>(
+        right_cols, std::vector<RmRecord>{make_int_record({1, 1, 3}), make_int_record({1, 1, 8}),
+                                          make_int_record({1, 2, 7}), make_int_record({2, 1, 1})});
+
+    HashJoinExecutor executor(
+        std::move(left), std::move(right),
+        std::vector<Condition>{make_eq_condition("left", "k1", "right", "k1"),
+                               make_eq_condition("left", "k2", "right", "k2")},
+        std::vector<Condition>{residual}, INNER_JOIN);
+
+    auto rows = collect_executor_rows(executor);
+    ASSERT_EQ(2, rows.size());
+    EXPECT_EQ(5, read_int_field(rows[0], 8));
+    EXPECT_EQ(3, read_int_field(rows[0], 20));
+    EXPECT_EQ(4, read_int_field(rows[1], 8));
+    EXPECT_EQ(1, read_int_field(rows[1], 20));
+}
+
+TEST(HashJoinExecutorTest, SemiJoinReturnsEachLeftTupleAtMostOnce) {
+    std::vector<ColMeta> left_cols = {make_int_col("left", "k1", 0), make_int_col("left", "k2", 4),
+                                      make_int_col("left", "payload", 8)};
+    std::vector<ColMeta> right_cols = {make_int_col("right", "k1", 0), make_int_col("right", "k2", 4),
+                                       make_int_col("right", "payload", 8)};
+
+    auto left = std::make_unique<MockExecutor>(
+        left_cols, std::vector<RmRecord>{make_int_record({1, 10, 100}), make_int_record({2, 20, 200}),
+                                         make_int_record({1, 30, 300}), make_int_record({4, 40, 400})});
+    auto right = std::make_unique<MockExecutor>(
+        right_cols, std::vector<RmRecord>{make_int_record({1, 0, 1}), make_int_record({1, 0, 2}),
+                                          make_int_record({2, 0, 3})});
+
+    HashJoinExecutor executor(std::move(left), std::move(right),
+                              std::vector<Condition>{make_eq_condition("left", "k1", "right", "k1")},
+                              std::vector<Condition>{}, SEMI_JOIN);
+
+    auto rows = collect_executor_rows(executor);
+    ASSERT_EQ(3, rows.size());
+    EXPECT_EQ(100, read_int_field(rows[0], 8));
+    EXPECT_EQ(200, read_int_field(rows[1], 8));
+    EXPECT_EQ(300, read_int_field(rows[2], 8));
 }

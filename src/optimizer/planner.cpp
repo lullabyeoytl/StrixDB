@@ -45,7 +45,7 @@ struct JoinPredicateAnalysis {
 struct JoinImplementationConfig {
     bool enable_nestedloop = true;
     bool enable_sortmerge = true;
-    bool enable_hash = false;
+    bool enable_hash = true;
 };
 
 struct JoinImplementationDecision {
@@ -55,7 +55,7 @@ struct JoinImplementationDecision {
     std::string fallback_reason;
 };
 
-auto build_join_implementation_config(bool enable_nestedloop_join, bool enable_sortmerge_join)
+auto build_join_implementation_config(bool enable_nestedloop_join, bool enable_sortmerge_join, bool enable_hash_join)
     -> JoinImplementationConfig;
 auto supports_join_implementation(JoinImplementation implementation, JoinType join_type) -> bool;
 auto analyze_join_predicates(const std::vector<Condition> &conds) -> JoinPredicateAnalysis;
@@ -228,14 +228,12 @@ auto convert_join_expr_conds(const std::vector<std::shared_ptr<ast::BinaryExpr>>
     return conds;
 }
 
-auto build_join_implementation_config(bool enable_nestedloop_join, bool enable_sortmerge_join)
+auto build_join_implementation_config(bool enable_nestedloop_join, bool enable_sortmerge_join, bool enable_hash_join)
     -> JoinImplementationConfig {
     JoinImplementationConfig config;
     config.enable_nestedloop = enable_nestedloop_join;
     config.enable_sortmerge = enable_sortmerge_join;
-    // Hash Join stays disabled until the executor lands. The generic decision
-    // path is introduced first so later extensions do not reshape planner APIs.
-    config.enable_hash = false;
+    config.enable_hash = enable_hash_join;
     return config;
 }
 
@@ -493,7 +491,8 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
     // 获取where条件
     auto conds = std::move(pending_conds);
     std::shared_ptr<Plan> table_join_executors;
-    auto join_impl_config = build_join_implementation_config(enable_nestedloop_join, enable_sortmerge_join);
+    auto join_impl_config =
+        build_join_implementation_config(enable_nestedloop_join, enable_sortmerge_join, this->enable_hash_join);
     validate_join_executor_config(join_impl_config);
     
     int scantbl[tables.size()];

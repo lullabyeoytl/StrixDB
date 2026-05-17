@@ -4,7 +4,6 @@
 #include <utility>
 #include <vector>
 
-#include "execution_common.h"
 #include "executor_abstract.h"
 #include "join_common.h"
 
@@ -33,20 +32,11 @@ class SortMergeJoinExecutor : public AbstractExecutor {
     bool pending_semi_advance_ = false;
 
     auto compare_merge_keys(const RmRecord &left_rec, const RmRecord &right_rec) const -> int {
-        for (size_t i = 0; i < left_key_metas_.size(); ++i) {
-            auto lhs = get_col_value(left_rec, left_key_metas_[i]);
-            auto rhs = get_col_value(right_rec, right_key_metas_[i]);
-            int cmp = lhs.compare(rhs);
-            if (cmp != 0) {
-                return cmp;
-            }
-        }
-        return 0;
+        return compare_join_keys(left_rec, left_key_metas_, right_rec, right_key_metas_);
     }
 
     auto pair_matches(const RmRecord &left_rec, const RmRecord &right_rec) const -> bool {
-        auto joined = build_join_eval_record(left_rec, right_rec, left_len_, right_len_);
-        return evaluate_conditions(residual_conds_, *joined, eval_cols_);
+        return evaluate_join_pair_conditions(residual_conds_, left_rec, right_rec, left_len_, right_len_, eval_cols_);
     }
 
     void set_end() {
