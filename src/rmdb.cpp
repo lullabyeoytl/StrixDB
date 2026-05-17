@@ -58,7 +58,7 @@ void sigint_handler(int signo) {
 
 // 判断当前正在执行的是显式事务还是单条SQL语句的事务，并更新事务ID
 void SetTransaction(txn_id_t *txn_id, Context *context) {
-    context->txn_ = txn_manager->get_transaction(*txn_id);
+    context->txn_ = (*txn_id == INVALID_TXN_ID) ? nullptr : txn_manager->get_transaction(*txn_id);
     if(context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
         context->txn_->get_state() == TransactionState::ABORTED) {
         context->txn_ = txn_manager->begin(nullptr, context->log_mgr_);
@@ -155,6 +155,7 @@ void *client_handler(void *sock_fd) {
 
                     // 回滚事务
                     txn_manager->abort(context->txn_, log_manager.get());
+                    txn_id = INVALID_TXN_ID;
                     std::cout << e.GetInfo() << std::endl;
 
                     std::fstream outfile;
@@ -193,15 +194,16 @@ void *client_handler(void *sock_fd) {
         }
         // 如果是单条语句，需要按照一个完整的事务来执行，所以执行完当前语句后，自动提交事务
         // 如果执行过程中发生了错误，则回滚事务以保证数据一致性
-        if(context->txn_->get_txn_mode() == false)
+        if(context->txn_ != nullptr && context->txn_->get_txn_mode() == false &&
+           context->txn_->get_state() != TransactionState::ABORTED &&
+           context->txn_->get_state() != TransactionState::COMMITTED)
         {
             if (has_error) {
-                if (context->txn_->get_state() != TransactionState::ABORTED &&
-                    context->txn_->get_state() != TransactionState::COMMITTED) {
-                    txn_manager->abort(context->txn_, log_manager.get());
-                }
+                txn_manager->abort(context->txn_, log_manager.get());
+                txn_id = INVALID_TXN_ID;
             } else {
                 txn_manager->commit(context->txn_, context->log_mgr_);
+                txn_id = INVALID_TXN_ID;
             }
         }
     }
