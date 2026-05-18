@@ -238,14 +238,17 @@ class AggregationPlan : public Plan
 {
     public:
         AggregationPlan(std::shared_ptr<Plan> subplan, std::vector<AggInfo> agg_infos,
-                        std::vector<TabCol> group_by_cols, std::vector<HavingCond> having_conds)
+                        std::vector<TabCol> group_by_cols, std::vector<HavingCond> having_conds,
+                        AggStrategy strategy = AggStrategy_Hash,
+                        std::vector<SortKeySpec> sort_keys = {})
         {
             Plan::tag = T_Aggregation;
-            strategy_ = AggStrategy_Hash;
+            strategy_ = strategy;
             subplan_ = std::move(subplan);
             agg_infos_ = std::move(agg_infos);
             group_by_cols_ = std::move(group_by_cols);
             having_conds_ = std::move(having_conds);
+            sort_keys_ = std::move(sort_keys);
         }
         ~AggregationPlan(){}
         AggStrategy strategy_;
@@ -253,6 +256,7 @@ class AggregationPlan : public Plan
         std::vector<AggInfo> agg_infos_;
         std::vector<TabCol> group_by_cols_;
         std::vector<HavingCond> having_conds_;
+        std::vector<SortKeySpec> sort_keys_;
 };
 
 // dml语句，包括insert; delete; update; select语句　

@@ -215,11 +215,15 @@ struct HavingCond : public TreeNode {
 struct OrderBy : public TreeNode
 {
     struct Item : public TreeNode {
+        std::shared_ptr<Expr> expr;
         std::shared_ptr<Col> col;
         OrderByDir orderby_dir;
 
         Item(std::shared_ptr<Col> col_, OrderByDir orderby_dir_) :
-            col(std::move(col_)), orderby_dir(orderby_dir_) {}
+            expr(col_), col(std::move(col_)), orderby_dir(orderby_dir_) {}
+
+        Item(std::shared_ptr<Expr> expr_, OrderByDir orderby_dir_) :
+            expr(std::move(expr_)), col(std::dynamic_pointer_cast<Col>(expr)), orderby_dir(orderby_dir_) {}
     };
 
     // Preserve the original user-specified key order for lexicographic sorting.

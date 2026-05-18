@@ -10,6 +10,8 @@ See the Mulan PSL v2 for more details. */
 
 #include "planner.h"
 
+#include <algorithm>
+#include <atomic>
 #include <memory>
 
 #include "execution/executor_delete.h"
@@ -357,6 +359,52 @@ auto physicalize_join_tree(const std::shared_ptr<Plan> &plan, const JoinImplemen
     return physicalize_logical_join(join, std::move(left), std::move(right), config);
 }
 
+auto ordering_has_required_prefix(const std::vector<SortKeySpec> &ordering,
+                                  const std::vector<SortKeySpec> &required_prefix) -> bool {
+    if (ordering.size() < required_prefix.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < required_prefix.size(); ++i) {
+        if (!ordering[i].equals(required_prefix[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto plan_provides_ordering(const std::shared_ptr<Plan> &plan,
+                           const std::vector<SortKeySpec> &required_keys) -> bool {
+    if (required_keys.empty()) {
+        return true;
+    }
+    if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
+        return ordering_has_required_prefix(sort->sort_keys_, required_keys);
+    }
+    return false;
+}
+
+auto order_by_compatible_with_grouping(const Query &query,
+                                        const std::vector<SortKeySpec> &group_sort_keys) -> bool {
+    return !query.order_by_keys.empty() && ordering_has_required_prefix(group_sort_keys, query.order_by_keys);
+}
+
+auto is_aggregate_query(const Query &query) -> bool {
+    return !query.agg_infos.empty() || !query.group_by_cols.empty() || !query.having_conds.empty();
+}
+
+auto plan_output_provides_ordering(const std::shared_ptr<Plan> &plan,
+                                   const std::vector<SortKeySpec> &required_keys) -> bool {
+    if (plan_provides_ordering(plan, required_keys)) {
+        return true;
+    }
+    auto aggregation = std::dynamic_pointer_cast<AggregationPlan>(plan);
+    if (aggregation == nullptr || aggregation->strategy_ != AggStrategy_Sort ||
+        !ordering_has_required_prefix(aggregation->sort_keys_, required_keys)) {
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 /**
@@ -454,7 +502,9 @@ std::shared_ptr<Plan> Planner::physical_optimization(std::shared_ptr<Query> quer
     // 其他物理优化
 
     // 处理orderby
-    plan = generate_sort_plan(query, std::move(plan)); 
+    if (!is_aggregate_query(*query)) {
+        plan = generate_sort_plan(query, std::move(plan));
+    }
 
     return plan;
 }
@@ -614,9 +664,118 @@ std::shared_ptr<Plan> Planner::generate_sort_plan(std::shared_ptr<Query> query, 
     if (query->order_by_keys.empty()) {
         return plan;
     }
+    if (plan_output_provides_ordering(plan, query->order_by_keys)) {
+        return plan;
+    }
     return std::make_shared<SortPlan>(T_Sort, std::move(plan), query->order_by_keys);
 }
 
+ColMeta Planner::lookup_col_meta(const TabCol &col) const {
+    const auto &cols = sm_manager_->db_.get_table(col.tab_name).cols;
+    return find_col_meta(cols, col);
+}
+
+size_t Planner::estimate_input_rows(const std::shared_ptr<Plan> &plan) const {
+    if (auto scan = std::dynamic_pointer_cast<ScanPlan>(plan)) {
+        auto fh_it = sm_manager_->fhs_.find(scan->tab_name_);
+        if (fh_it == sm_manager_->fhs_.end()) {
+            return kDefaultAggregationRows;
+        }
+        auto hdr = fh_it->second->get_file_hdr();
+        int pages = hdr.num_pages.load(std::memory_order_acquire);
+        if (pages <= RM_FIRST_RECORD_PAGE) {
+            return 0;
+        }
+        return static_cast<size_t>(pages - RM_FIRST_RECORD_PAGE) *
+               static_cast<size_t>(hdr.num_records_per_page);
+    }
+    if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
+        return estimate_input_rows(sort->subplan_);
+    }
+    if (auto projection = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
+        return estimate_input_rows(projection->subplan_);
+    }
+    if (auto aggregation = std::dynamic_pointer_cast<AggregationPlan>(plan)) {
+        return estimate_input_rows(aggregation->subplan_);
+    }
+    if (auto join = std::dynamic_pointer_cast<PhysicalJoinPlan>(plan)) {
+        return std::max(estimate_input_rows(join->left_), estimate_input_rows(join->right_));
+    }
+    // Logical joins can expand cardinality; keep the default conservative without table statistics.
+    return kDefaultAggregationRows;
+}
+
+bool Planner::should_use_sort_aggregation(const Query &query, const std::shared_ptr<Plan> &plan,
+                                          const std::vector<SortKeySpec> &sort_keys) const {
+    for (const auto &group_col : query.group_by_cols) {
+        auto type = lookup_col_meta(group_col).type;
+        if (type != TYPE_INT && type != TYPE_FLOAT && type != TYPE_STRING) {
+            return true;
+        }
+    }
+
+    if (plan_provides_ordering(plan, sort_keys)) {
+        return true;
+    }
+
+    if (order_by_compatible_with_grouping(query, sort_keys)) {
+        return true;
+    }
+
+    size_t input_rows = estimate_input_rows(plan);
+    size_t key_width = 0;
+    for (const auto &group_col : query.group_by_cols) {
+        const auto &col = lookup_col_meta(group_col);
+        key_width += col.type == TYPE_STRING ? static_cast<size_t>(std::max(1, col.len / 2))
+                                             : static_cast<size_t>(col.len);
+    }
+    size_t agg_width = 0;
+    for (const auto &agg : query.agg_infos) {
+        switch (agg.agg_type) {
+            case AGG_COUNT:    agg_width += sizeof(int); break;
+            case AGG_SUM:
+            case AGG_AVG:      agg_width += sizeof(double) + sizeof(int); break;
+            case AGG_MIN:
+            case AGG_MAX:
+                agg_width += agg.is_star ? sizeof(int)
+                                          : static_cast<size_t>(lookup_col_meta(agg.col).len);
+                break;
+        }
+        agg_width += sizeof(bool);
+    }
+    size_t estimated_groups = std::min(input_rows, kMaxEstimatedGroups);
+    size_t per_group_overhead = 64;
+    size_t hash_bytes = estimated_groups * (key_width + agg_width + per_group_overhead);
+    double adjusted = static_cast<double>(hash_bytes) * kHashAggregationSafetyFactor;
+    return adjusted > static_cast<double>(kHashAggregationMemoryBudgetBytes);
+}
+
+std::shared_ptr<Plan> Planner::generate_aggregate_plan(std::shared_ptr<Query> query,
+                                                         std::shared_ptr<Plan> plan) {
+    if (!is_aggregate_query(*query)) {
+        return plan;
+    }
+    // no group-by keys: scalar aggregate always uses hash
+    if (query->group_by_cols.empty()) {
+        return std::make_shared<AggregationPlan>(std::move(plan), query->agg_infos,
+                                                  query->group_by_cols, query->having_conds,
+                                                  AggStrategy_Hash, std::vector<SortKeySpec>{});
+    }
+
+    auto sort_keys = make_sort_key_specs(query->group_by_cols);
+    if (!should_use_sort_aggregation(*query, plan, sort_keys)) {
+        return std::make_shared<AggregationPlan>(std::move(plan), query->agg_infos,
+                                                  query->group_by_cols, query->having_conds,
+                                                  AggStrategy_Hash, std::vector<SortKeySpec>{});
+    }
+
+    if (!plan_provides_ordering(plan, sort_keys)) {
+        plan = std::make_shared<SortPlan>(T_Sort, std::move(plan), sort_keys);
+    }
+    return std::make_shared<AggregationPlan>(std::move(plan), query->agg_infos,
+                                              query->group_by_cols, query->having_conds,
+                                              AggStrategy_Sort, sort_keys);
+}
 
 /**
  * @brief select plan 生成
@@ -633,9 +792,10 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
     auto sel_cols = query->select_items.empty() ? query->cols : query->select_items;
     std::shared_ptr<Plan> plannerRoot = physical_optimization(query, context);
 
-    if (!query->agg_infos.empty() || !query->group_by_cols.empty() || !query->having_conds.empty()) {
-        plannerRoot = std::make_shared<AggregationPlan>(std::move(plannerRoot), query->agg_infos,
-                                                        query->group_by_cols, query->having_conds);
+    plannerRoot = generate_aggregate_plan(query, std::move(plannerRoot));
+
+    if (is_aggregate_query(*query)) {
+        plannerRoot = generate_sort_plan(query, std::move(plannerRoot));
     }
 
     plannerRoot = std::make_shared<ProjectionPlan>(T_Projection, std::move(plannerRoot), 

@@ -43,11 +43,11 @@ class Planner {
     std::vector<TabCol> collect_dml_required_cols(const Query &query, const std::string &tab_name) const;
 
     void set_enable_nestedloop_join(bool set_val) { enable_nestedloop_join = set_val; }
-    
+
     void set_enable_sortmerge_join(bool set_val) { enable_sortmerge_join = set_val; }
 
     void set_enable_hash_join(bool set_val) { enable_hash_join = set_val; }
-    
+
    private:
     std::shared_ptr<Query> logical_optimization(std::shared_ptr<Query> query, Context *context);
     std::shared_ptr<Plan> physical_optimization(std::shared_ptr<Query> query, Context *context);
@@ -56,12 +56,21 @@ class Planner {
 
     std::shared_ptr<Plan> generate_sort_plan(std::shared_ptr<Query> query, std::shared_ptr<Plan> plan);
 
-std::shared_ptr<Plan> generate_select_plan(std::shared_ptr<Query> query, Context *context);
+    std::shared_ptr<Plan> generate_aggregate_plan(std::shared_ptr<Query> query, std::shared_ptr<Plan> plan);
+
+    std::shared_ptr<Plan> generate_select_plan(std::shared_ptr<Query> query, Context *context);
 
 
     // int get_indexNo(std::string tab_name, std::vector<Condition> curr_conds);
     std::shared_ptr<ScanPlan> make_scan_plan(const std::string &tab_name, std::vector<Condition> conds,
                                              std::vector<TabCol> required_cols = {});
+
+    ColMeta lookup_col_meta(const TabCol &col) const;
+
+    size_t estimate_input_rows(const std::shared_ptr<Plan> &plan) const;
+
+    bool should_use_sort_aggregation(const Query &query, const std::shared_ptr<Plan> &plan,
+                                     const std::vector<SortKeySpec> &sort_keys) const;
 
     ColType interp_sv_type(ast::SvType sv_type) {
         std::map<ast::SvType, ColType> m = {

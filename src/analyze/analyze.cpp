@@ -13,6 +13,24 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 
+namespace {
+
+enum class OrderExprKind {
+    Column,
+    Aggregate
+};
+
+auto classify_order_expr(const std::shared_ptr<ast::Expr> &expr) -> OrderExprKind {
+    if (std::dynamic_pointer_cast<ast::Col>(expr)) {
+        return OrderExprKind::Column;
+    }
+    if (std::dynamic_pointer_cast<ast::AggFunc>(expr)) {
+        return OrderExprKind::Aggregate;
+    }
+    throw InternalError("Unsupported ORDER BY expression type");
+}
+
+}  // namespace
 
 AggInfo convert_agg_func(const std::shared_ptr<ast::AggFunc> &sv_agg) {
     AggInfo agg;
@@ -115,8 +133,25 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         }
         if (x->has_sort) {
             for (const auto &sv_order_item : x->order->items) {
-                TabCol order_col = {.tab_name = sv_order_item->col->tab_name, .col_name = sv_order_item->col->col_name};
-                check_column(visible_cols, order_col);
+                TabCol order_col;
+                switch (classify_order_expr(sv_order_item->expr)) {
+                    case OrderExprKind::Column: {
+                        auto sv_order_col = std::static_pointer_cast<ast::Col>(sv_order_item->expr);
+                        order_col = {.tab_name = sv_order_col->tab_name, .col_name = sv_order_col->col_name};
+                        check_column(visible_cols, order_col);
+                        break;
+                    }
+                    case OrderExprKind::Aggregate: {
+                        auto sv_order_agg = std::static_pointer_cast<ast::AggFunc>(sv_order_item->expr);
+                        auto agg = convert_agg_func(sv_order_agg);
+                        if (!agg.is_star) {
+                            check_column(visible_cols, agg.col);
+                        }
+                        append_unique_agg(query->agg_infos, agg);
+                        order_col = {.tab_name = std::string(), .col_name = agg_output_name(agg)};
+                        break;
+                    }
+                }
                 query->order_by_keys.push_back(
                     SortKeySpec{std::move(order_col), sv_order_item->orderby_dir == ast::OrderBy_DESC});
             }
@@ -366,10 +401,23 @@ void Analyze::check_aggregate(const std::vector<ColMeta> &all_cols, Query &query
         throw RMDBError("Non-aggregated columns must appear in GROUP BY");
     }
 
+    if (!has_group_by && has_agg_func) {
+        for (auto &order_key : query.order_by_keys) {
+            if (!order_key.col.tab_name.empty()) {
+                throw RMDBError("Non-aggregated columns must appear in GROUP BY");
+            }
+        }
+    }
+
     if (has_group_by) {
         for (auto &sel_col : query.cols) {
             if (!contains_col(query.group_by_cols, sel_col)) {
                 throw RMDBError(sel_col.col_name + " must appear in GROUP BY");
+            }
+        }
+        for (auto &order_key : query.order_by_keys) {
+            if (!order_key.col.tab_name.empty() && !contains_col(query.group_by_cols, order_key.col)) {
+                throw RMDBError(order_key.col.col_name + " must appear in GROUP BY");
             }
         }
     }

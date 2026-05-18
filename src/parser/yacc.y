@@ -58,6 +58,7 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX UNIQUE AND ON SEMI JOIN EXIT HELP T
 %type <sv_join_exprs> joinClauseList
 %type <sv_join_type> joinType
 %type <sv_col> col
+%type <sv_expr> order_expr
 %type <sv_cols> colList
 %type <sv_set_clause> setClause
 %type <sv_set_clauses> setClauses
@@ -555,9 +556,20 @@ order_clause:
     ;
 
 order_item:
-      col opt_asc_desc
+      order_expr opt_asc_desc
     {
         $$ = std::make_shared<OrderBy::Item>($1, $2);
+    }
+    ;
+
+order_expr:
+      col
+    {
+        $$ = std::static_pointer_cast<Expr>($1);
+    }
+    |   agg_func
+    {
+        $$ = std::static_pointer_cast<Expr>($1);
     }
     ;
 
