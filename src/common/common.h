@@ -179,6 +179,26 @@ struct Value {
     }
 };
 
+/**
+ * @brief Convert a literal/runtime value to the target column type before materialization.
+ *
+ * The only implicit conversion currently allowed for writes is INT -> FLOAT.
+ * Other cross-type writes still fail to avoid silent truncation or lossy casts.
+ */
+inline auto coerce_value_to_type(const Value &src, ColType target_type) -> Value {
+    Value coerced = src;
+    // Force callers to rebuild raw bytes with the destination column length.
+    coerced.raw.reset();
+    if (src.type == target_type) {
+        return coerced;
+    }
+    if (target_type == TYPE_FLOAT && src.type == TYPE_INT) {
+        coerced.set_float(static_cast<float>(src.int_val));
+        return coerced;
+    }
+    throw IncompatibleTypeError(coltype2str(target_type), coltype2str(src.type));
+}
+
 struct Condition {
     TabCol lhs_col;   // left-hand side column
     CompOp op;        // comparison operator

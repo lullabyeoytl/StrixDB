@@ -1179,6 +1179,31 @@ TEST(OrderByPlannerTest, PreservesNormalizedSortKeysAcrossAnalyzeAndPlanner) {
     }
 }
 
+TEST(ValueCoercionTest, WidensIntLiteralForFloatColumnWrites) {
+    Value value;
+    value.set_int(90);
+
+    Value coerced = coerce_value_to_type(value, TYPE_FLOAT);
+    ASSERT_EQ(TYPE_FLOAT, coerced.type);
+    EXPECT_FLOAT_EQ(90.0f, coerced.float_val);
+    EXPECT_EQ(nullptr, coerced.raw);
+
+    coerced.init_raw(static_cast<int>(sizeof(float)));
+    EXPECT_FLOAT_EQ(90.0f, *reinterpret_cast<const float *>(coerced.raw->data));
+}
+
+TEST(ValueCoercionTest, RejectsLossyFloatToIntWrites) {
+    Value value;
+    value.set_float(90.5f);
+
+    EXPECT_THROW(
+        {
+            auto coerced = coerce_value_to_type(value, TYPE_INT);
+            (void)coerced;
+        },
+        IncompatibleTypeError);
+}
+
 TEST(SortExecutorTest, AppliesMultiKeySortSpecsWithMixedDirections) {
     std::vector<ColMeta> cols = {make_int_col("t", "a", 0), make_int_col("t", "b", 4), make_int_col("t", "payload", 8)};
     auto input = std::make_unique<MockExecutor>(
