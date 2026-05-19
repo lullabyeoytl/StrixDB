@@ -15,6 +15,8 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <climits>
 #include <cfloat>
+#include <cstdint>
+#include <limits>
 
 #include "common/common.h"
 #include "execution_common.h"
@@ -87,6 +89,11 @@ class IndexScanExecutor : public AbstractExecutor {
             case TYPE_STRING:
                 memset(dest, use_max ? 0xFF : 0, col.len);
                 break;
+            case TYPE_DATETIME: {
+                int64_t val = use_max ? std::numeric_limits<int64_t>::max() : std::numeric_limits<int64_t>::min();
+                memcpy(dest, &val, sizeof(int64_t));
+                break;
+            }
             default:
                 throw InternalError("Unexpected column type");
         }
@@ -106,7 +113,7 @@ class IndexScanExecutor : public AbstractExecutor {
             }
             auto col_it = std::find_if(index_meta_.cols.begin(), index_meta_.cols.end(),
                                        [&](const ColMeta &col) { return col.name == cond.lhs_col.col_name; });
-            if (col_it != index_meta_.cols.end()) {
+            if (col_it != index_meta_.cols.end() && cond.rhs_val.type == col_it->type) {
                 cond.rhs_val.init_raw(col_it->len);
             }
         }

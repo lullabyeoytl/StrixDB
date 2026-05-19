@@ -170,6 +170,11 @@ class StringOverflowError : public RMDBError {
     StringOverflowError() : RMDBError("String is too long") {}
 };
 
+class InvalidDatetimeError : public RMDBError {
+   public:
+    InvalidDatetimeError(const std::string &literal) : RMDBError("Invalid datetime literal: " + literal) {}
+};
+
 class IncompatibleTypeError : public RMDBError {
    public:
     IncompatibleTypeError(const std::string &lhs, const std::string &rhs)

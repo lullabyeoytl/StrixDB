@@ -328,7 +328,10 @@ void Analyze::check_clause(const std::vector<ColMeta> &all_cols, std::vector<Con
         ColType lhs_type = lhs_col->type;
         ColType rhs_type;
         if (cond.is_rhs_val) {
-            cond.rhs_val.init_raw(lhs_col->len);
+            cond.rhs_val = coerce_value_to_type(cond.rhs_val, lhs_type, true);
+            if (cond.rhs_val.type == lhs_type) {
+                cond.rhs_val.init_raw(lhs_col->len);
+            }
             rhs_type = cond.rhs_val.type;
         } else {
             auto rhs_it = tab_cache.find(cond.rhs_col.tab_name);
@@ -386,7 +389,7 @@ ColType Analyze::agg_result_type(const AggInfo &agg, const std::vector<ColMeta> 
     }
 
     ColType input_type = get_column_type(all_cols, agg.col);
-    if ((agg.agg_type == AGG_SUM || agg.agg_type == AGG_AVG) && input_type == TYPE_STRING) {
+    if ((agg.agg_type == AGG_SUM || agg.agg_type == AGG_AVG) && !is_numeric_type(input_type)) {
         throw RMDBError("SUM/AVG only support INT or FLOAT columns");
     }
     if (agg.agg_type == AGG_AVG) {

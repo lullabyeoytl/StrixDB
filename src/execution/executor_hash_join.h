@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <unordered_map>
 #include <utility>
@@ -30,6 +31,10 @@ struct HashJoinKeyHasher {
             } else if (value.type == TYPE_STRING) {
                 value_hash = std::hash<int>{}(2);
                 value_hash ^= std::hash<std::string>{}(value.str_val) + 0x9e3779b9 + (value_hash << 6) +
+                              (value_hash >> 2);
+            } else if (value.type == TYPE_DATETIME) {
+                value_hash = std::hash<int>{}(3);
+                value_hash ^= std::hash<int64_t>{}(value.datetime_val) + 0x9e3779b9 + (value_hash << 6) +
                               (value_hash >> 2);
             } else {
                 throw InternalError("Unexpected value type in HashJoinKeyHasher");

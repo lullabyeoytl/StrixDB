@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include <thread>
 #include <vector>
 #include <atomic>
+#include <cstdint>
 
 #include "ix_defs.h"
 #include "transaction/transaction.h"
@@ -36,15 +37,20 @@ inline int ix_compare(const char *a, const char *b, ColType type, int col_len) {
         case TYPE_INT: {
             int ia = *(int *)a;
             int ib = *(int *)b;
-            return (ia < ib) ? -1 : ((ia > ib) ? 1 : 0);
+            return three_way_compare(ia, ib);
         }
         case TYPE_FLOAT: {
             float fa = *(float *)a;
             float fb = *(float *)b;
-            return (fa < fb) ? -1 : ((fa > fb) ? 1 : 0);
+            return three_way_compare(fa, fb);
         }
         case TYPE_STRING:
             return memcmp(a, b, col_len);
+        case TYPE_DATETIME: {
+            int64_t da = *reinterpret_cast<const int64_t *>(a);
+            int64_t db = *reinterpret_cast<const int64_t *>(b);
+            return three_way_compare(da, db);
+        }
         default:
             throw InternalError("Unexpected data type");
     }

@@ -86,6 +86,8 @@ class AggregationStateHelper {
             result.set_float(0.0f);
         } else if (type == TYPE_STRING) {
             result.set_str(std::string());
+        } else if (type == TYPE_DATETIME) {
+            result.set_datetime(0);
         } else {
             throw InternalError("Unexpected aggregate result type");
         }
@@ -109,6 +111,8 @@ class AggregationStateHelper {
             os << value.float_val;
         } else if (value.type == TYPE_STRING) {
             os << value.str_val.size() << ':' << value.str_val;
+        } else if (value.type == TYPE_DATETIME) {
+            os << value.datetime_val;
         } else {
             throw InternalError("Unexpected group key value type");
         }

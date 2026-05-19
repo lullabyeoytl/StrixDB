@@ -29,12 +29,14 @@ struct NormalizeResult {
 inline auto normalize_make_const_condition(const TabCol &lhs_col, const Value &rhs_val,
                                            const std::vector<ColMeta> &cols) -> Condition {
     Condition inferred;
+    const auto &lhs_meta = find_col_meta(cols, lhs_col);
     inferred.lhs_col = lhs_col;
     inferred.op = OP_EQ;
     inferred.is_rhs_val = true;
-    inferred.rhs_val = rhs_val;
-    inferred.rhs_val.raw.reset();
-    inferred.rhs_val.init_raw(find_col_meta(cols, lhs_col).len);
+    inferred.rhs_val = coerce_value_to_type(rhs_val, lhs_meta.type, true);
+    if (inferred.rhs_val.type == lhs_meta.type) {
+        inferred.rhs_val.init_raw(lhs_meta.len);
+    }
     return inferred;
 }
 

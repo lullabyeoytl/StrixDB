@@ -36,6 +36,8 @@ inline auto get_col_value(const RmRecord &record, const ColMeta &col) -> Value {
         std::string str(rec_buf, col.len);
         str.resize(std::strlen(str.c_str()));
         value.set_str(str);
+    } else if (col.type == TYPE_DATETIME) {
+        value.set_datetime(*reinterpret_cast<const int64_t *>(rec_buf));
     } else {
         throw InternalError("Unexpected column type in get_col_value");
     }

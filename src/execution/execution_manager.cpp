@@ -34,7 +34,7 @@ const char *help_info = "Supported SQL syntax:\n"
                    "  UPDATE table_name SET column_name = value [, column_name = value ...] [WHERE where_clause]\n"
                    "  SELECT selector FROM table_name [WHERE where_clause]\n"
                    "type:\n"
-                   "  {INT | FLOAT | CHAR(n)}\n"
+                   "  {INT | FLOAT | CHAR(n) | DATETIME}\n"
                    "where_clause:\n"
                    "  condition [AND condition ...]\n"
                    "condition:\n"
@@ -177,8 +177,14 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         captions.push_back(sel_col.col_name);
     }
 
+    std::vector<size_t> col_widths;
+    for (const auto &col : executorTreeRoot->cols()) {
+        col_widths.push_back(col.type == TYPE_DATETIME ? RecordPrinter::DATETIME_COL_WIDTH
+                                                       : RecordPrinter::DEFAULT_COL_WIDTH);
+    }
+
     // Print header into buffer
-    RecordPrinter rec_printer(sel_cols.size());
+    RecordPrinter rec_printer(std::move(col_widths));
     rec_printer.print_separator(context);
     rec_printer.print_record(captions, context);
     rec_printer.print_separator(context);
@@ -204,6 +210,9 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         }
         if (value.type == TYPE_STRING) {
             return value.str_val;
+        }
+        if (value.type == TYPE_DATETIME) {
+            return format_datetime_value(value.datetime_val);
         }
         throw InternalError("Unexpected value type in select_from");
     };

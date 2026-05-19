@@ -87,7 +87,7 @@ void prepare_index_lookup_values(const IndexMeta &index_meta, std::vector<Condit
         }
         auto col_it = std::find_if(index_meta.cols.begin(), index_meta.cols.end(),
                                    [&](const ColMeta &col) { return col.name == cond.lhs_col.col_name; });
-        if (col_it != index_meta.cols.end()) {
+        if (col_it != index_meta.cols.end() && cond.rhs_val.type == col_it->type) {
             cond.rhs_val.init_raw(col_it->len);
         }
     }
@@ -720,7 +720,7 @@ bool Planner::should_use_sort_aggregation(const Query &query, const std::shared_
                                           const std::vector<SortKeySpec> &sort_keys) const {
     for (const auto &group_col : query.group_by_cols) {
         auto type = lookup_col_meta(group_col).type;
-        if (type != TYPE_INT && type != TYPE_FLOAT && type != TYPE_STRING) {
+        if (type != TYPE_INT && type != TYPE_FLOAT && type != TYPE_STRING && type != TYPE_DATETIME) {
             return true;
         }
     }

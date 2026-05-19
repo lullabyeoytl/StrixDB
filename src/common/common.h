@@ -12,6 +12,8 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -94,15 +96,120 @@ inline auto is_range_comp_op(CompOp op) -> bool {
     return op == OP_LT || op == OP_LE || op == OP_GT || op == OP_GE;
 }
 
+template <typename T>
+inline auto three_way_compare(const T &lhs, const T &rhs) -> int {
+    if (lhs < rhs) return -1;
+    if (lhs > rhs) return 1;
+    return 0;
+}
+
 const std::map<CompOp, CompOp> kSwapOp = {
     {OP_EQ, OP_EQ}, {OP_NE, OP_NE}, {OP_LT, OP_GT}, {OP_GT, OP_LT}, {OP_LE, OP_GE}, {OP_GE, OP_LE},
 };
+
+static constexpr int kDatetimeLen = static_cast<int>(sizeof(int64_t));
+static constexpr int64_t kSecondsPerDay = 24 * 60 * 60;
+
+inline auto is_datetime_leap_year(int year) -> bool {
+    return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+}
+
+inline auto datetime_days_in_month(int year, int month) -> int {
+    static constexpr int kMonthDays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (month == 2 && is_datetime_leap_year(year)) {
+        return 29;
+    }
+    return kMonthDays[month - 1];
+}
+
+inline auto datetime_digit(char ch) -> bool {
+    return ch >= '0' && ch <= '9';
+}
+
+inline auto parse_datetime_part(const std::string &literal, size_t pos, size_t len) -> int {
+    int value = 0;
+    for (size_t i = 0; i < len; ++i) {
+        char ch = literal[pos + i];
+        if (!datetime_digit(ch)) {
+            throw InvalidDatetimeError(literal);
+        }
+        value = value * 10 + (ch - '0');
+    }
+    return value;
+}
+
+inline auto datetime_days_from_civil(int year, unsigned month, unsigned day) -> int64_t {
+    year -= month <= 2;
+    const int era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned yoe = static_cast<unsigned>(year - era * 400);
+    const unsigned doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return static_cast<int64_t>(era) * 146097 + static_cast<int64_t>(doe) - 719468;
+}
+
+inline void datetime_civil_from_days(int64_t days, int &year, unsigned &month, unsigned &day) {
+    days += 719468;
+    const int64_t era = (days >= 0 ? days : days - 146096) / 146097;
+    const unsigned doe = static_cast<unsigned>(days - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    year = static_cast<int>(yoe) + static_cast<int>(era) * 400;
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp = (5 * doy + 2) / 153;
+    day = doy - (153 * mp + 2) / 5 + 1;
+    month = mp + (mp < 10 ? 3 : -9);
+    year += month <= 2;
+}
+
+inline auto datetime_literal_to_seconds(const std::string &literal) -> int64_t {
+    if (literal.size() != 19 || literal[4] != '-' || literal[7] != '-' || literal[10] != ' ' ||
+        literal[13] != ':' || literal[16] != ':') {
+        throw InvalidDatetimeError(literal);
+    }
+
+    int year = parse_datetime_part(literal, 0, 4);
+    int month = parse_datetime_part(literal, 5, 2);
+    int day = parse_datetime_part(literal, 8, 2);
+    int hour = parse_datetime_part(literal, 11, 2);
+    int minute = parse_datetime_part(literal, 14, 2);
+    int second = parse_datetime_part(literal, 17, 2);
+
+    if (year < 1 || month < 1 || month > 12 || day < 1 || day > datetime_days_in_month(year, month) ||
+        hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
+        throw InvalidDatetimeError(literal);
+    }
+
+    int64_t days = datetime_days_from_civil(year, static_cast<unsigned>(month), static_cast<unsigned>(day));
+    return days * kSecondsPerDay + hour * 3600 + minute * 60 + second;
+}
+
+inline auto format_datetime_value(int64_t seconds) -> std::string {
+    int64_t days = seconds / kSecondsPerDay;
+    int64_t day_seconds = seconds % kSecondsPerDay;
+    if (day_seconds < 0) {
+        day_seconds += kSecondsPerDay;
+        --days;
+    }
+
+    int year = 0;
+    unsigned month = 0;
+    unsigned day = 0;
+    datetime_civil_from_days(days, year, month, day);
+
+    int hour = static_cast<int>(day_seconds / 3600);
+    int minute = static_cast<int>((day_seconds % 3600) / 60);
+    int second = static_cast<int>(day_seconds % 60);
+
+    char buffer[20];
+    std::snprintf(buffer, sizeof(buffer), "%04d-%02u-%02u %02d:%02d:%02d", year, month, day, hour, minute, second);
+    return std::string(buffer);
+}
 
 struct Value {
     ColType type;  // type of value
     union {
         int int_val;      // int value
         float float_val;  // float value
+        int64_t datetime_val;
     };
     std::string str_val;  // string value
 
@@ -122,7 +229,12 @@ struct Value {
         type = TYPE_STRING;
         str_val = std::move(str_val_);
     }
-    
+
+    void set_datetime(int64_t datetime_val_) {
+        type = TYPE_DATETIME;
+        datetime_val = datetime_val_;
+    }
+
     void init_raw(int len) {
         assert(raw == nullptr);
         raw = std::make_shared<RmRecord>(len);
@@ -138,6 +250,11 @@ struct Value {
             }
             memset(raw->data, 0, len);
             memcpy(raw->data, str_val.c_str(), str_val.size());
+        } else if (type == TYPE_DATETIME) {
+            assert(len == kDatetimeLen);
+            *reinterpret_cast<int64_t *>(raw->data) = datetime_val;
+        } else {
+            throw InternalError("Unexpected value type in Value::init_raw");
         }
     }
 
@@ -159,13 +276,11 @@ struct Value {
         }
 
         if (type == TYPE_STRING && rhs.type == TYPE_STRING) {
-            if (str_val < rhs.str_val) {
-                return -1;
-            }
-            if (str_val > rhs.str_val) {
-                return 1;
-            }
-            return 0;
+            return three_way_compare(str_val, rhs.str_val);
+        }
+
+        if (type == TYPE_DATETIME && rhs.type == TYPE_DATETIME) {
+            return three_way_compare(datetime_val, rhs.datetime_val);
         }
 
         throw InternalError("Unexpected value type combination in Value::compare");
@@ -184,13 +299,20 @@ struct Value {
     }
 };
 
+inline auto parse_datetime_literal(const std::string &literal) -> Value {
+    Value value;
+    value.set_datetime(datetime_literal_to_seconds(literal));
+    return value;
+}
+
 /**
  * @brief Convert a literal/runtime value to the target column type before materialization.
  *
- * The only implicit conversion currently allowed for writes is INT -> FLOAT.
- * Other cross-type writes still fail to avoid silent truncation or lossy casts.
+ * INT -> FLOAT is the only numeric widening conversion.
+ * STRING -> DATETIME is allowed only when the target column is datetime.
+ * Mixed numeric predicate values can stay in their literal type when allowed.
  */
-inline auto coerce_value_to_type(const Value &src, ColType target_type) -> Value {
+inline auto coerce_value_to_type(const Value &src, ColType target_type, bool allow_mixed_numeric = false) -> Value {
     Value coerced = src;
     // Force callers to rebuild raw bytes with the destination column length.
     coerced.raw.reset();
@@ -199,6 +321,12 @@ inline auto coerce_value_to_type(const Value &src, ColType target_type) -> Value
     }
     if (target_type == TYPE_FLOAT && src.type == TYPE_INT) {
         coerced.set_float(static_cast<float>(src.int_val));
+        return coerced;
+    }
+    if (target_type == TYPE_DATETIME && src.type == TYPE_STRING) {
+        return parse_datetime_literal(src.str_val);
+    }
+    if (allow_mixed_numeric && is_numeric_type(target_type) && coerced.is_numeric()) {
         return coerced;
     }
     throw IncompatibleTypeError(coltype2str(target_type), coltype2str(src.type));
