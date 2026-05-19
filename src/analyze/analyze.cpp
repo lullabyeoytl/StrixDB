@@ -80,7 +80,8 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
                 throw TableNotFoundError(tab_name);
             }
         }
-        for (auto &sv_sel_expr : x->cols) {
+        for (auto &sv_select_item : x->select_items) {
+            auto &sv_sel_expr = sv_select_item->expr;
             if (auto sv_sel_col = std::dynamic_pointer_cast<ast::Col>(sv_sel_expr)) {
                 TabCol sel_col = {.tab_name = sv_sel_col->tab_name, .col_name = sv_sel_col->col_name};
                 query->cols.push_back(sel_col);
@@ -105,12 +106,13 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         }
         std::vector<ColMeta> visible_cols;
         get_all_cols(visible_tables, visible_cols);
-        if (x->cols.empty()) {
+        if (x->select_items.empty()) {
             // select all columns
             for (auto &col : visible_cols) {
                 TabCol sel_col = {.tab_name = col.tab_name, .col_name = col.name};
                 query->cols.push_back(sel_col);
                 query->select_items.push_back(sel_col);
+                query->output_names.push_back(sel_col.col_name);
             }
         } else {
             // infer table name from column name
@@ -118,12 +120,18 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
                 check_column(visible_cols, sel_col);  // 列元数据校验
             }
             query->select_items.clear();
+            query->output_names.clear();
             size_t col_idx = 0;
-            for (auto &sv_sel_expr : x->cols) {
+            for (auto &sv_select_item : x->select_items) {
+                auto &sv_sel_expr = sv_select_item->expr;
                 if (std::dynamic_pointer_cast<ast::Col>(sv_sel_expr)) {
-                    query->select_items.push_back(query->cols[col_idx++]);
+                    const auto &sel_col = query->cols[col_idx++];
+                    query->select_items.push_back(sel_col);
+                    query->output_names.push_back(sel_col.col_name);
                 } else if (auto sv_agg = std::dynamic_pointer_cast<ast::AggFunc>(sv_sel_expr)) {
-                    query->select_items.push_back({std::string(), agg_output_name(convert_agg_func(sv_agg))});
+                    auto default_name = agg_output_name(convert_agg_func(sv_agg));
+                    query->select_items.push_back({std::string(), default_name});
+                    query->output_names.push_back(sv_select_item->has_alias ? sv_select_item->alias : default_name);
                 } else {
                     throw InternalError("Unexpected select expression type");
                 }

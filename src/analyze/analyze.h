@@ -37,6 +37,7 @@ class Query{
     // aggregation metadata
     std::vector<AggInfo> agg_infos;
     std::vector<TabCol> select_items;
+    std::vector<std::string> output_names;
     std::vector<TabCol> group_by_cols;
     std::vector<HavingCond> having_conds;
     // ORDER BY keys are normalized during analysis so downstream layers share one spec model.

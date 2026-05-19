@@ -30,7 +30,7 @@ using namespace ast;
 %param {yyscan_t yyscanner}
 
 // keywords
-%token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY LIMIT OFFSET
+%token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY LIMIT OFFSET AS
 WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX UNIQUE AND ON SEMI JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE ENABLE_HASHJOIN
 %token COUNT SUM AVG MIN MAX GROUP HAVING
 // non-keywords
@@ -49,7 +49,8 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX UNIQUE AND ON SEMI JOIN EXIT HELP T
 %type <sv_type_len> type
 %type <sv_comp_op> op
 %type <sv_expr> expr
-%type <sv_exprs> exprList selector
+%type <sv_select_item> selectItem
+%type <sv_select_items> selectItemList selector
 %type <sv_agg_func> agg_func
 %type <sv_val> value
 %type <sv_vals> valueList
@@ -463,15 +464,26 @@ selector:
     {
         $$ = {};
     }
-    |   exprList
+    |   selectItemList
     ;
 
-exprList:
+selectItem:
         expr
     {
-        $$ = std::vector<std::shared_ptr<Expr>>{$1};
+        $$ = std::make_shared<SelectItem>($1);
     }
-    |   exprList ',' expr
+    |   agg_func AS colName
+    {
+        $$ = std::make_shared<SelectItem>(std::static_pointer_cast<Expr>($1), $3);
+    }
+    ;
+
+selectItemList:
+        selectItem
+    {
+        $$ = std::vector<std::shared_ptr<SelectItem>>{$1};
+    }
+    |   selectItemList ',' selectItem
     {
         $$.push_back($3);
     }
