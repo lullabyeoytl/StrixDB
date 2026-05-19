@@ -48,6 +48,7 @@ typedef enum PlanTag{
     T_SortMerge,    // sort merge join
     T_HashJoin,     // hash join
     T_Sort,
+    T_Limit,
     T_Projection,
     T_Aggregation
 } PlanTag;
@@ -232,6 +233,20 @@ class SortPlan : public Plan
         std::shared_ptr<Plan> subplan_;
         std::vector<SortKeySpec> sort_keys_;
         
+};
+
+class LimitPlan : public Plan
+{
+    public:
+        LimitPlan(std::shared_ptr<Plan> subplan, LimitSpec limit_spec)
+        {
+            Plan::tag = T_Limit;
+            subplan_ = std::move(subplan);
+            limit_spec_ = limit_spec;
+        }
+        ~LimitPlan(){}
+        std::shared_ptr<Plan> subplan_;
+        LimitSpec limit_spec_;
 };
 
 class AggregationPlan : public Plan

@@ -157,6 +157,10 @@ private:
                 print_node(item->col, offset);
                 print_val(orderby2str(item->orderby_dir), offset);
             }
+        } else if (auto x = std::dynamic_pointer_cast<LimitClause>(node)) {
+            std::cout << "LIMIT\n";
+            print_val(x->limit, offset);
+            print_val(x->offset, offset);
         } else if (auto x = std::dynamic_pointer_cast<TypeLen>(node)) {
             std::cout << "TYPE_LEN\n";
             print_val(type2str(x->type), offset);
@@ -205,6 +209,9 @@ private:
             }
             if (x->has_sort) {
                 print_node(x->order, offset);
+            }
+            if (x->has_limit) {
+                print_node(x->limit_clause, offset);
             }
         } else if (auto x = std::dynamic_pointer_cast<TxnBegin>(node)) {
             std::cout << "BEGIN\n";

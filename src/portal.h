@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include "optimizer/plan.h"
 #include "execution/executor_abstract.h"
 #include "execution/executor_hash_join.h"
+#include "execution/executor_limit.h"
 #include "execution/executor_nestedloop_join.h"
 #include "execution/executor_sortmerge_join.h"
 #include "execution/executor_projection.h"
@@ -160,6 +161,9 @@ class Portal
         if(auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)){
             return std::make_unique<ProjectionExecutor>(convert_plan_executor(x->subplan_, context), 
                                                         x->sel_cols_);
+        } else if(auto x = std::dynamic_pointer_cast<LimitPlan>(plan)) {
+            return std::make_unique<LimitExecutor>(convert_plan_executor(x->subplan_, context),
+                                                   x->limit_spec_);
         } else if(auto x = std::dynamic_pointer_cast<AggregationPlan>(plan)) {
             auto input = convert_plan_executor(x->subplan_, context);
             if (x->strategy_ == AggStrategy_Sort) {

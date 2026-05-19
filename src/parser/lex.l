@@ -93,6 +93,8 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "HELP" { return HELP; }
 "ORDER" { return ORDER; }
 "BY" {  return BY;  }
+"LIMIT" { return LIMIT; }
+"OFFSET" { return OFFSET; }
 "ASC" { return ASC; }
 "COUNT" { return COUNT; }
 "SUM" { return SUM; }

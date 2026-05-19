@@ -30,6 +30,16 @@ auto classify_order_expr(const std::shared_ptr<ast::Expr> &expr) -> OrderExprKin
     throw InternalError("Unsupported ORDER BY expression type");
 }
 
+auto normalize_limit_clause(const std::shared_ptr<ast::LimitClause> &limit_clause) -> LimitSpec {
+    if (limit_clause->limit < 0) {
+        throw RMDBError("LIMIT must not be negative");
+    }
+    if (limit_clause->offset < 0) {
+        throw RMDBError("OFFSET must not be negative");
+    }
+    return LimitSpec{static_cast<size_t>(limit_clause->limit), static_cast<size_t>(limit_clause->offset)};
+}
+
 }  // namespace
 
 AggInfo convert_agg_func(const std::shared_ptr<ast::AggFunc> &sv_agg) {
@@ -155,6 +165,9 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
                 query->order_by_keys.push_back(
                     SortKeySpec{std::move(order_col), sv_order_item->orderby_dir == ast::OrderBy_DESC});
             }
+        }
+        if (x->has_limit) {
+            query->limit_spec = normalize_limit_clause(x->limit_clause);
         }
         for (auto &sv_having : x->having_conds) {
             HavingCond having_cond;

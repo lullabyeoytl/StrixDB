@@ -30,7 +30,7 @@ using namespace ast;
 %param {yyscan_t yyscanner}
 
 // keywords
-%token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
+%token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY LIMIT OFFSET
 WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX UNIQUE AND ON SEMI JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE ENABLE_HASHJOIN
 %token COUNT SUM AVG MIN MAX GROUP HAVING
 // non-keywords
@@ -68,6 +68,7 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX UNIQUE AND ON SEMI JOIN EXIT HELP T
 %type <sv_orderby_items> order_clause
 %type <sv_orderby_item> order_item
 %type <sv_orderby_dir> opt_asc_desc
+%type <sv_limit_clause> opt_limit_clause
 %type <sv_group_by> opt_group_clause
 %type <sv_having_cond> having_cond
 %type <sv_having_conds> havingCondList opt_having_clause
@@ -182,11 +183,11 @@ dml:
     {
         $$ = std::make_shared<UpdateStmt>($2, $4, $5);
     }
-    |   SELECT selector FROM tableList optWhereClause opt_group_clause opt_having_clause opt_order_clause
+    |   SELECT selector FROM tableList optWhereClause opt_group_clause opt_having_clause opt_order_clause opt_limit_clause
     {
-        $$ = std::make_shared<SelectStmt>($2, $4, $5, $8, $6, $7);
+        $$ = std::make_shared<SelectStmt>($2, $4, $5, $8, $6, $7, $9);
     }
-    |   SELECT selector FROM tbName joinClauseList optWhereClause opt_group_clause opt_having_clause opt_order_clause
+    |   SELECT selector FROM tbName joinClauseList optWhereClause opt_group_clause opt_having_clause opt_order_clause opt_limit_clause
     {
         std::vector<std::string> tabs{$4};
         std::string current_left = $4;
@@ -195,7 +196,7 @@ dml:
             tabs.push_back(join_expr->right);
             current_left = join_expr->right;
         }
-        $$ = std::make_shared<SelectStmt>($2, std::move(tabs), $6, std::move($5), $9, $7, $8);
+        $$ = std::make_shared<SelectStmt>($2, std::move(tabs), $6, std::move($5), $9, $7, $8, $10);
     }
     ;
 
@@ -539,6 +540,18 @@ opt_order_clause:
     ORDER BY order_clause      
     { 
         $$ = std::make_shared<OrderBy>($3); 
+    }
+    |   /* epsilon */ { $$ = nullptr; }
+    ;
+
+opt_limit_clause:
+    LIMIT VALUE_INT
+    {
+        $$ = std::make_shared<LimitClause>($2, 0);
+    }
+    |   LIMIT VALUE_INT OFFSET VALUE_INT
+    {
+        $$ = std::make_shared<LimitClause>($2, $4);
     }
     |   /* epsilon */ { $$ = nullptr; }
     ;

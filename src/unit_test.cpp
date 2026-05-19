@@ -40,6 +40,7 @@ See the Mulan PSL v2 for more details. */
 #include "analyze/analyze.h"
 #include "execution/execution_sort.h"
 #include "execution/executor_hash_join.h"
+#include "execution/executor_limit.h"
 #include "gtest/gtest.h"
 #include "optimizer/planner.h"
 #include "parser/parser.h"
@@ -1179,6 +1180,39 @@ TEST(OrderByPlannerTest, PreservesNormalizedSortKeysAcrossAnalyzeAndPlanner) {
     }
 }
 
+TEST(LimitParserTest, ParsesLimitAndOffset) {
+    auto parse_tree = parse_sql("select * from t order by a desc limit 5 offset 2;");
+    auto select = std::dynamic_pointer_cast<ast::SelectStmt>(parse_tree);
+    ASSERT_NE(nullptr, select);
+    ASSERT_TRUE(select->has_limit);
+    ASSERT_NE(nullptr, select->limit_clause);
+    EXPECT_EQ(5, select->limit_clause->limit);
+    EXPECT_EQ(2, select->limit_clause->offset);
+}
+
+TEST(LimitPlannerTest, InsertsLimitPlanBeforeProjection) {
+    SmManager sm_manager(nullptr, nullptr, nullptr, nullptr);
+    sm_manager.db_.SetTabMeta("t", make_int_table("t", {"a", "b", "c"}));
+
+    Analyze analyze(&sm_manager);
+    Planner planner(&sm_manager);
+
+    auto query = analyze.do_analyze(parse_sql("select * from t order by a limit 3 offset 1;"));
+    ASSERT_TRUE(query->limit_spec.has_value());
+    EXPECT_EQ(3U, query->limit_spec->limit);
+    EXPECT_EQ(1U, query->limit_spec->offset);
+
+    auto dml_plan = std::dynamic_pointer_cast<DMLPlan>(planner.do_planner(query, nullptr));
+    ASSERT_NE(nullptr, dml_plan);
+    auto projection = std::dynamic_pointer_cast<ProjectionPlan>(dml_plan->subplan_);
+    ASSERT_NE(nullptr, projection);
+    auto limit_plan = std::dynamic_pointer_cast<LimitPlan>(projection->subplan_);
+    ASSERT_NE(nullptr, limit_plan);
+    EXPECT_EQ(3U, limit_plan->limit_spec_.limit);
+    EXPECT_EQ(1U, limit_plan->limit_spec_.offset);
+    ASSERT_NE(nullptr, std::dynamic_pointer_cast<SortPlan>(limit_plan->subplan_));
+}
+
 TEST(ValueCoercionTest, WidensIntLiteralForFloatColumnWrites) {
     Value value;
     value.set_int(90);
@@ -1220,6 +1254,22 @@ TEST(SortExecutorTest, AppliesMultiKeySortSpecsWithMixedDirections) {
     EXPECT_EQ(200, read_int_field(rows[1], 8));
     EXPECT_EQ(150, read_int_field(rows[2], 8));
     EXPECT_EQ(100, read_int_field(rows[3], 8));
+}
+
+TEST(LimitExecutorTest, AppliesOffsetAndRowCount) {
+    std::vector<ColMeta> cols = {make_int_col("t", "a", 0), make_int_col("t", "payload", 4)};
+    auto input = std::make_unique<MockExecutor>(
+        cols, std::vector<RmRecord>{make_int_record({1, 100}), make_int_record({2, 200}),
+                                    make_int_record({3, 300}), make_int_record({4, 400})});
+
+    LimitExecutor executor(std::move(input), LimitSpec{2, 1});
+
+    auto rows = collect_executor_rows(executor);
+    ASSERT_EQ(2, rows.size());
+    EXPECT_EQ(2, read_int_field(rows[0], 0));
+    EXPECT_EQ(200, read_int_field(rows[0], 4));
+    EXPECT_EQ(3, read_int_field(rows[1], 0));
+    EXPECT_EQ(300, read_int_field(rows[1], 4));
 }
 
 TEST(HashJoinExecutorTest, InnerJoinMatchesAllTuplesInBucket) {

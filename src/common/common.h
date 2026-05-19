@@ -45,6 +45,11 @@ struct SortKeySpec {
     }
 };
 
+struct LimitSpec {
+    size_t limit = 0;
+    size_t offset = 0;
+};
+
 inline auto make_sort_key_specs(const std::vector<TabCol> &cols, bool is_desc = false) -> std::vector<SortKeySpec> {
     std::vector<SortKeySpec> keys;
     keys.reserve(cols.size());

@@ -670,6 +670,14 @@ std::shared_ptr<Plan> Planner::generate_sort_plan(std::shared_ptr<Query> query, 
     return std::make_shared<SortPlan>(T_Sort, std::move(plan), query->order_by_keys);
 }
 
+std::shared_ptr<Plan> Planner::generate_limit_plan(std::shared_ptr<Query> query, std::shared_ptr<Plan> plan)
+{
+    if (!query->limit_spec.has_value()) {
+        return plan;
+    }
+    return std::make_shared<LimitPlan>(std::move(plan), *query->limit_spec);
+}
+
 ColMeta Planner::lookup_col_meta(const TabCol &col) const {
     const auto &cols = sm_manager_->db_.get_table(col.tab_name).cols;
     return find_col_meta(cols, col);
@@ -691,6 +699,9 @@ size_t Planner::estimate_input_rows(const std::shared_ptr<Plan> &plan) const {
     }
     if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
         return estimate_input_rows(sort->subplan_);
+    }
+    if (auto limit = std::dynamic_pointer_cast<LimitPlan>(plan)) {
+        return std::min(estimate_input_rows(limit->subplan_), limit->limit_spec_.limit);
     }
     if (auto projection = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
         return estimate_input_rows(projection->subplan_);
@@ -797,6 +808,8 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
     if (is_aggregate_query(*query)) {
         plannerRoot = generate_sort_plan(query, std::move(plannerRoot));
     }
+
+    plannerRoot = generate_limit_plan(query, std::move(plannerRoot));
 
     plannerRoot = std::make_shared<ProjectionPlan>(T_Projection, std::move(plannerRoot), 
                                                         std::move(sel_cols));

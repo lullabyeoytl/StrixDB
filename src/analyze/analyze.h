@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include <cassert>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,7 @@ class Query{
     std::vector<HavingCond> having_conds;
     // ORDER BY keys are normalized during analysis so downstream layers share one spec model.
     std::vector<SortKeySpec> order_by_keys;
+    std::optional<LimitSpec> limit_spec;
 
     Query(){}
 
