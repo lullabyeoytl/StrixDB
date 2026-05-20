@@ -144,6 +144,13 @@ private:
             } else {
                 print_node(x->col, offset);
             }
+        } else if (auto x = std::dynamic_pointer_cast<SelectItem>(node)) {
+            std::cout << "SELECT_ITEM\n";
+            print_node(x->expr, offset);
+            if (x->has_alias) {
+                print_val("ALIAS", offset);
+                print_val(x->alias, offset);
+            }
         } else if (auto x = std::dynamic_pointer_cast<GroupBy>(node)) {
             std::cout << "GROUP_BY\n";
             print_node_list(x->cols, offset);
@@ -199,7 +206,7 @@ private:
             print_node_list(x->conds, offset);
         } else if (auto x = std::dynamic_pointer_cast<SelectStmt>(node)) {
             std::cout << "SELECT\n";
-            print_node_list(x->cols, offset);
+            print_node_list(x->select_items, offset);
             print_val_list(x->tabs, offset);
             print_node_list(x->conds, offset);
             if (x->has_group_by) {

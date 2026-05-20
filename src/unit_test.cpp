@@ -1152,6 +1152,29 @@ TEST(OrderByParserTest, ParsesMultiKeyDirections) {
     EXPECT_EQ(ast::OrderBy_DEFAULT, select->order->items[2]->orderby_dir);
 }
 
+TEST(AggregateAliasParserTest, ParsesExplicitAggregateAliases) {
+    auto parse_tree = parse_sql("select count(*) as cnt, sum(a) as total from t;");
+    auto select = std::dynamic_pointer_cast<ast::SelectStmt>(parse_tree);
+    ASSERT_NE(nullptr, select);
+    ASSERT_EQ(2, select->select_items.size());
+
+    auto count_item = select->select_items[0];
+    ASSERT_NE(nullptr, count_item);
+    EXPECT_TRUE(count_item->has_alias);
+    EXPECT_EQ("cnt", count_item->alias);
+    ASSERT_NE(nullptr, std::dynamic_pointer_cast<ast::AggFunc>(count_item->expr));
+
+    auto sum_item = select->select_items[1];
+    ASSERT_NE(nullptr, sum_item);
+    EXPECT_TRUE(sum_item->has_alias);
+    EXPECT_EQ("total", sum_item->alias);
+    ASSERT_NE(nullptr, std::dynamic_pointer_cast<ast::AggFunc>(sum_item->expr));
+}
+
+TEST(AggregateAliasParserTest, RejectsNonAggregateAliases) {
+    EXPECT_THROW(parse_sql("select a as x from t;"), std::runtime_error);
+}
+
 TEST(OrderByPlannerTest, PreservesNormalizedSortKeysAcrossAnalyzeAndPlanner) {
     SmManager sm_manager(nullptr, nullptr, nullptr, nullptr);
     sm_manager.db_.SetTabMeta("t", make_int_table("t", {"a", "b", "c"}));
@@ -1211,6 +1234,33 @@ TEST(LimitPlannerTest, InsertsLimitPlanBeforeProjection) {
     EXPECT_EQ(3U, limit_plan->limit_spec_.limit);
     EXPECT_EQ(1U, limit_plan->limit_spec_.offset);
     ASSERT_NE(nullptr, std::dynamic_pointer_cast<SortPlan>(limit_plan->subplan_));
+}
+
+TEST(AggregateAliasPlannerTest, KeepsInternalAggregateNamesAndSeparateOutputNames) {
+    SmManager sm_manager(nullptr, nullptr, nullptr, nullptr);
+    sm_manager.db_.SetTabMeta("t", make_int_table("t", {"a", "b"}));
+
+    Analyze analyze(&sm_manager);
+    Planner planner(&sm_manager);
+
+    auto query = analyze.do_analyze(parse_sql("select count(*) as cnt, sum(a) as total from t;"));
+    ASSERT_EQ(2, query->select_items.size());
+    ASSERT_EQ(2, query->output_names.size());
+    EXPECT_EQ("count(*)", query->select_items[0].col_name);
+    EXPECT_EQ("sum(a)", query->select_items[1].col_name);
+    EXPECT_EQ("cnt", query->output_names[0]);
+    EXPECT_EQ("total", query->output_names[1]);
+
+    auto dml_plan = std::dynamic_pointer_cast<DMLPlan>(planner.do_planner(query, nullptr));
+    ASSERT_NE(nullptr, dml_plan);
+    auto projection = std::dynamic_pointer_cast<ProjectionPlan>(dml_plan->subplan_);
+    ASSERT_NE(nullptr, projection);
+    ASSERT_EQ(2, projection->sel_cols_.size());
+    ASSERT_EQ(2, projection->output_names_.size());
+    EXPECT_EQ("count(*)", projection->sel_cols_[0].col_name);
+    EXPECT_EQ("sum(a)", projection->sel_cols_[1].col_name);
+    EXPECT_EQ("cnt", projection->output_names_[0]);
+    EXPECT_EQ("total", projection->output_names_[1]);
 }
 
 TEST(ValueCoercionTest, WidensIntLiteralForFloatColumnWrites) {

@@ -801,6 +801,13 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
 
     //物理优化
     auto sel_cols = query->select_items.empty() ? query->cols : query->select_items;
+    auto output_names = query->output_names;
+    if (output_names.empty()) {
+        output_names.reserve(sel_cols.size());
+        for (const auto &sel_col : sel_cols) {
+            output_names.push_back(sel_col.col_name);
+        }
+    }
     std::shared_ptr<Plan> plannerRoot = physical_optimization(query, context);
 
     plannerRoot = generate_aggregate_plan(query, std::move(plannerRoot));
@@ -811,8 +818,8 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
 
     plannerRoot = generate_limit_plan(query, std::move(plannerRoot));
 
-    plannerRoot = std::make_shared<ProjectionPlan>(T_Projection, std::move(plannerRoot), 
-                                                        std::move(sel_cols));
+    plannerRoot = std::make_shared<ProjectionPlan>(T_Projection, std::move(plannerRoot),
+                                                   std::move(sel_cols), std::move(output_names));
 
     return plannerRoot;
 }
