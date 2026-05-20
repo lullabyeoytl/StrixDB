@@ -406,7 +406,7 @@ void SmManager::create_unique_index(const std::string& tab_name, const std::vect
                 throw UniqueViolationError(tab_name, col_names);
             }
         } else {
-            // Index handle not open — fall back to file scan
+            // Index handle not open - fall back to file scan
             if (has_duplicate_keys(fhs_.at(tab_name).get(), precheck_meta, context)) {
                 throw UniqueViolationError(tab_name, col_names);
             }

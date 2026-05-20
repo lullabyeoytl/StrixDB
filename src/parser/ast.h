@@ -15,7 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include "common/common.h"
 
 enum JoinType {
-    INNER_JOIN, LEFT_JOIN, RIGHT_JOIN, FULL_JOIN
+    INNER_JOIN, LEFT_JOIN, RIGHT_JOIN, FULL_JOIN, SEMI_JOIN
 };
 namespace ast {
 
@@ -286,6 +286,21 @@ struct SelectStmt : public TreeNode {
                 has_group_by = (bool)group_by;
                 has_having = !having_conds.empty();
             }
+
+    SelectStmt(std::vector<std::shared_ptr<Expr>> cols_,
+               std::vector<std::string> tabs_,
+               std::vector<std::shared_ptr<BinaryExpr>> conds_,
+               std::vector<std::shared_ptr<JoinExpr>> jointree_,
+               std::shared_ptr<OrderBy> order_,
+               std::shared_ptr<GroupBy> group_by_,
+               std::vector<std::shared_ptr<HavingCond>> having_conds_) :
+            cols(std::move(cols_)), tabs(std::move(tabs_)), conds(std::move(conds_)),
+            jointree(std::move(jointree_)), order(std::move(order_)),
+            group_by(std::move(group_by_)), having_conds(std::move(having_conds_)) {
+                has_sort = (bool)order;
+                has_group_by = (bool)group_by;
+                has_having = !having_conds.empty();
+            }
 };
 
 // set enable_nestloop
@@ -329,6 +344,8 @@ struct SemValue {
 
     std::shared_ptr<BinaryExpr> sv_cond;
     std::vector<std::shared_ptr<BinaryExpr>> sv_conds;
+    std::vector<std::shared_ptr<JoinExpr>> sv_join_exprs;
+    JoinType sv_join_type;
 
     std::shared_ptr<OrderBy> sv_orderby;
     

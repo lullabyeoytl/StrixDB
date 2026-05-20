@@ -22,7 +22,7 @@ using namespace ast;
 
 // keywords
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
-WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX UNIQUE AND JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
+WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX UNIQUE AND ON SEMI JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
 %token COUNT SUM AVG MIN MAX GROUP HAVING
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
@@ -46,6 +46,8 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX UNIQUE AND JOIN EXIT HELP TXN_BEGIN
 %type <sv_vals> valueList
 %type <sv_str> tbName colName
 %type <sv_strs> tableList colNameList
+%type <sv_join_exprs> joinClauseList
+%type <sv_join_type> joinType
 %type <sv_col> col
 %type <sv_cols> colList
 %type <sv_set_clause> setClause
@@ -171,6 +173,38 @@ dml:
     |   SELECT selector FROM tableList optWhereClause opt_group_clause opt_having_clause opt_order_clause
     {
         $$ = std::make_shared<SelectStmt>($2, $4, $5, $8, $6, $7);
+    }
+    |   SELECT selector FROM tbName joinClauseList optWhereClause opt_group_clause opt_having_clause opt_order_clause
+    {
+        std::vector<std::string> tabs{$4};
+        std::string current_left = $4;
+        for (auto &join_expr : $5) {
+            join_expr->left = current_left;
+            tabs.push_back(join_expr->right);
+            current_left = join_expr->right;
+        }
+        $$ = std::make_shared<SelectStmt>($2, std::move(tabs), $6, std::move($5), $9, $7, $8);
+    }
+    ;
+
+joinClauseList:
+        joinType JOIN tbName ON whereClause
+    {
+        $$ = std::vector<std::shared_ptr<JoinExpr>>{
+            std::make_shared<JoinExpr>(std::string(), $3, $5, $1)
+        };
+    }
+    |   joinClauseList joinType JOIN tbName ON whereClause
+    {
+        $1.push_back(std::make_shared<JoinExpr>(std::string(), $4, $6, $2));
+        $$ = std::move($1);
+    }
+    ;
+
+joinType:
+        SEMI
+    {
+        $$ = SEMI_JOIN;
     }
     ;
 

@@ -126,6 +126,11 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
             query->having_conds.push_back(having_cond);
         }
         check_aggregate(all_cols, *query);
+        if (!x->jointree.empty()) {
+            for (auto &join_expr : x->jointree) {
+                normalize_sv_conds(join_expr->conds, all_cols);
+            }
+        }
         //处理where条件
         get_clause(x->conds, query->conds);
         check_clause(all_cols, query->conds);
@@ -225,6 +230,22 @@ void Analyze::get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv
     }
 }
 
+void Analyze::normalize_sv_conds(std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds,
+                                 const std::vector<ColMeta> &all_cols) {
+    std::vector<Condition> conds;
+    get_clause(sv_conds, conds);
+    check_clause(all_cols, conds);
+    for (size_t i = 0; i < sv_conds.size(); ++i) {
+        sv_conds[i]->lhs->tab_name = conds[i].lhs_col.tab_name;
+        if (!conds[i].is_rhs_val) {
+            auto rhs_col = std::dynamic_pointer_cast<ast::Col>(sv_conds[i]->rhs);
+            if (rhs_col != nullptr) {
+                rhs_col->tab_name = conds[i].rhs_col.tab_name;
+            }
+        }
+    }
+}
+
 void Analyze::check_clause(const std::vector<ColMeta> &all_cols, std::vector<Condition> &conds) {
     std::map<std::string, TabMeta> tab_cache;
     // Get raw values in where clause
@@ -243,7 +264,10 @@ void Analyze::check_clause(const std::vector<ColMeta> &all_cols, std::vector<Con
         ColType lhs_type = lhs_col->type;
         ColType rhs_type;
         if (cond.is_rhs_val) {
-            cond.rhs_val.init_raw(lhs_col->len);
+            cond.rhs_val = coerce_value_to_type(cond.rhs_val, lhs_type, true);
+            if (cond.rhs_val.type == lhs_type) {
+                cond.rhs_val.init_raw(lhs_col->len);
+            }
             rhs_type = cond.rhs_val.type;
         } else {
             auto rhs_it = tab_cache.find(cond.rhs_col.tab_name);
@@ -259,7 +283,6 @@ void Analyze::check_clause(const std::vector<ColMeta> &all_cols, std::vector<Con
         }
     }
 }
-
 
 Value Analyze::convert_sv_value(const std::shared_ptr<ast::Value> &sv_val) {
     Value val;

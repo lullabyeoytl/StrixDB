@@ -17,11 +17,11 @@ See the Mulan PSL v2 for more details. */
 #include <memory>
 #include <string>
 #include <vector>
+
 #include "defs.h"
 #include "errors.h"
-#include "system/sm_meta.h"
 #include "record/rm_defs.h"
-
+#include "system/sm_meta.h"
 
 struct TabCol {
     std::string tab_name;
@@ -30,7 +30,7 @@ struct TabCol {
     friend bool operator<(const TabCol &x, const TabCol &y) {
         return std::make_pair(x.tab_name, x.col_name) < std::make_pair(y.tab_name, y.col_name);
     }
-    
+
     inline bool equals(const TabCol &rhs) const {
         return tab_name == rhs.tab_name && col_name == rhs.col_name;
     }
@@ -48,7 +48,7 @@ inline auto find_col_meta(const std::vector<ColMeta> &cols, const TabCol &target
     auto it = std::find_if(cols.begin(), cols.end(),
                            [&](const ColMeta &col) { return col_meta_matches(col, target); });
     if (it == cols.end()) {
-        throw ColumnNotFoundError("Column not found: " + target.tab_name + "." + target.col_name);
+        throw ColumnNotFoundError(target.tab_name + "." + target.col_name);
     }
     return *it;
 }
@@ -76,14 +76,14 @@ const std::map<CompOp, CompOp> kSwapOp = {
 };
 
 struct Value {
-    ColType type;  // type of value
+    ColType type;
     union {
-        int int_val;      // int value
-        float float_val;  // float value
+        int int_val;
+        float float_val;
     };
-    std::string str_val;  // string value
+    std::string str_val;
 
-    std::shared_ptr<RmRecord> raw;  // raw record buffer
+    std::shared_ptr<RmRecord> raw;
 
     void set_int(int int_val_) {
         type = TYPE_INT;
@@ -99,7 +99,7 @@ struct Value {
         type = TYPE_STRING;
         str_val = std::move(str_val_);
     }
-    
+
     void init_raw(int len) {
         assert(raw == nullptr);
         raw = std::make_shared<RmRecord>(len);
@@ -110,7 +110,7 @@ struct Value {
             assert(len == sizeof(float));
             *(float *)(raw->data) = float_val;
         } else if (type == TYPE_STRING) {
-            if (len < (int)str_val.size()) {
+            if (len < static_cast<int>(str_val.size())) {
                 throw StringOverflowError();
             }
             memset(raw->data, 0, len);
@@ -161,19 +161,37 @@ struct Value {
     }
 };
 
+inline auto coerce_value_to_type(const Value &src, ColType target_type,
+                                 bool allow_mixed_numeric = false) -> Value {
+    Value coerced = src;
+    coerced.raw.reset();
+    if (src.type == target_type) {
+        return coerced;
+    }
+    if (target_type == TYPE_FLOAT && src.type == TYPE_INT) {
+        coerced.set_float(static_cast<float>(src.int_val));
+        return coerced;
+    }
+    if (allow_mixed_numeric && is_numeric_type(target_type) && is_numeric_type(src.type)) {
+        return coerced;
+    }
+    throw IncompatibleTypeError(coltype2str(target_type), coltype2str(src.type));
+}
+
 struct Condition {
-    TabCol lhs_col;   // left-hand side column
-    CompOp op;        // comparison operator
-    bool is_rhs_val;  // true if right-hand side is a value (not a column)
-    TabCol rhs_col;   // right-hand side column
-    Value rhs_val;    // right-hand side value
-    
+    TabCol lhs_col;
+    CompOp op;
+    bool is_rhs_val;
+    TabCol rhs_col;
+    Value rhs_val;
+
     inline auto equals(const Condition &rhs) const -> bool {
-        // 左列， 操作符， RHS种类&值
-        if (!lhs_col.equals(rhs.lhs_col) || op != rhs.op || is_rhs_val != rhs.is_rhs_val) return false;
+        if (!lhs_col.equals(rhs.lhs_col) || op != rhs.op || is_rhs_val != rhs.is_rhs_val) {
+            return false;
+        }
         if (is_rhs_val) {
             return rhs_val.equals(rhs.rhs_val);
-        } 
+        }
         return rhs_col.equals(rhs.rhs_col);
     }
 };
