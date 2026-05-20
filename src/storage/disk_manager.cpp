@@ -96,7 +96,7 @@ void DiskManager::destroy_dir(const std::string &path) {
 
 /**
  * @description: 判断指定路径文件是否存在
- * @return {bool} 若指定路径文件存在则返回true 
+ * @return {bool} 若指定路径文件存在则返回true
  * @param {string} &path 指定路径文件
  */
 bool DiskManager::is_file(const std::string &path) {
@@ -143,7 +143,7 @@ void DiskManager::destroy_file(const std::string &path) {
 
 
 /**
- * @description: 打开指定路径文件 
+ * @description: 打开指定路径文件
  * @return {int} 返回打开的文件的文件句柄
  * @param {string} &path 文件所在路径
  */
@@ -182,6 +182,17 @@ void DiskManager::close_file(int fd) {
     fd2path_.erase(fd);
 }
 
+void DiskManager::close_file(const std::string &path) {
+    if (!path2fd_.count(path)) {
+        throw FileNotOpenError(path);
+    }
+    int fd = path2fd_[path];
+    if (close(fd) < 0) {
+        throw UnixError();
+    }
+    path2fd_.erase(path);
+    fd2path_.erase(fd);
+}
 
 /**
  * @description: 获得文件的大小
