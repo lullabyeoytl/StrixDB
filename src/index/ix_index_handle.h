@@ -10,8 +10,6 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
-#include <memory>
-
 #include "ix_defs.h"
 #include "transaction/transaction.h"
 
@@ -129,9 +127,6 @@ class IxNodeHandle {
 
     int remove(const char *key);
 
-    // 精确删除：按 (key, rid) 匹配并删除，返回是否找到
-    bool remove(const char *key, const Rid &rid);
-
     /**
      * @brief used in internal node to remove the last key in root node, and return the last child
      *
@@ -176,23 +171,22 @@ class IxIndexHandle {
 
    public:
     IxIndexHandle(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager, int fd);
-    ~IxIndexHandle();
 
     // for search
     bool get_value(const char *key, std::vector<Rid> *result, Transaction *transaction);
 
-    std::pair<std::unique_ptr<IxNodeHandle>, bool> find_leaf_page(const char *key, Operation operation, Transaction *transaction,
+    std::pair<IxNodeHandle *, bool> find_leaf_page(const char *key, Operation operation, Transaction *transaction,
                                                  bool find_first = false);
 
     // for insert
     page_id_t insert_entry(const char *key, const Rid &value, Transaction *transaction);
 
-    std::unique_ptr<IxNodeHandle> split(IxNodeHandle *node);
+    IxNodeHandle *split(IxNodeHandle *node);
 
     void insert_into_parent(IxNodeHandle *old_node, const char *key, IxNodeHandle *new_node, Transaction *transaction);
 
     // for delete
-    bool delete_entry(const char *key, const Rid &rid, Transaction *transaction);
+    bool delete_entry(const char *key, Transaction *transaction);
 
     bool coalesce_or_redistribute(IxNodeHandle *node, Transaction *transaction = nullptr,
                                 bool *root_is_latched = nullptr);
@@ -211,8 +205,6 @@ class IxIndexHandle {
 
     Iid leaf_begin() const;
 
-    bool has_duplicate_keys() const;
-
    private:
     // 辅助函数
     void update_root_page_no(page_id_t root) { file_hdr_->root_page_ = root; }
@@ -220,9 +212,9 @@ class IxIndexHandle {
     bool is_empty() const { return file_hdr_->root_page_ == IX_NO_PAGE; }
 
     // for get/create node
-    std::unique_ptr<IxNodeHandle> fetch_node(int page_no) const;
+    IxNodeHandle *fetch_node(int page_no) const;
 
-    std::unique_ptr<IxNodeHandle> create_node();
+    IxNodeHandle *create_node();
 
     // for maintain data structure
     void maintain_parent(IxNodeHandle *node);
@@ -232,9 +224,6 @@ class IxIndexHandle {
     void release_node_handle(IxNodeHandle &node);
 
     void maintain_child(IxNodeHandle *node, int child_idx);
-
-    // Walk backward from `start` to the first leaf whose last key is < `key`
-    std::unique_ptr<IxNodeHandle> backtrack_leaf(std::unique_ptr<IxNodeHandle> start, const char *key);
 
     // for index test
     Rid get_rid(const Iid &iid) const;

@@ -82,13 +82,15 @@ class ScanPlan : public Plan
 class JoinPlan : public Plan
 {
     public:
-        JoinPlan(PlanTag tag, std::shared_ptr<Plan> left, std::shared_ptr<Plan> right, std::vector<Condition> conds)
+        JoinPlan(PlanTag tag, std::shared_ptr<Plan> left, std::shared_ptr<Plan> right, std::vector<Condition> conds,
+                 JoinType join_type = INNER_JOIN, bool reverse_right_scan = false)
         {
             Plan::tag = tag;
             left_ = std::move(left);
             right_ = std::move(right);
             conds_ = std::move(conds);
-            type = INNER_JOIN;
+            type = join_type;
+            reverse_right_scan_ = reverse_right_scan;
         }
         ~JoinPlan(){}
         // 左节点
@@ -97,8 +99,9 @@ class JoinPlan : public Plan
         std::shared_ptr<Plan> right_;
         // 连接条件
         std::vector<Condition> conds_;
-        // future TODO: 后续可以支持的连接类型
+        // Logical join type; output schema depends on it.
         JoinType type;
+        bool reverse_right_scan_;
 };
 
 class ProjectionPlan : public Plan

@@ -170,7 +170,10 @@ void Analyze::check_clause(const std::vector<ColMeta> &all_cols, std::vector<Con
         ColType lhs_type = lhs_col->type;
         ColType rhs_type;
         if (cond.is_rhs_val) {
-            cond.rhs_val.init_raw(lhs_col->len);
+            cond.rhs_val = coerce_value_to_type(cond.rhs_val, lhs_type, true);
+            if (cond.rhs_val.type == lhs_type) {
+                cond.rhs_val.init_raw(lhs_col->len);
+            }
             rhs_type = cond.rhs_val.type;
         } else {
             auto rhs_it = tab_cache.find(cond.rhs_col.tab_name);
@@ -181,12 +184,11 @@ void Analyze::check_clause(const std::vector<ColMeta> &all_cols, std::vector<Con
             auto rhs_col = rhs_tab.get_col(cond.rhs_col.col_name);
             rhs_type = rhs_col->type;
         }
-        if (lhs_type != rhs_type) {
+        if (!are_comparable_types(lhs_type, rhs_type)) {
             throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
         }
     }
 }
-
 
 Value Analyze::convert_sv_value(const std::shared_ptr<ast::Value> &sv_val) {
     Value val;

@@ -48,9 +48,7 @@ class UpdateExecutor : public AbstractExecutor {
         set_cols.reserve(set_clauses_.size());
         for (auto &set_clause : set_clauses_) {
             auto &col = *tab_.get_col(set_clause.lhs.col_name);
-            if (col.type != set_clause.rhs.type) {
-                throw IncompatibleTypeError(coltype2str(col.type), coltype2str(set_clause.rhs.type));
-            }
+            set_clause.rhs = coerce_value_to_type(set_clause.rhs, col.type);
             if (set_clause.rhs.raw == nullptr){
                 set_clause.rhs.init_raw(col.len);
             }
@@ -143,7 +141,7 @@ class UpdateExecutor : public AbstractExecutor {
                 auto &index = tab_.indexes[i];
                 auto old_key = std::make_unique<char[]>(index.col_tot_len);
                 index.build_key(old_key.get(), candidate.old_rec->data);
-                index_handles[i]->delete_entry(old_key.get(), candidate.rid, context_->txn_);
+                index_handles[i]->delete_entry(old_key.get(), context_->txn_);
             }
 
             fh_->update_record(candidate.rid, candidate.new_rec->data, context_);

@@ -369,17 +369,17 @@ void SmManager::create_unique_index(const std::string& tab_name, const std::vect
         // Check for duplicates before upgrading to unique
         std::string old_ix_name = ix_manager_->get_index_name(tab_name, index_cols);
         auto ih_it = ihs_.find(old_ix_name);
-        if (ih_it != ihs_.end()) {
-            // B+tree key-order walk: O(n) time, O(1) memory
-            if (ih_it->second->has_duplicate_keys()) {
-                throw UniqueViolationError(tab_name, col_names);
-            }
-        } else {
-            // Index handle not open — fall back to file scan
-            if (has_duplicate_keys(fhs_.at(tab_name).get(), precheck_meta, context)) {
-                throw UniqueViolationError(tab_name, col_names);
-            }
-        }
+        // if (ih_it != ihs_.end()) {
+        //     // B+tree key-order walk: O(n) time, O(1) memory
+        //     if (ih_it->second->has_duplicate_keys()) {
+        //         throw UniqueViolationError(tab_name, col_names);
+        //     }
+        // } else {
+        //     // Index handle not open — fall back to file scan
+        //     if (has_duplicate_keys(fhs_.at(tab_name).get(), precheck_meta, context)) {
+        //         throw UniqueViolationError(tab_name, col_names);
+        //     }
+        // }
 
         // Remove old normal index
         if (ih_it != ihs_.end()) {

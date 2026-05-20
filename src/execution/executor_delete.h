@@ -50,7 +50,7 @@ class DeleteExecutor : public AbstractExecutor {
                 auto &index = tab_.indexes[i];
                 auto key = std::make_unique<char[]>(index.col_tot_len);
                 index.build_key(key.get(), rec->data);
-                index_handles[i]->delete_entry(key.get(), rid, context_->txn_);
+                index_handles[i]->delete_entry(key.get(), context_->txn_);
             }
             fh_->delete_record(rid, context_);
         }

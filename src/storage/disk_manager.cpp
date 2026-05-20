@@ -11,60 +11,13 @@ See the Mulan PSL v2 for more details. */
 #include "storage/disk_manager.h"
 
 #include <assert.h>    // for assert
-#include <errno.h>
 #include <string.h>    // for memset
-#include <filesystem>
 #include <sys/stat.h>  // for stat
 #include <unistd.h>    // for lseek
 
 #include "defs.h"
 
-namespace {
-
-void write_all_at(int fd, const char *data, int num_bytes, off_t offset) {
-    int total_written = 0;
-    while (total_written < num_bytes) {
-        // use pwrite in case of offset moved by other threads
-        ssize_t bytes_written = pwrite(fd, data + total_written, num_bytes - total_written, offset + total_written);
-        if (bytes_written < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            throw InternalError("DiskManager::write_page Error");
-        }
-        if (bytes_written == 0) {
-            throw InternalError("DiskManager::write_page Error");
-        }
-        total_written += static_cast<int>(bytes_written);
-    }
-}
-
-int read_at(int fd, char *data, int num_bytes, off_t offset) {
-    int total_read = 0;
-    while (total_read < num_bytes) {
-        // use pread in case of offset moved by other threads
-        ssize_t bytes_read = pread(fd, data + total_read, num_bytes - total_read, offset + total_read);
-        if (bytes_read < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            throw InternalError("DiskManager::read_page Error");
-        }
-        if (bytes_read == 0) {
-            break;
-        }
-        total_read += static_cast<int>(bytes_read);
-    }
-    return total_read;
-}
-
-}  // namespace
-
-DiskManager::DiskManager() {
-    for (int i = 0; i < MAX_FD; ++i) {
-        fd2pageno_[i] = 0;
-    }
-}
+DiskManager::DiskManager() { memset(fd2pageno_, 0, MAX_FD * (sizeof(std::atomic<page_id_t>) / sizeof(char))); }
 
 /**
  * @description: 将数据写入文件的指定磁盘页面中
@@ -75,7 +28,13 @@ DiskManager::DiskManager() {
  */
 void DiskManager::write_page(int fd, page_id_t page_no, const char *offset, int num_bytes) {
     const off_t page_offset = static_cast<off_t>(page_no) * PAGE_SIZE;
-    write_all_at(fd, offset, num_bytes, page_offset);
+    if (lseek(fd, page_offset, SEEK_SET) == -1) {
+        throw InternalError("DiskManager::write_page Error");
+    }
+    const ssize_t bytes_write = write(fd, offset, num_bytes);
+    if (bytes_write != num_bytes) {
+        throw InternalError("DiskManager::write_page Error");
+    }
 }
 
 /**
@@ -90,7 +49,13 @@ void DiskManager::read_page(int fd, page_id_t page_no, char *offset, int num_byt
     // 2.调用read()函数
     // 注意read返回值与num_bytes不等时，throw InternalError("DiskManager::read_page Error");
     const off_t page_offset = static_cast<off_t>(page_no) * PAGE_SIZE;
-    const int bytes_read = read_at(fd, offset, num_bytes, page_offset);
+    if (lseek(fd, page_offset, SEEK_SET) == -1) {
+        throw InternalError("DiskManager::read_page Error");
+    }
+    const ssize_t bytes_read = read(fd, offset, num_bytes);
+    if (bytes_read < 0) {
+        throw InternalError("DiskManager::read_page Error");
+    }
     if (bytes_read <= num_bytes) {
         memset(offset + bytes_read, 0, num_bytes - bytes_read);
     }
@@ -115,17 +80,16 @@ bool DiskManager::is_dir(const std::string& path) {
 }
 
 void DiskManager::create_dir(const std::string &path) {
-    try {
-        std::filesystem::create_directories(path);
-    } catch (const std::filesystem::filesystem_error &) {
+    // Create a subdirectory
+    std::string cmd = "mkdir " + path;
+    if (system(cmd.c_str()) < 0) {  // 创建一个名为path的目录
         throw UnixError();
     }
 }
 
 void DiskManager::destroy_dir(const std::string &path) {
-    try {
-        std::filesystem::remove_all(path);
-    } catch (const std::filesystem::filesystem_error &) {
+    std::string cmd = "rm -r " + path;
+    if (system(cmd.c_str()) < 0) {
         throw UnixError();
     }
 }
@@ -189,22 +153,15 @@ int DiskManager::open_file(const std::string &path) {
     if (!is_file(path)) {
         throw FileNotFoundError(path);
     }
-    {
-        std::lock_guard<std::mutex> lock(latch_);
-        auto it = path2fd_.find(path);
-        if (it != path2fd_.end()) {
-            fd2ref_count_[it->second]++;
-            return it->second;
-        }
+    if (path2fd_.count(path)) {
+        return path2fd_[path];
     }
     int fd = open(path.c_str(), O_RDWR);
     if (fd < 0) {
         throw UnixError();
     }
-    std::lock_guard<std::mutex> lock(latch_);
     path2fd_[path] = fd;
     fd2path_[fd] = path;
-    fd2ref_count_[fd] = 1;
     return fd;
 }
 
@@ -213,35 +170,29 @@ int DiskManager::open_file(const std::string &path) {
  * @param {int} fd 打开的文件的文件句柄
  */
 void DiskManager::close_file(int fd) {
-    std::string path;
-    bool should_close = false;
-    {
-        std::lock_guard<std::mutex> lock(latch_);
-        auto path_it = fd2path_.find(fd);
-        if (path_it == fd2path_.end()) {
-            throw FileNotOpenError(fd);
-        }
-
-        auto ref_it = fd2ref_count_.find(fd);
-        assert(ref_it != fd2ref_count_.end());
-        ref_it->second--;
-        if (ref_it->second > 0) {
-            return;
-        }
-
-        path = path_it->second;
-        path2fd_.erase(path);
-        fd2path_.erase(path_it);
-        fd2ref_count_.erase(ref_it);
-        fd2pageno_[fd] = 0;
-        should_close = true;
+    // 调用close()函数
+    // 注意不能关闭未打开的文件，并且需要更新文件打开列表
+    if (!fd2path_.count(fd)) {
+        throw FileNotOpenError(fd);
     }
-
-    if (should_close && close(fd) < 0) {
+    if (close(fd) < 0) {
         throw UnixError();
     }
+    path2fd_.erase(fd2path_[fd]);
+    fd2path_.erase(fd);
 }
 
+void DiskManager::close_file(const std::string &path) {
+    if (!path2fd_.count(path)) {
+        throw FileNotOpenError(path);
+    }
+    int fd = path2fd_[path];
+    if (close(fd) < 0) {
+        throw UnixError();
+    }
+    path2fd_.erase(path);
+    fd2path_.erase(fd);
+}
 
 /**
  * @description: 获得文件的大小
@@ -260,12 +211,10 @@ int DiskManager::get_file_size(const std::string &file_name) {
  * @param {int} fd 文件句柄
  */
 std::string DiskManager::get_file_name(int fd) {
-    std::lock_guard<std::mutex> lock(latch_);
-    auto it = fd2path_.find(fd);
-    if (it == fd2path_.end()) {
+    if (!fd2path_.count(fd)) {
         throw FileNotOpenError(fd);
     }
-    return it->second;
+    return fd2path_[fd];
 }
 
 /**
@@ -274,19 +223,10 @@ std::string DiskManager::get_file_name(int fd) {
  * @param {string} &file_name 文件名
  */
 int DiskManager::get_file_fd(const std::string &file_name) {
-    {
-        std::lock_guard<std::mutex> lock(latch_);
-        auto it = path2fd_.find(file_name);
-        if (it != path2fd_.end()) {
-            return it->second;
-        }
+    if (!path2fd_.count(file_name)) {
+        return open_file(file_name);
     }
-    return open_file(file_name);
-}
-
-bool DiskManager::is_file_open(const std::string &file_name) {
-    std::lock_guard<std::mutex> lock(latch_);
-    return path2fd_.count(file_name) > 0;
+    return path2fd_[file_name];
 }
 
 
@@ -298,7 +238,6 @@ bool DiskManager::is_file_open(const std::string &file_name) {
  * @param {int} offset 读取的内容在文件中的位置
  */
 int DiskManager::read_log(char *log_data, int size, int offset) {
-    std::lock_guard<std::mutex> log_lock(log_latch_);
     // read log file from the previous end
     if (log_fd_ == -1) {
         log_fd_ = open_file(LOG_FILE_NAME);
@@ -310,7 +249,10 @@ int DiskManager::read_log(char *log_data, int size, int offset) {
 
     size = std::min(size, file_size - offset);
     if(size == 0) return 0;
-    return read_at(log_fd_, log_data, size, offset);
+    lseek(log_fd_, offset, SEEK_SET);
+    ssize_t bytes_read = read(log_fd_, log_data, size);
+    assert(bytes_read == size);
+    return bytes_read;
 }
 
 
@@ -320,12 +262,14 @@ int DiskManager::read_log(char *log_data, int size, int offset) {
  * @param {int} size 要写入的内容大小
  */
 void DiskManager::write_log(char *log_data, int size) {
-    std::lock_guard<std::mutex> log_lock(log_latch_);
     if (log_fd_ == -1) {
         log_fd_ = open_file(LOG_FILE_NAME);
     }
 
     // write from the file_end
-    const int file_size = get_file_size(LOG_FILE_NAME);
-    write_all_at(log_fd_, log_data, size, file_size);
+    lseek(log_fd_, 0, SEEK_END);
+    ssize_t bytes_write = write(log_fd_, log_data, size);
+    if (bytes_write != size) {
+        throw UnixError();
+    }
 }
