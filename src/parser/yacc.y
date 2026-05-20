@@ -143,7 +143,7 @@ ddl:
     }
     |   CREATE INDEX tbName '(' colNameList ')'
     {
-        $$ = std::make_shared<CreateIndex>($3, $5, false);
+        $$ = std::make_shared<CreateIndex>($3, $5, true);
     }
     |   CREATE UNIQUE INDEX tbName '(' colNameList ')'
     {

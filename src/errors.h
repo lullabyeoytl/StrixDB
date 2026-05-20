@@ -53,6 +53,7 @@ class UnixError : public RMDBError {
 class FileNotOpenError : public RMDBError {
    public:
     FileNotOpenError(int fd) : RMDBError("Invalid file descriptor: " + std::to_string(fd)) {}
+    FileNotOpenError(const std::string &path) : RMDBError("File not open: " + path) {}
 };
 
 class FileNotClosedError : public RMDBError {

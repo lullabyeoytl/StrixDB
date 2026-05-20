@@ -214,7 +214,7 @@ class DDLPlan : public Plan
 {
     public:
         DDLPlan(PlanTag tag, std::string tab_name, std::vector<std::string> col_names,
-                std::vector<ColDef> cols, std::vector<IndexSpec> index_specs = {}, bool unique = false)
+                std::vector<ColDef> cols, std::vector<IndexSpec> index_specs = {}, bool unique = true)
         {
             Plan::tag = tag;
             tab_name_ = std::move(tab_name);

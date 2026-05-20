@@ -115,7 +115,7 @@ void SmManager::open_db(const std::string& db_name) {
             ihs_.emplace(ix_name, ix_manager_->open_index(entry.first, index.cols));
         }
     }
-}   
+}
 
 /**
  * @description: 把数据库相关的元数据刷入磁盘中
@@ -147,7 +147,7 @@ void SmManager::close_db() {
 
 /**
  * @description: 显示所有的表,通过测试需要将其结果写入到output.txt,详情看题目文档
- * @param {Context*} context 
+ * @param {Context*} context
  */
 void SmManager::show_tables(Context* context) {
     std::fstream outfile;
@@ -172,19 +172,10 @@ void SmManager::show_index(const std::string& tab_name, Context* context) {
     }
     TabMeta &tab = db_.get_table(tab_name);
 
-    std::vector<std::string> captions = {"Index", "Columns", "Unique"};
-    RecordPrinter printer(captions.size());
-
-    printer.print_separator(context);
-    printer.print_record(captions, context);
-    printer.print_separator(context);
-
     std::fstream outfile;
     outfile.open("output.txt", std::ios::out | std::ios::app);
-    outfile << "| Index | Columns | Unique |\n";
 
     for (auto &index : tab.indexes) {
-        std::string ix_name = ix_manager_->get_index_name(tab_name, index.cols);
         std::string cols;
         for (size_t i = 0; i < index.cols.size(); ++i) {
             if (i != 0) {
@@ -192,19 +183,24 @@ void SmManager::show_index(const std::string& tab_name, Context* context) {
             }
             cols += index.cols[i].name;
         }
-        std::string unique = index.unique ? "YES" : "NO";
-        printer.print_record({ix_name, cols, unique}, context);
-        outfile << "| " << ix_name << " | " << cols << " | " << unique << " |\n";
+        std::string unique = index.unique ? "unique" : "normal";
+        std::string line = "| " + tab_name + " | " + unique + " | (" + cols + ") |\n";
+        if (context->ellipsis_ == false && *context->offset_ + line.length() < BUFFER_LENGTH) {
+            memcpy(context->data_send_ + *(context->offset_), line.c_str(), line.length());
+            *(context->offset_) += line.length();
+        } else {
+            context->ellipsis_ = true;
+        }
+        outfile << line;
     }
 
-    printer.print_separator(context);
     outfile.close();
 }
 
 /**
  * @description: 显示表的元数据
  * @param {string&} tab_name 表名称
- * @param {Context*} context 
+ * @param {Context*} context
  */
 void SmManager::desc_table(const std::string& tab_name, Context* context) {
     TabMeta &tab = db_.get_table(tab_name);
@@ -228,7 +224,7 @@ void SmManager::desc_table(const std::string& tab_name, Context* context) {
  * @description: 创建表
  * @param {string&} tab_name 表的名称
  * @param {vector<ColDef>&} col_defs 表的字段
- * @param {Context*} context 
+ * @param {Context*} context
  */
 void SmManager::create_table(const std::string& tab_name, const std::vector<ColDef>& col_defs, Context* context) {
     if (db_.is_table(tab_name)) {

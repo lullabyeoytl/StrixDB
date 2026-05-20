@@ -46,6 +46,11 @@ int main() {
         YY_BUFFER_STATE buf = yy_scan_string(sql.c_str());
         assert(yyparse() == 0);
         if (ast::parse_tree != nullptr) {
+            if (sql == "create index tb(a);") {
+                auto create_index = std::dynamic_pointer_cast<ast::CreateIndex>(ast::parse_tree);
+                assert(create_index != nullptr);
+                assert(create_index->unique);
+            }
             ast::TreePrinter::print(ast::parse_tree);
             yy_delete_buffer(buf);
             std::cout << std::endl;
