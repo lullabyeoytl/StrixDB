@@ -1,6 +1,8 @@
 # Build directories
 build/
 cmake-build-*/
+.trae/
+BufferPoolManagerTest_db/
 
 # CMake generated files
 CMakeCache.txt
@@ -28,6 +30,11 @@ Makefile
 *.swp
 *.swo
 *~
+*~origin_master
+
+# Parser generated files (bison/flex output)
+src/parser/yacc.tab.*
+src/parser/lex.yy.*
 
 # Vendored deps: keep sources, ignore generated files inside them
 deps/googletest/install_manifest.txt
@@ -37,3 +44,5 @@ deps/googletest/**/CMakeCache.txt
 deps/googletest/**/CTestTestfile.cmake
 deps/googletest/**/cmake_install.cmake
 deps/googletest/**/Makefile
+
+/demo
