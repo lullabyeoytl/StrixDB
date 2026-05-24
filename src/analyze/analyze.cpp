@@ -72,13 +72,20 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
     std::shared_ptr<Query> query = std::make_shared<Query>();
     if (auto x = std::dynamic_pointer_cast<ast::SelectStmt>(parse))
     {
-        // 处理表名
-        query->tables = std::move(x->tabs);
-        /** TODO: 检查表是否存在 */
-        for (auto &tab_name : query->tables) {
-            if (!sm_manager_->db_.is_table(tab_name)) {
-                throw TableNotFoundError(tab_name);
+        // Keep one binding per FROM item so aliases remain distinct relation instances.
+        for (const auto &table_ref : x->table_refs) {
+            if (!sm_manager_->db_.is_table(table_ref->table_name)) {
+                throw TableNotFoundError(table_ref->table_name);
             }
+            auto exposed_name = table_ref->exposed_name();
+            auto duplicate = std::find_if(query->from_bindings.begin(), query->from_bindings.end(),
+                                          [&](const TableBinding &binding) {
+                                              return binding.exposed_name == exposed_name;
+                                          });
+            if (duplicate != query->from_bindings.end()) {
+                throw RMDBError("Duplicate table name or alias: " + exposed_name);
+            }
+            query->from_bindings.push_back(TableBinding{table_ref->table_name, exposed_name});
         }
         for (auto &sv_select_item : x->select_items) {
             auto &sv_sel_expr = sv_select_item->expr;
@@ -94,18 +101,26 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         }
 
         std::vector<ColMeta> all_cols;
-        get_all_cols(query->tables, all_cols);
-        std::vector<std::string> visible_tables = query->tables;
+        get_all_cols(query->from_bindings, all_cols);
+        auto visible_bindings = query->from_bindings;
         bool all_semi_joins = !x->jointree.empty() &&
                               std::all_of(x->jointree.begin(), x->jointree.end(),
                                           [](const std::shared_ptr<ast::JoinExpr> &join_expr) {
                                               return join_expr->type == SEMI_JOIN;
                                           });
         if (all_semi_joins) {
-            visible_tables = {x->jointree.front()->left};
+            auto left_name = x->jointree.front()->left;
+            auto it = std::find_if(query->from_bindings.begin(), query->from_bindings.end(),
+                                   [&](const TableBinding &binding) {
+                                       return binding.exposed_name == left_name;
+                                   });
+            if (it == query->from_bindings.end()) {
+                throw TableNotFoundError(left_name);
+            }
+            visible_bindings = {*it};
         }
         std::vector<ColMeta> visible_cols;
-        get_all_cols(visible_tables, visible_cols);
+        get_all_cols(visible_bindings, visible_cols);
         if (x->select_items.empty()) {
             // select all columns
             for (auto &col : visible_cols) {
@@ -117,7 +132,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         } else {
             // infer table name from column name
             for (auto &sel_col : query->cols) {
-                check_column(visible_cols, sel_col);  // 列元数据校验
+                check_column(visible_cols, sel_col, visible_bindings);  // 列元数据校验
             }
             query->select_items.clear();
             query->output_names.clear();
@@ -139,13 +154,13 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         }
         for (auto &agg : query->agg_infos) {
             if (!agg.is_star) {
-                check_column(visible_cols, agg.col);
+                check_column(visible_cols, agg.col, visible_bindings);
             }
         }
         if (x->has_group_by) {
             for (auto &sv_group_col : x->group_by->cols) {
                 TabCol group_col = {.tab_name = sv_group_col->tab_name, .col_name = sv_group_col->col_name};
-                check_column(visible_cols, group_col);
+                check_column(visible_cols, group_col, visible_bindings);
                 query->group_by_cols.push_back(group_col);
             }
         }
@@ -156,14 +171,14 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
                     case OrderExprKind::Column: {
                         auto sv_order_col = std::static_pointer_cast<ast::Col>(sv_order_item->expr);
                         order_col = {.tab_name = sv_order_col->tab_name, .col_name = sv_order_col->col_name};
-                        check_column(visible_cols, order_col);
+                        check_column(visible_cols, order_col, visible_bindings);
                         break;
                     }
                     case OrderExprKind::Aggregate: {
                         auto sv_order_agg = std::static_pointer_cast<ast::AggFunc>(sv_order_item->expr);
                         auto agg = convert_agg_func(sv_order_agg);
                         if (!agg.is_star) {
-                            check_column(visible_cols, agg.col);
+                            check_column(visible_cols, agg.col, visible_bindings);
                         }
                         append_unique_agg(query->agg_infos, agg);
                         order_col = {.tab_name = std::string(), .col_name = agg_output_name(agg)};
@@ -184,12 +199,12 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
             if (sv_having->is_agg) {
                 having_cond.agg = convert_agg_func(sv_having->agg);
                 if (!having_cond.agg.is_star) {
-                    check_column(visible_cols, having_cond.agg.col);
+                    check_column(visible_cols, having_cond.agg.col, visible_bindings);
                 }
                 append_unique_agg(query->agg_infos, having_cond.agg);
             } else {
                 having_cond.col = {.tab_name = sv_having->col->tab_name, .col_name = sv_having->col->col_name};
-                check_column(visible_cols, having_cond.col);
+                check_column(visible_cols, having_cond.col, visible_bindings);
             }
             auto rhs_val = std::dynamic_pointer_cast<ast::Value>(sv_having->rhs);
             if (rhs_val == nullptr) {
@@ -201,12 +216,14 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         check_aggregate(visible_cols, *query);
         if (!x->jointree.empty()) {
             for (auto &sv_join : x->jointree) {
-                normalize_sv_conds(sv_join->conds, all_cols);
+                sv_join->left = resolve_exposed_name(query->from_bindings, sv_join->left);
+                sv_join->right = resolve_exposed_name(query->from_bindings, sv_join->right);
+                normalize_sv_conds(sv_join->conds, all_cols, query->from_bindings);
             }
         }
         //处理where条件
         get_clause(x->conds, query->conds);
-        check_clause(all_cols, query->conds);
+        check_clause(all_cols, query->conds, query->from_bindings);
     } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(parse)) {
         // 检查表是否存在
         if (!sm_manager_->db_.is_table(x->tab_name)) {
@@ -221,7 +238,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         }
         // 校验 SET 中的列存在性并推断表名
         std::vector<ColMeta> upd_cols;
-        get_all_cols({x->tab_name}, upd_cols);
+        get_all_cols({TableBinding{x->tab_name, x->tab_name}}, upd_cols);
         for (auto &set_clause : query->set_clauses) {
             check_column(upd_cols, set_clause.lhs);
         }
@@ -233,7 +250,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         //处理where条件
         get_clause(x->conds, query->conds);
         std::vector<ColMeta> del_cols;
-        get_all_cols({x->tab_name}, del_cols);
+        get_all_cols({TableBinding{x->tab_name, x->tab_name}}, del_cols);
         check_clause(del_cols, query->conds);
     } else if (auto x = std::dynamic_pointer_cast<ast::InsertStmt>(parse)) {
         // 处理insert 的values值
@@ -248,7 +265,8 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
 }
 
 
-void Analyze::check_column(const std::vector<ColMeta> &all_cols, TabCol &target) {
+void Analyze::check_column(const std::vector<ColMeta> &all_cols, TabCol &target,
+                           const std::vector<TableBinding> &bindings) {
     if (target.tab_name.empty()) {
         // Table name not specified, infer table name from column name
         std::string tab_name;
@@ -265,6 +283,9 @@ void Analyze::check_column(const std::vector<ColMeta> &all_cols, TabCol &target)
         }
         target.tab_name = std::move(tab_name);
     } else {
+        if (!bindings.empty()) {
+            target.tab_name = resolve_exposed_name(bindings, target.tab_name);
+        }
         try {
             find_col_meta(all_cols, target);
         } catch (const RMDBError &e) {
@@ -273,16 +294,19 @@ void Analyze::check_column(const std::vector<ColMeta> &all_cols, TabCol &target)
     }
 }
 
-void Analyze::get_all_cols(const std::vector<std::string> &tab_names, std::vector<ColMeta> &all_cols) {
+void Analyze::get_all_cols(const std::vector<TableBinding> &bindings, std::vector<ColMeta> &all_cols) {
     size_t total = 0;
-    for (auto &name : tab_names) {
-        total += sm_manager_->db_.get_table(name).cols.size();
+    for (const auto &binding : bindings) {
+        total += sm_manager_->db_.get_table(binding.table_name).cols.size();
     }
     all_cols.reserve(all_cols.size() + total);
-    for (auto &sel_tab_name : tab_names) {
-        // 这里db_不能写成get_db(), 注意要传指针
-        const auto &sel_tab_cols = sm_manager_->db_.get_table(sel_tab_name).cols;
-        all_cols.insert(all_cols.end(), sel_tab_cols.begin(), sel_tab_cols.end());
+    for (const auto &binding : bindings) {
+        //这里db_不能写成get_db(), 注意要传指针
+        const auto &sel_tab_cols = sm_manager_->db_.get_table(binding.table_name).cols;
+        for (auto col : sel_tab_cols) {
+            col.tab_name = binding.exposed_name;
+            all_cols.push_back(std::move(col));
+        }
     }
 }
 
@@ -303,10 +327,11 @@ void Analyze::get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv
     }
 }
 
-void Analyze::normalize_sv_conds(std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds, const std::vector<ColMeta> &all_cols) {
+void Analyze::normalize_sv_conds(std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds, const std::vector<ColMeta> &all_cols,
+                                 const std::vector<TableBinding> &bindings) {
     std::vector<Condition> conds;
     get_clause(sv_conds, conds);
-    check_clause(all_cols, conds);
+    check_clause(all_cols, conds, bindings);
     for (size_t i = 0; i < sv_conds.size(); ++i) {
         sv_conds[i]->lhs->tab_name = conds[i].lhs_col.tab_name;
         if (!conds[i].is_rhs_val) {
@@ -318,18 +343,29 @@ void Analyze::normalize_sv_conds(std::vector<std::shared_ptr<ast::BinaryExpr>> &
     }
 }
 
-void Analyze::check_clause(const std::vector<ColMeta> &all_cols, std::vector<Condition> &conds) {
+void Analyze::check_clause(const std::vector<ColMeta> &all_cols, std::vector<Condition> &conds,
+                           const std::vector<TableBinding> &bindings) {
     std::map<std::string, TabMeta> tab_cache;
+    auto resolve_base_table_name = [&](const std::string &exposed_name) -> const std::string & {
+        auto it = std::find_if(bindings.begin(), bindings.end(), [&](const TableBinding &binding) {
+            return binding.exposed_name == exposed_name;
+        });
+        if (it != bindings.end()) {
+            return it->table_name;
+        }
+        return exposed_name;
+    };
     // Get raw values in where clause
     for (auto &cond : conds) {
         // Infer table name from column name
-        check_column(all_cols, cond.lhs_col);
+        check_column(all_cols, cond.lhs_col, bindings);
         if (!cond.is_rhs_val) {
-            check_column(all_cols, cond.rhs_col);
+            check_column(all_cols, cond.rhs_col, bindings);
         }
         auto tab_it = tab_cache.find(cond.lhs_col.tab_name);
         if (tab_it == tab_cache.end()) {
-            tab_it = tab_cache.emplace(cond.lhs_col.tab_name, sm_manager_->db_.get_table(cond.lhs_col.tab_name)).first;
+            tab_it = tab_cache.emplace(cond.lhs_col.tab_name,
+                                       sm_manager_->db_.get_table(resolve_base_table_name(cond.lhs_col.tab_name))).first;
         }
         TabMeta &lhs_tab = tab_it->second;
         auto lhs_col = lhs_tab.get_col(cond.lhs_col.col_name);
@@ -344,7 +380,8 @@ void Analyze::check_clause(const std::vector<ColMeta> &all_cols, std::vector<Con
         } else {
             auto rhs_it = tab_cache.find(cond.rhs_col.tab_name);
             if (rhs_it == tab_cache.end()) {
-                rhs_it = tab_cache.emplace(cond.rhs_col.tab_name, sm_manager_->db_.get_table(cond.rhs_col.tab_name)).first;
+                rhs_it = tab_cache.emplace(cond.rhs_col.tab_name,
+                                           sm_manager_->db_.get_table(resolve_base_table_name(cond.rhs_col.tab_name))).first;
             }
             TabMeta &rhs_tab = rhs_it->second;
             auto rhs_col = rhs_tab.get_col(cond.rhs_col.col_name);
@@ -461,4 +498,21 @@ void Analyze::check_aggregate(const std::vector<ColMeta> &all_cols, Query &query
             throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(having_cond.rhs_val.type));
         }
     }
+}
+
+std::string Analyze::resolve_exposed_name(const std::vector<TableBinding> &bindings, const std::string &name) const {
+    auto alias_it = std::find_if(bindings.begin(), bindings.end(), [&](const TableBinding &binding) {
+        return binding.exposed_name == name;
+    });
+    if (alias_it != bindings.end()) {
+        return alias_it->exposed_name;
+    }
+
+    auto real_it = std::find_if(bindings.begin(), bindings.end(), [&](const TableBinding &binding) {
+        return binding.table_name == name && binding.exposed_name == binding.table_name;
+    });
+    if (real_it != bindings.end()) {
+        return real_it->exposed_name;
+    }
+    throw TableNotFoundError(name);
 }

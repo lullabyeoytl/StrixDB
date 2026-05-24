@@ -21,6 +21,15 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm.h"
 #include "common/common.h"
 
+struct TableBinding {
+    std::string table_name;
+    std::string exposed_name;
+
+    inline auto exposes(const std::string &name) const -> bool {
+        return exposed_name == name;
+    }
+};
+
 class Query{
     public:
     std::shared_ptr<ast::TreeNode> parse;
@@ -28,8 +37,8 @@ class Query{
     std::vector<Condition> conds;
     // 投影列
     std::vector<TabCol> cols;
-    // 表名
-    std::vector<std::string> tables;
+    // SELECT relation instances visible in the query scope.
+    std::vector<TableBinding> from_bindings;
     // update 的set 值
     std::vector<SetClause> set_clauses;
     //insert 的values值
@@ -59,15 +68,19 @@ public:
     std::shared_ptr<Query> do_analyze(std::shared_ptr<ast::TreeNode> root);
 
 private:
-    void check_column(const std::vector<ColMeta> &all_cols, TabCol &target);
-    void get_all_cols(const std::vector<std::string> &tab_names, std::vector<ColMeta> &all_cols);
+    void check_column(const std::vector<ColMeta> &all_cols, TabCol &target,
+                      const std::vector<TableBinding> &bindings = {});
+    void get_all_cols(const std::vector<TableBinding> &bindings, std::vector<ColMeta> &all_cols);
     void get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds, std::vector<Condition> &conds);
-    void normalize_sv_conds(std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds, const std::vector<ColMeta> &all_cols);
+    void normalize_sv_conds(std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds, const std::vector<ColMeta> &all_cols,
+                            const std::vector<TableBinding> &bindings = {});
     // 直接传入已经构造好的all_cols防止重复获取
-    void check_clause(const std::vector<ColMeta> &all_cols, std::vector<Condition> &conds);
+    void check_clause(const std::vector<ColMeta> &all_cols, std::vector<Condition> &conds,
+                      const std::vector<TableBinding> &bindings = {});
     Value convert_sv_value(const std::shared_ptr<ast::Value> &sv_val);
     CompOp convert_sv_comp_op(ast::SvCompOp op);
     ColType get_column_type(const std::vector<ColMeta> &all_cols, const TabCol &target);
     ColType agg_result_type(const AggInfo &agg, const std::vector<ColMeta> &all_cols);
     void check_aggregate(const std::vector<ColMeta> &all_cols, Query &query);
+    std::string resolve_exposed_name(const std::vector<TableBinding> &bindings, const std::string &name) const;
 };

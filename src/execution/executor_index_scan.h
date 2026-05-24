@@ -44,6 +44,7 @@ class IndexScanExecutor : public AbstractExecutor {
     };
 
     std::string tab_name_;                      // 表名称
+    std::string exposed_name_;
     TabMeta tab_;                               // 表的元数据
     std::vector<Condition> index_lookup_conds_; // 索引查找条件
     std::vector<Condition> residual_conds_;     // 索引扫描后的剩余过滤条件
@@ -265,10 +266,11 @@ class IndexScanExecutor : public AbstractExecutor {
    public:
     IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> index_lookup_conds,
                       std::vector<Condition> residual_conds, std::vector<std::string> index_col_names,
-                      std::optional<IndexMeta> index_meta, Context *context) {
+                      std::optional<IndexMeta> index_meta, std::string exposed_name, Context *context) {
         sm_manager_ = sm_manager;
         context_ = context;
         tab_name_ = std::move(tab_name);
+        exposed_name_ = std::move(exposed_name);
         tab_ = sm_manager_->db_.get_table(tab_name_);
         index_lookup_conds_ = std::move(index_lookup_conds);
         residual_conds_ = std::move(residual_conds);
@@ -280,10 +282,13 @@ class IndexScanExecutor : public AbstractExecutor {
         }
         fh_ = sm_manager_->fhs_.at(tab_name_).get();
         cols_ = tab_.cols;
+        for (auto &col : cols_) {
+            col.tab_name = exposed_name_;
+        }
         len_ = cols_.back().offset + cols_.back().len;
 
-        normalize_conds(index_lookup_conds_, tab_name_);
-        normalize_conds(residual_conds_, tab_name_);
+        normalize_conds(index_lookup_conds_, exposed_name_);
+        normalize_conds(residual_conds_, exposed_name_);
         prepare_lookup_values();
         if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
             context_->lock_mgr_->lock_IS_on_table(context_->txn_, fh_->GetFd());

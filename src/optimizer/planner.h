@@ -39,7 +39,7 @@ class Planner {
 
 
     std::shared_ptr<Plan> do_planner(std::shared_ptr<Query> query, Context *context);
-    std::vector<TabCol> collect_scan_required_cols(const Query &query, const std::string &tab_name) const;
+    std::vector<TabCol> collect_scan_required_cols(const Query &query, const std::string &exposed_name) const;
     std::vector<TabCol> collect_dml_required_cols(const Query &query, const std::string &tab_name) const;
 
     void set_enable_nestedloop_join(bool set_val) { enable_nestedloop_join = set_val; }
@@ -64,10 +64,10 @@ class Planner {
 
 
     // int get_indexNo(std::string tab_name, std::vector<Condition> curr_conds);
-    std::shared_ptr<ScanPlan> make_scan_plan(const std::string &tab_name, std::vector<Condition> conds,
+    std::shared_ptr<ScanPlan> make_scan_plan(const TableBinding &binding, std::vector<Condition> conds,
                                              std::vector<TabCol> required_cols = {});
 
-    ColMeta lookup_col_meta(const TabCol &col) const;
+    ColMeta lookup_col_meta(const Query &query, const TabCol &col) const;
 
     size_t estimate_input_rows(const std::shared_ptr<Plan> &plan) const;
 

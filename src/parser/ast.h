@@ -197,6 +197,21 @@ struct SetClause : public TreeNode {
             col_name(std::move(col_name_)), val(std::move(val_)) {}
 };
 
+struct TableRef : public TreeNode {
+    std::string table_name;
+    bool has_alias = false;
+    std::string alias;
+
+    explicit TableRef(std::string table_name_) : table_name(std::move(table_name_)) {}
+
+    TableRef(std::string table_name_, std::string alias_) :
+            table_name(std::move(table_name_)), has_alias(true), alias(std::move(alias_)) {}
+
+    auto exposed_name() const -> const std::string & {
+        return has_alias ? alias : table_name;
+    }
+};
+
 struct BinaryExpr : public TreeNode {
     std::shared_ptr<Col> lhs;
     SvCompOp op;
@@ -280,17 +295,19 @@ struct UpdateStmt : public TreeNode {
 struct JoinExpr : public TreeNode {
     std::string left;
     std::string right;
+    std::shared_ptr<TableRef> right_table_ref;
     std::vector<std::shared_ptr<BinaryExpr>> conds;
     JoinType type;
 
-    JoinExpr(std::string left_, std::string right_,
-               std::vector<std::shared_ptr<BinaryExpr>> conds_, JoinType type_) :
-            left(std::move(left_)), right(std::move(right_)), conds(std::move(conds_)), type(type_) {}
+    JoinExpr(std::string left_, std::shared_ptr<TableRef> right_table_ref_,
+             std::vector<std::shared_ptr<BinaryExpr>> conds_, JoinType type_) :
+            left(std::move(left_)), right(right_table_ref_->exposed_name()),
+            right_table_ref(std::move(right_table_ref_)), conds(std::move(conds_)), type(type_) {}
 };
 
 struct SelectStmt : public TreeNode {
     std::vector<std::shared_ptr<SelectItem>> select_items;
-    std::vector<std::string> tabs;
+    std::vector<std::shared_ptr<TableRef>> table_refs;
     std::vector<std::shared_ptr<BinaryExpr>> conds;
     std::vector<std::shared_ptr<JoinExpr>> jointree;
 
@@ -307,13 +324,13 @@ struct SelectStmt : public TreeNode {
     std::shared_ptr<LimitClause> limit_clause;
 
     SelectStmt(std::vector<std::shared_ptr<SelectItem>> select_items_,
-               std::vector<std::string> tabs_,
+               std::vector<std::shared_ptr<TableRef>> table_refs_,
                std::vector<std::shared_ptr<BinaryExpr>> conds_,
                std::shared_ptr<OrderBy> order_,
                std::shared_ptr<GroupBy> group_by_,
                std::vector<std::shared_ptr<HavingCond>> having_conds_,
                std::shared_ptr<LimitClause> limit_clause_) :
-            select_items(std::move(select_items_)), tabs(std::move(tabs_)), conds(std::move(conds_)),
+            select_items(std::move(select_items_)), table_refs(std::move(table_refs_)), conds(std::move(conds_)),
             order(std::move(order_)), group_by(std::move(group_by_)), having_conds(std::move(having_conds_)),
             limit_clause(std::move(limit_clause_)) {
                 has_sort = (bool)order;
@@ -323,14 +340,14 @@ struct SelectStmt : public TreeNode {
             }
 
     SelectStmt(std::vector<std::shared_ptr<SelectItem>> select_items_,
-               std::vector<std::string> tabs_,
+               std::vector<std::shared_ptr<TableRef>> table_refs_,
                std::vector<std::shared_ptr<BinaryExpr>> conds_,
                std::vector<std::shared_ptr<JoinExpr>> jointree_,
                std::shared_ptr<OrderBy> order_,
                std::shared_ptr<GroupBy> group_by_,
                std::vector<std::shared_ptr<HavingCond>> having_conds_,
                std::shared_ptr<LimitClause> limit_clause_) :
-            select_items(std::move(select_items_)), tabs(std::move(tabs_)), conds(std::move(conds_)),
+            select_items(std::move(select_items_)), table_refs(std::move(table_refs_)), conds(std::move(conds_)),
             jointree(std::move(jointree_)),
             order(std::move(order_)), group_by(std::move(group_by_)), having_conds(std::move(having_conds_)),
             limit_clause(std::move(limit_clause_)) {
@@ -384,6 +401,9 @@ struct SemValue {
 
     std::shared_ptr<BinaryExpr> sv_cond;
     std::vector<std::shared_ptr<BinaryExpr>> sv_conds;
+
+    std::shared_ptr<TableRef> sv_table_ref;
+    std::vector<std::shared_ptr<TableRef>> sv_table_refs;
 
     std::shared_ptr<JoinExpr> sv_join_expr;
     std::vector<std::shared_ptr<JoinExpr>> sv_join_exprs;

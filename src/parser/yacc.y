@@ -55,7 +55,9 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT DATETIME INDEX UNIQUE AND ON SEMI JOIN EX
 %type <sv_val> value
 %type <sv_vals> valueList
 %type <sv_str> tbName colName
-%type <sv_strs> tableList colNameList
+%type <sv_strs> colNameList
+%type <sv_table_ref> tableRef
+%type <sv_table_refs> tableList
 %type <sv_join_exprs> joinClauseList
 %type <sv_join_type> joinType
 %type <sv_col> col
@@ -188,13 +190,13 @@ dml:
     {
         $$ = std::make_shared<SelectStmt>($2, $4, $5, $8, $6, $7, $9);
     }
-    |   SELECT selector FROM tbName joinClauseList optWhereClause opt_group_clause opt_having_clause opt_order_clause opt_limit_clause
+    |   SELECT selector FROM tableRef joinClauseList optWhereClause opt_group_clause opt_having_clause opt_order_clause opt_limit_clause
     {
-        std::vector<std::string> tabs{$4};
-        std::string current_left = $4;
+        std::vector<std::shared_ptr<TableRef>> tabs{$4};
+        std::string current_left = $4->exposed_name();
         for (auto &join_expr : $5) {
             join_expr->left = current_left;
-            tabs.push_back(join_expr->right);
+            tabs.push_back(join_expr->right_table_ref);
             current_left = join_expr->right;
         }
         $$ = std::make_shared<SelectStmt>($2, std::move(tabs), $6, std::move($5), $9, $7, $8, $10);
@@ -202,13 +204,13 @@ dml:
     ;
 
 joinClauseList:
-        joinType JOIN tbName ON whereClause
+        joinType JOIN tableRef ON whereClause
     {
         $$ = std::vector<std::shared_ptr<JoinExpr>>{
             std::make_shared<JoinExpr>(std::string(), $3, $5, $1)
         };
     }
-    |   joinClauseList joinType JOIN tbName ON whereClause
+    |   joinClauseList joinType JOIN tableRef ON whereClause
     {
         $1.push_back(std::make_shared<JoinExpr>(std::string(), $4, $6, $2));
         $$ = std::move($1);
@@ -538,17 +540,32 @@ having_cond:
     ;
 
 tableList:
+        tableRef
+    {
+        $$ = std::vector<std::shared_ptr<TableRef>>{$1};
+    }
+    |   tableList ',' tableRef
+    {
+        $$.push_back($3);
+    }
+    |   tableList JOIN tableRef
+    {
+        $$.push_back($3);
+    }
+    ;
+
+tableRef:
         tbName
     {
-        $$ = std::vector<std::string>{$1};
+        $$ = std::make_shared<TableRef>($1);
     }
-    |   tableList ',' tbName
+    |   tbName IDENTIFIER
     {
-        $$.push_back($3);
+        $$ = std::make_shared<TableRef>($1, $2);
     }
-    |   tableList JOIN tbName
+    |   tbName AS IDENTIFIER
     {
-        $$.push_back($3);
+        $$ = std::make_shared<TableRef>($1, $3);
     }
     ;
 

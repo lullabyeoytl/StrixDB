@@ -186,6 +186,13 @@ private:
             std::cout << "SET_CLAUSE\n";
             print_val(x->col_name, offset);
             print_node(x->val, offset);
+        } else if (auto x = std::dynamic_pointer_cast<TableRef>(node)) {
+            std::cout << "TABLE_REF\n";
+            print_val(x->table_name, offset);
+            if (x->has_alias) {
+                print_val("ALIAS", offset);
+                print_val(x->alias, offset);
+            }
         } else if (auto x = std::dynamic_pointer_cast<BinaryExpr>(node)) {
             std::cout << "BINARY_EXPR\n";
             print_node(x->lhs, offset);
@@ -207,7 +214,7 @@ private:
         } else if (auto x = std::dynamic_pointer_cast<SelectStmt>(node)) {
             std::cout << "SELECT\n";
             print_node_list(x->select_items, offset);
-            print_val_list(x->tabs, offset);
+            print_node_list(x->table_refs, offset);
             print_node_list(x->conds, offset);
             if (x->has_group_by) {
                 print_node(x->group_by, offset);

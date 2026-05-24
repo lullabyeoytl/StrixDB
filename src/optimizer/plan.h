@@ -69,26 +69,34 @@ public:
 class ScanPlan : public Plan
 {
     public:
-        ScanPlan(SmManager *sm_manager, std::string tab_name, std::vector<Condition> all_conds,
+        ScanPlan(SmManager *sm_manager, std::string tab_name, std::string exposed_name, std::vector<Condition> all_conds,
                  bool empty_result = false)
         {
             Plan::tag = T_SeqScan;
             tab_name_ = std::move(tab_name);
+            exposed_name_ = std::move(exposed_name);
             TabMeta &tab = sm_manager->db_.get_table(tab_name_);
             cols_ = tab.cols;
+            for (auto &col : cols_) {
+                col.tab_name = exposed_name_;
+            }
             len_ = cols_.back().offset + cols_.back().len;
             all_conds_ = std::move(all_conds);
             empty_result_ = empty_result;
         }
 
-        ScanPlan(SmManager *sm_manager, std::string tab_name, std::vector<Condition> index_lookup_conds,
+        ScanPlan(SmManager *sm_manager, std::string tab_name, std::string exposed_name, std::vector<Condition> index_lookup_conds,
                  std::vector<Condition> residual_conds, std::vector<std::string> index_col_names,
                  std::optional<IndexMeta> index_meta = std::nullopt)
         {
             Plan::tag = T_IndexScan;
             tab_name_ = std::move(tab_name);
+            exposed_name_ = std::move(exposed_name);
             TabMeta &tab = sm_manager->db_.get_table(tab_name_);
             cols_ = tab.cols;
+            for (auto &col : cols_) {
+                col.tab_name = exposed_name_;
+            }
             len_ = cols_.back().offset + cols_.back().len;
             index_lookup_conds_ = std::move(index_lookup_conds);
             residual_conds_ = std::move(residual_conds);
@@ -104,6 +112,7 @@ class ScanPlan : public Plan
         ~ScanPlan(){}
         // 以下变量同ScanExecutor中的变量
         std::string tab_name_;                     
+        std::string exposed_name_;
         std::vector<ColMeta> cols_;                
         std::vector<Condition> index_lookup_conds_;
         std::vector<Condition> residual_conds_;
