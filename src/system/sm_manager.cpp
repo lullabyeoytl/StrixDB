@@ -15,7 +15,6 @@ See the Mulan PSL v2 for more details. */
 #include <filesystem>
 
 #include <fstream>
-#include <unordered_set>
 
 #include "index/ix.h"
 #include "record/rm.h"
@@ -282,32 +281,10 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
     flush_meta();
 }
 
-namespace {
-
-bool has_duplicate_keys(RmFileHandle *fh, const IndexMeta &index_meta, Context *context) {
-    std::unordered_set<std::string> seen;
-    RmScan scan(fh);
-    while (!scan.is_end()) {
-        Rid rid = scan.rid();
-        auto rec = fh->get_record(rid, context);
-        auto key = std::make_unique<char[]>(index_meta.col_tot_len);
-        index_meta.build_key(key.get(), rec->data);
-        std::string key_bytes(key.get(), index_meta.col_tot_len);
-        if (!seen.insert(key_bytes).second) {
-            return true;
-        }
-        scan.next();
-    }
-    return false;
-}
-
-}  // namespace
-
 /**
  * @description: 创建索引
  * @param {string&} tab_name 表的名称
  * @param {vector<string>&} col_names 索引包含的字段名称
- * @param {bool} unique 是否是唯一索引
  * @param {Context*} context
  */
 void SmManager::create_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
@@ -324,14 +301,11 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
         index_cols.push_back(*col_it);
     }
 
-    // Create the index file on disk
-    ix_manager_->create_index(tab_name, index_cols);
+    ix_manager_->create_index(tab_name, index_cols, true);
 
-    // Open the index handle
     std::string ix_name = ix_manager_->get_index_name(tab_name, index_cols);
     auto ih = ix_manager_->open_index(tab_name, index_cols);
 
-    // Build IndexMeta and add to table metadata
     IndexMeta index_meta;
     index_meta.tab_name = tab_name;
     index_meta.col_tot_len = 0;
@@ -340,107 +314,7 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
         index_meta.cols.push_back(col);
     }
     index_meta.col_num = index_cols.size();
-    index_meta.unique = false;
-    tab.indexes.push_back(index_meta);
-
-    // Mark columns as indexed
-    for (auto &col : tab.cols) {
-        for (auto &index_col : index_cols) {
-            if (col.name == index_col.name) {
-                col.index = true;
-            }
-        }
-    }
-
-    // Populate index with existing records
-    RmScan scan(fhs_.at(tab_name).get());
-    while (!scan.is_end()) {
-        Rid rid = scan.rid();
-        auto rec = fhs_.at(tab_name)->get_record(rid, context);
-
-        auto key = std::make_unique<char[]>(index_meta.col_tot_len);
-        index_meta.build_key(key.get(), rec->data);
-        ih->insert_entry(key.get(), rid, context->txn_);
-
-        scan.next();
-    }
-
-    // Store index handle in ihs_
-    ihs_.emplace(ix_name, std::move(ih));
-
-    flush_meta();
-}
-
-void SmManager::create_unique_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
-    TabMeta &tab = db_.get_table(tab_name);
-
-    std::vector<ColMeta> index_cols;
-    for (auto &col_name : col_names) {
-        index_cols.push_back(*tab.get_col(col_name));
-    }
-
-    // Build pre-check meta
-    IndexMeta precheck_meta;
-    precheck_meta.tab_name = tab_name;
-    precheck_meta.col_tot_len = 0;
-    for (auto &col : index_cols) {
-        precheck_meta.col_tot_len += col.len;
-        precheck_meta.cols.push_back(col);
-    }
-    precheck_meta.col_num = index_cols.size();
-    precheck_meta.unique = true;
-
-    // If a normal index already exists, handle upgrade path
-    if (tab.is_index(col_names)) {
-        auto index_it = tab.get_index_meta(col_names);
-        if (index_it->unique) {
-            throw IndexExistsError(tab_name, col_names);
-        }
-
-        // Check for duplicates before upgrading to unique
-        std::string old_ix_name = ix_manager_->get_index_name(tab_name, index_cols);
-        auto ih_it = ihs_.find(old_ix_name);
-        if (ih_it != ihs_.end()) {
-            // B+tree key-order walk: O(n) time, O(1) memory
-            if (ih_it->second->has_duplicate_keys()) {
-                throw UniqueViolationError(tab_name, col_names);
-            }
-        } else {
-            // Index handle not open - fall back to file scan
-            if (has_duplicate_keys(fhs_.at(tab_name).get(), precheck_meta, context)) {
-                throw UniqueViolationError(tab_name, col_names);
-            }
-        }
-
-        // Remove old normal index
-        if (ih_it != ihs_.end()) {
-            ix_manager_->close_index(ih_it->second.get());
-            ihs_.erase(ih_it);
-        }
-        ix_manager_->destroy_index(tab_name, index_cols);
-        tab.indexes.erase(index_it);
-
-        // TODO: Known limitation: TOCTOU window between pre-check and rebuild
-    } else {
-        // Pre-check for duplicate keys (fresh creation path)
-        if (has_duplicate_keys(fhs_.at(tab_name).get(), precheck_meta, context)) {
-            throw UniqueViolationError(tab_name, col_names);
-        }
-    }
-
-    // Create the index file with unique flag set
-    ix_manager_->create_index(tab_name, index_cols, /*unique=*/true);
-
-    // Open the index handle directly ,so we can
-    // populate before registering metadata.  If population fails, the index
-    // file is destroyed and no inconsistent state persists.
-    std::string ix_name = ix_manager_->get_index_name(tab_name, index_cols);
-    auto ih = ix_manager_->open_index(tab_name, index_cols);
-
-    int col_tot_len = 0;
-    for (auto &col : index_cols) {
-        col_tot_len += col.len;
-    }
+    index_meta.unique = true;
 
     try {
         RmScan scan(fhs_.at(tab_name).get());
@@ -448,31 +322,22 @@ void SmManager::create_unique_index(const std::string& tab_name, const std::vect
             Rid rid = scan.rid();
             auto rec = fhs_.at(tab_name)->get_record(rid, context);
 
-            auto key = std::make_unique<char[]>(col_tot_len);
-            int off = 0;
-            for (auto &col : index_cols) {
-                memcpy(key.get() + off, rec->data + col.offset, col.len);
-                off += col.len;
-            }
+            auto key = std::make_unique<char[]>(index_meta.col_tot_len);
+            index_meta.build_key(key.get(), rec->data);
             ih->insert_entry(key.get(), rid, context->txn_);
 
             scan.next();
         }
+    } catch (const UniqueKeyViolationError &) {
+        ix_manager_->close_index(ih.get());
+        ix_manager_->destroy_index(tab_name, index_cols);
+        throw UniqueViolationError(tab_name, col_names);
     } catch (...) {
         ix_manager_->close_index(ih.get());
         ix_manager_->destroy_index(tab_name, index_cols);
         throw;
     }
 
-    // Population complete — register metadata and handle
-    IndexMeta index_meta;
-    index_meta.tab_name = tab_name;
-    index_meta.col_tot_len = col_tot_len;
-    for (auto &col : index_cols) {
-        index_meta.cols.push_back(col);
-    }
-    index_meta.col_num = index_cols.size();
-    index_meta.unique = true;
     tab.indexes.push_back(index_meta);
 
     for (auto &col : tab.cols) {

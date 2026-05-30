@@ -54,11 +54,7 @@ void QlManager::run_mutli_query(std::shared_ptr<Plan> plan, Context *context){
             {
                 sm_manager_->create_table(x->tab_name_, x->cols_, context);
                 for (auto &spec : x->index_specs_) {
-                    if (spec.unique) {
-                        sm_manager_->create_unique_index(x->tab_name_, spec.cols, context);
-                    } else {
-                        sm_manager_->create_index(x->tab_name_, spec.cols, context);
-                    }
+                    sm_manager_->create_index(x->tab_name_, spec.cols, context);
                 }
                 break;
             }
@@ -69,11 +65,7 @@ void QlManager::run_mutli_query(std::shared_ptr<Plan> plan, Context *context){
             }
             case T_CreateIndex:
             {
-                if (x->unique_) {
-                    sm_manager_->create_unique_index(x->tab_name_, x->tab_col_names_, context);
-                } else {
-                    sm_manager_->create_index(x->tab_name_, x->tab_col_names_, context);
-                }
+                sm_manager_->create_index(x->tab_name_, x->tab_col_names_, context);
                 break;
             }
             case T_DropIndex:
