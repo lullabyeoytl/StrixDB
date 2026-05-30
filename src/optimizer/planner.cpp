@@ -513,6 +513,10 @@ std::shared_ptr<Query> Planner::logical_optimization(std::shared_ptr<Query> quer
 std::shared_ptr<Plan> Planner::physical_optimization(std::shared_ptr<Query> query, Context *context)
 {
     std::shared_ptr<Plan> plan = make_one_rel(query);
+    auto join_impl_config =
+        build_join_implementation_config(enable_nestedloop_join, enable_sortmerge_join, this->enable_hash_join);
+    validate_join_executor_config(join_impl_config);
+    plan = physicalize_join_tree(std::move(plan), join_impl_config);
     
     // 其他物理优化
 
@@ -682,10 +686,6 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
     }
 
     auto conds = std::move(pending_conds);
-    auto join_impl_config =
-        build_join_implementation_config(enable_nestedloop_join, enable_sortmerge_join, this->enable_hash_join);
-    validate_join_executor_config(join_impl_config);
-
     std::vector<int> scantbl(query->from_bindings.size(), -1);
     std::vector<std::string> joined_tables;
 
@@ -707,7 +707,7 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
     }
 
     append_unjoined_scans(table_join_executors, table_scan_executors, scantbl);
-    return physicalize_join_tree(table_join_executors, join_impl_config);
+    return table_join_executors;
 }
 
 
