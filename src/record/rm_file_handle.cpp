@@ -54,6 +54,11 @@ Rid RmFileHandle::next_insert_rid() {
     }
 }
 
+void RmFileHandle::release_reserved_rid(const Rid &rid) {
+    std::lock_guard<std::mutex> guard(file_latch_);
+    reserved_slots_.erase(encode_rid(rid));
+}
+
 /**
  * @description: 在当前表中插入一条记录，不指定插入位置
  * @param {char*} buf 要插入的记录的数据

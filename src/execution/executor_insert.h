@@ -49,21 +49,6 @@ class InsertExecutor : public AbstractExecutor {
             val.init_raw(col.len);
             memcpy(rec.data + col.offset, val.raw->data, col.len);
         }
-        // Pre-check all unique indexes before mutating anything.
-        // This avoids dangling index entries when a table has multiple unique
-        // indexes and a later one fails after earlier ones already succeeded.
-        for (size_t i = 0; i < tab_.indexes.size(); ++i) {
-            auto &index = tab_.indexes[i];
-            if (!index.unique) continue;
-            auto ih = sm_manager_->get_ih(tab_name_, index.cols);
-            auto key = std::make_unique<char[]>(index.col_tot_len);
-            index.build_key(key.get(), rec.data);
-            std::vector<Rid> result;
-            if (ih->get_value(key.get(), &result, context_->txn_)) {
-                throw UniqueViolationError(tab_name_, index.col_names());
-            }
-        }
-
         while (true) {
             rid_ = fh_->next_insert_rid();
             if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
@@ -74,32 +59,51 @@ class InsertExecutor : public AbstractExecutor {
                 break;
             }
         }
-        // WAL
-        lsn_t op_prev_lsn = context_ != nullptr && context_->txn_ != nullptr ? context_->txn_->get_prev_lsn() : INVALID_LSN;
-        lsn_t op_lsn = INVALID_LSN;
-        if (context_ != nullptr && context_->txn_ != nullptr && context_->log_mgr_ != nullptr) {
-            InsertLogRecord log_record(context_->txn_->get_transaction_id(), rec, rid_, tab_name_);
-            log_record.prev_lsn_ = op_prev_lsn;
-            op_lsn = context_->log_mgr_->add_log_to_buffer(&log_record);
-            context_->txn_->set_prev_lsn(op_lsn);
-        }
 
-        // Insert into record file
-        fh_->insert_record(rid_, rec.data);
-        if (op_lsn != INVALID_LSN) {
-            fh_->set_page_lsn(rid_, op_lsn);
-        }
-        if (context_ != nullptr && context_->txn_ != nullptr) {
-            context_->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name_, rid_, op_prev_lsn));
-        }
+        std::vector<std::pair<IndexMeta *, std::unique_ptr<char[]>>> inserted_keys;
+        std::vector<std::string> violation_cols;
+        try {
+            for (size_t i = 0; i < tab_.indexes.size(); ++i) {
+                auto &index = tab_.indexes[i];
+                auto ih = sm_manager_->get_ih(tab_name_, index.cols);
+                auto key = std::make_unique<char[]>(index.col_tot_len);
+                index.build_key(key.get(), rec.data);
+                try {
+                    ih->insert_entry(key.get(), rid_, context_->txn_);
+                } catch (const UniqueKeyViolationError &) {
+                    violation_cols = index.col_names();
+                    throw;
+                }
+                inserted_keys.emplace_back(&index, std::move(key));
+            }
 
-        // Insert into index (uniqueness already pre-checked above)
-        for (size_t i = 0; i < tab_.indexes.size(); ++i) {
-            auto &index = tab_.indexes[i];
-            auto ih = sm_manager_->get_ih(tab_name_, index.cols);
-            auto key = std::make_unique<char[]>(index.col_tot_len);
-            index.build_key(key.get(), rec.data);
-            ih->insert_entry(key.get(), rid_, context_->txn_);
+            lsn_t op_prev_lsn = context_ != nullptr && context_->txn_ != nullptr ? context_->txn_->get_prev_lsn() : INVALID_LSN;
+            lsn_t op_lsn = INVALID_LSN;
+            if (context_ != nullptr && context_->txn_ != nullptr && context_->log_mgr_ != nullptr) {
+                InsertLogRecord log_record(context_->txn_->get_transaction_id(), rec, rid_, tab_name_);
+                log_record.prev_lsn_ = op_prev_lsn;
+                op_lsn = context_->log_mgr_->add_log_to_buffer(&log_record);
+                context_->txn_->set_prev_lsn(op_lsn);
+            }
+
+            fh_->insert_record(rid_, rec.data, op_lsn);
+            if (context_ != nullptr && context_->txn_ != nullptr) {
+                context_->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name_, rid_, op_prev_lsn));
+            }
+        } catch (const UniqueKeyViolationError &) {
+            for (auto it = inserted_keys.rbegin(); it != inserted_keys.rend(); ++it) {
+                auto ih = sm_manager_->get_ih(tab_name_, it->first->cols);
+                ih->delete_entry(it->second.get(), rid_, context_->txn_);
+            }
+            fh_->release_reserved_rid(rid_);
+            throw UniqueViolationError(tab_name_, violation_cols);
+        } catch (...) {
+            for (auto it = inserted_keys.rbegin(); it != inserted_keys.rend(); ++it) {
+                auto ih = sm_manager_->get_ih(tab_name_, it->first->cols);
+                ih->delete_entry(it->second.get(), rid_, context_->txn_);
+            }
+            fh_->release_reserved_rid(rid_);
+            throw;
         }
         return nullptr;
     }

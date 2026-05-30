@@ -87,6 +87,8 @@ class RmFileHandle: public NonCopyable {
 
     Rid next_insert_rid();
 
+    void release_reserved_rid(const Rid &rid);
+
     Rid insert_record(char *buf, Context *context);
 
     void insert_record(const Rid &rid, char *buf, lsn_t page_lsn = INVALID_LSN);
