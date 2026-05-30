@@ -524,149 +524,190 @@ std::shared_ptr<Plan> Planner::physical_optimization(std::shared_ptr<Query> quer
     return plan;
 }
 
-
-
-std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
-{
-    auto x = std::dynamic_pointer_cast<ast::SelectStmt>(query->parse);
-    const auto &bindings = query->from_bindings;
+std::vector<Condition> Planner::collect_select_conds(const std::shared_ptr<Query> &query) const {
     std::vector<Condition> pending_conds = query->conds;
-    if (x != nullptr) {
-        for (const auto &join_expr : x->jointree) {
-            auto join_conds = convert_join_expr_conds(join_expr->conds);
-            pending_conds.insert(pending_conds.end(), join_conds.begin(), join_conds.end());
-        }
+    auto select = std::dynamic_pointer_cast<ast::SelectStmt>(query->parse);
+    if (select == nullptr) {
+        return pending_conds;
     }
-    // // Scan table , 生成表算子列表tab_nodes
-    std::vector<std::shared_ptr<Plan>> table_scan_executors(bindings.size());
-    for (size_t i = 0; i < bindings.size(); i++) {
-        auto curr_conds = pop_conds(pending_conds, bindings[i].exposed_name);
-        auto required_cols = collect_scan_required_cols(*query, bindings[i].exposed_name);
-        table_scan_executors[i] = make_scan_plan(bindings[i], std::move(curr_conds), std::move(required_cols));
+    for (const auto &join_expr : select->jointree) {
+        auto join_conds = convert_join_expr_conds(join_expr->conds);
+        pending_conds.insert(pending_conds.end(), join_conds.begin(), join_conds.end());
     }
-    // 只有一个表，不需要join。
-    if(bindings.size() == 1)
-    {
-        return table_scan_executors[0];
+    return pending_conds;
+}
+
+std::vector<std::shared_ptr<Plan>> Planner::build_base_scan_plans(const Query &query,
+                                                                  std::vector<Condition> &pending_conds) {
+    std::vector<std::shared_ptr<Plan>> table_scan_executors(query.from_bindings.size());
+    for (size_t i = 0; i < query.from_bindings.size(); i++) {
+        auto curr_conds = pop_conds(pending_conds, query.from_bindings[i].exposed_name);
+        auto required_cols = collect_scan_required_cols(query, query.from_bindings[i].exposed_name);
+        table_scan_executors[i] =
+            make_scan_plan(query.from_bindings[i], std::move(curr_conds), std::move(required_cols));
     }
-    // 获取where条件
-    auto conds = std::move(pending_conds);
+    return table_scan_executors;
+}
+
+std::shared_ptr<Plan> Planner::build_join_tree_from_jointree(
+    const std::shared_ptr<ast::SelectStmt> &select,
+    std::vector<std::shared_ptr<Plan>> &table_scan_executors,
+    std::vector<int> &scantbl,
+    std::vector<std::string> &joined_tables) {
+    if (select == nullptr || select->jointree.empty()) {
+        return nullptr;
+    }
+
     std::shared_ptr<Plan> table_join_executors;
-    auto join_impl_config =
-        build_join_implementation_config(enable_nestedloop_join, enable_sortmerge_join, this->enable_hash_join);
-    validate_join_executor_config(join_impl_config);
-    
-    std::vector<int> scantbl(bindings.size(), -1);
+    for (const auto &join_expr : select->jointree) {
+        bool left_joined =
+            std::find(joined_tables.begin(), joined_tables.end(), join_expr->left) != joined_tables.end();
+        bool right_joined =
+            std::find(joined_tables.begin(), joined_tables.end(), join_expr->right) != joined_tables.end();
+        std::shared_ptr<Plan> left = nullptr;
+        std::shared_ptr<Plan> right = nullptr;
 
-    std::vector<std::string> joined_tables;
-    if (x != nullptr && !x->jointree.empty()) {
-        for (const auto &join_expr : x->jointree) {
-            bool left_joined = std::find(joined_tables.begin(), joined_tables.end(), join_expr->left) != joined_tables.end();
-            bool right_joined = std::find(joined_tables.begin(), joined_tables.end(), join_expr->right) != joined_tables.end();
-            std::shared_ptr<Plan> left = nullptr;
-            std::shared_ptr<Plan> right = nullptr;
+        if (!left_joined) {
+            left = pop_scan(scantbl.data(), join_expr->left, joined_tables, table_scan_executors);
+        }
+        if (!right_joined) {
+            right = pop_scan(scantbl.data(), join_expr->right, joined_tables, table_scan_executors);
+        }
 
-            if (!left_joined) {
-                left = pop_scan(scantbl.data(), join_expr->left, joined_tables, table_scan_executors);
-            }
-            if (!right_joined) {
-                right = pop_scan(scantbl.data(), join_expr->right, joined_tables, table_scan_executors);
-            }
-
-            if (table_join_executors == nullptr) {
-                table_join_executors = std::make_shared<JoinPlan>(std::move(left), std::move(right),
-                                                                  std::vector<Condition>(), join_expr->type);
-            } else if (left_joined && !right_joined) {
-                table_join_executors = std::make_shared<JoinPlan>(std::move(table_join_executors),
-                                                                  std::move(right), std::vector<Condition>(),
-                                                                  join_expr->type);
-            } else if (!left_joined && right_joined) {
-                table_join_executors = std::make_shared<JoinPlan>(std::move(left),
-                                                                  std::move(table_join_executors),
-                                                                  std::vector<Condition>(), join_expr->type);
-            } else if (!left_joined && !right_joined) {
-                auto pair_join = std::make_shared<JoinPlan>(std::move(left), std::move(right),
-                                                            std::vector<Condition>(), join_expr->type);
-                table_join_executors = std::make_shared<JoinPlan>(std::move(pair_join),
-                                                                  std::move(table_join_executors),
-                                                                  std::vector<Condition>());
-            }
+        if (table_join_executors == nullptr) {
+            table_join_executors = std::make_shared<JoinPlan>(std::move(left), std::move(right),
+                                                              std::vector<Condition>(), join_expr->type);
+        } else if (left_joined && !right_joined) {
+            table_join_executors = std::make_shared<JoinPlan>(std::move(table_join_executors),
+                                                              std::move(right), std::vector<Condition>(),
+                                                              join_expr->type);
+        } else if (!left_joined && right_joined) {
+            table_join_executors = std::make_shared<JoinPlan>(std::move(left),
+                                                              std::move(table_join_executors),
+                                                              std::vector<Condition>(), join_expr->type);
+        } else if (!left_joined && !right_joined) {
+            auto pair_join = std::make_shared<JoinPlan>(std::move(left), std::move(right),
+                                                        std::vector<Condition>(), join_expr->type);
+            table_join_executors = std::make_shared<JoinPlan>(std::move(pair_join),
+                                                              std::move(table_join_executors),
+                                                              std::vector<Condition>());
         }
     }
+    return table_join_executors;
+}
 
-    if(table_join_executors == nullptr && conds.size() >= 1)
-    {
-        // 有连接条件
+std::shared_ptr<Plan> Planner::seed_join_tree_from_remaining_conds(
+    std::vector<Condition> &conds,
+    std::vector<std::shared_ptr<Plan>> &table_scan_executors,
+    std::vector<int> &scantbl,
+    std::vector<std::string> &joined_tables) {
+    auto it = conds.begin();
+    while (it != conds.end()) {
+        std::shared_ptr<Plan> left, right;
+        left = pop_scan(scantbl.data(), it->lhs_col.tab_name, joined_tables, table_scan_executors);
+        right = pop_scan(scantbl.data(), it->rhs_col.tab_name, joined_tables, table_scan_executors);
+        std::vector<Condition> join_conds{*it};
+        auto table_join_executors = std::make_shared<JoinPlan>(std::move(left), std::move(right), join_conds);
+        conds.erase(it);
+        return table_join_executors;
+    }
+    return nullptr;
+}
 
-        // 根据连接条件，生成第一层join
-        auto it = conds.begin();
-        while (it != conds.end()) {
-            std::shared_ptr<Plan> left , right;
-            left = pop_scan(scantbl.data(), it->lhs_col.tab_name, joined_tables, table_scan_executors);
-            right = pop_scan(scantbl.data(), it->rhs_col.tab_name, joined_tables, table_scan_executors);
+void Planner::attach_remaining_conds(std::shared_ptr<Plan> &table_join_executors,
+                                     std::vector<Condition> &conds,
+                                     std::vector<std::shared_ptr<Plan>> &table_scan_executors,
+                                     std::vector<int> &scantbl,
+                                     std::vector<std::string> &joined_tables) {
+    auto it = conds.begin();
+    while (it != conds.end()) {
+        std::shared_ptr<Plan> left_need_to_join_executors = nullptr;
+        std::shared_ptr<Plan> right_need_to_join_executors = nullptr;
+        bool isneedreverse = false;
+        if (std::find(joined_tables.begin(), joined_tables.end(), it->lhs_col.tab_name) == joined_tables.end()) {
+            left_need_to_join_executors =
+                pop_scan(scantbl.data(), it->lhs_col.tab_name, joined_tables, table_scan_executors);
+        }
+        if (!it->is_rhs_val &&
+            std::find(joined_tables.begin(), joined_tables.end(), it->rhs_col.tab_name) == joined_tables.end()) {
+            right_need_to_join_executors =
+                pop_scan(scantbl.data(), it->rhs_col.tab_name, joined_tables, table_scan_executors);
+            isneedreverse = true;
+        }
+
+        if (left_need_to_join_executors != nullptr && right_need_to_join_executors != nullptr) {
             std::vector<Condition> join_conds{*it};
-            //建立join
-            table_join_executors = std::make_shared<JoinPlan>(std::move(left), std::move(right), join_conds);
-            it = conds.erase(it);
-            break;
+            std::shared_ptr<Plan> temp_join_executors = std::make_shared<JoinPlan>(
+                std::move(left_need_to_join_executors), std::move(right_need_to_join_executors), join_conds);
+            table_join_executors = std::make_shared<JoinPlan>(std::move(temp_join_executors),
+                                                              std::move(table_join_executors),
+                                                              std::vector<Condition>());
+        } else if (left_need_to_join_executors != nullptr || right_need_to_join_executors != nullptr) {
+            if (isneedreverse) {
+                std::swap(it->lhs_col, it->rhs_col);
+                it->op = kSwapOp.at(it->op);
+                left_need_to_join_executors = std::move(right_need_to_join_executors);
+            }
+            std::vector<Condition> join_conds{*it};
+            table_join_executors = std::make_shared<JoinPlan>(std::move(left_need_to_join_executors),
+                                                              std::move(table_join_executors), join_conds);
+        } else if (!it->is_rhs_val) {
+            push_conds(std::move(&(*it)), table_join_executors);
         }
-    } else if (table_join_executors == nullptr) {
-        table_join_executors = table_scan_executors[0];
-        scantbl[0] = 1;
-        joined_tables.emplace_back(bindings[0].exposed_name);
+        it = conds.erase(it);
     }
+}
 
-    if (table_join_executors != nullptr) {
-        auto it = conds.begin();
-        while (it != conds.end()) {
-            std::shared_ptr<Plan> left_need_to_join_executors = nullptr;
-            std::shared_ptr<Plan> right_need_to_join_executors = nullptr;
-            bool isneedreverse = false;
-            if (std::find(joined_tables.begin(), joined_tables.end(), it->lhs_col.tab_name) == joined_tables.end()) {
-                left_need_to_join_executors = pop_scan(scantbl.data(), it->lhs_col.tab_name, joined_tables, table_scan_executors);
-            }
-            if (!it->is_rhs_val &&
-                std::find(joined_tables.begin(), joined_tables.end(), it->rhs_col.tab_name) == joined_tables.end()) {
-                right_need_to_join_executors = pop_scan(scantbl.data(), it->rhs_col.tab_name, joined_tables, table_scan_executors);
-                isneedreverse = true;
-            }
-
-            if(left_need_to_join_executors != nullptr && right_need_to_join_executors != nullptr) {
-                std::vector<Condition> join_conds{*it};
-                std::shared_ptr<Plan> temp_join_executors = std::make_shared<JoinPlan>(
-                    std::move(left_need_to_join_executors), std::move(right_need_to_join_executors), join_conds);
-                table_join_executors = std::make_shared<JoinPlan>(std::move(temp_join_executors),
-                                                                  std::move(table_join_executors),
-                                                                  std::vector<Condition>());
-            } else if(left_need_to_join_executors != nullptr || right_need_to_join_executors != nullptr) {
-                if(isneedreverse) {
-                    std::swap(it->lhs_col, it->rhs_col);
-                    it->op = kSwapOp.at(it->op);
-                    left_need_to_join_executors = std::move(right_need_to_join_executors);
-                }
-                std::vector<Condition> join_conds{*it};
-                table_join_executors = std::make_shared<JoinPlan>(std::move(left_need_to_join_executors),
-                                                                  std::move(table_join_executors), join_conds);
-            } else if (!it->is_rhs_val) {
-                push_conds(std::move(&(*it)), table_join_executors);
-            }
-            it = conds.erase(it);
-        }
-    }
-
-    //连接剩余表
-    for (size_t i = 0; i < bindings.size(); i++) {
-        if(scantbl[i] == -1) {
+void Planner::append_unjoined_scans(std::shared_ptr<Plan> &table_join_executors,
+                                    std::vector<std::shared_ptr<Plan>> &table_scan_executors,
+                                    std::vector<int> &scantbl) {
+    for (size_t i = 0; i < table_scan_executors.size(); i++) {
+        if (scantbl[i] == -1) {
             table_join_executors = std::make_shared<JoinPlan>(std::move(table_scan_executors[i]),
                                                               std::move(table_join_executors),
                                                               std::vector<Condition>());
         }
     }
+}
 
-    table_join_executors = physicalize_join_tree(table_join_executors, join_impl_config);
+std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
+{
+    auto select = std::dynamic_pointer_cast<ast::SelectStmt>(query->parse);
+    std::vector<Condition> pending_conds = collect_select_conds(query);
+    auto table_scan_executors = build_base_scan_plans(*query, pending_conds);
 
-    return table_join_executors;
+    if (query->from_bindings.size() == 1)
+    {
+        return table_scan_executors[0];
+    }
 
+    auto conds = std::move(pending_conds);
+    auto join_impl_config =
+        build_join_implementation_config(enable_nestedloop_join, enable_sortmerge_join, this->enable_hash_join);
+    validate_join_executor_config(join_impl_config);
+
+    std::vector<int> scantbl(query->from_bindings.size(), -1);
+    std::vector<std::string> joined_tables;
+
+    std::shared_ptr<Plan> table_join_executors =
+        build_join_tree_from_jointree(select, table_scan_executors, scantbl, joined_tables);
+
+    if (table_join_executors == nullptr && !conds.empty())
+    {
+        table_join_executors =
+            seed_join_tree_from_remaining_conds(conds, table_scan_executors, scantbl, joined_tables);
+    } else if (table_join_executors == nullptr) {
+        table_join_executors = table_scan_executors[0];
+        scantbl[0] = 1;
+        joined_tables.emplace_back(query->from_bindings[0].exposed_name);
+    }
+
+    if (table_join_executors != nullptr) {
+        attach_remaining_conds(table_join_executors, conds, table_scan_executors, scantbl, joined_tables);
+    }
+
+    append_unjoined_scans(table_join_executors, table_scan_executors, scantbl);
+    return physicalize_join_tree(table_join_executors, join_impl_config);
 }
 
 

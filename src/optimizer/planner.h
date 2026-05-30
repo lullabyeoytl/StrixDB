@@ -53,6 +53,27 @@ class Planner {
     std::shared_ptr<Plan> physical_optimization(std::shared_ptr<Query> query, Context *context);
 
     std::shared_ptr<Plan> make_one_rel(std::shared_ptr<Query> query);
+    std::vector<Condition> collect_select_conds(const std::shared_ptr<Query> &query) const;
+    std::vector<std::shared_ptr<Plan>> build_base_scan_plans(const Query &query,
+                                                             std::vector<Condition> &pending_conds);
+    std::shared_ptr<Plan> build_join_tree_from_jointree(
+        const std::shared_ptr<ast::SelectStmt> &select,
+        std::vector<std::shared_ptr<Plan>> &table_scan_executors,
+        std::vector<int> &scantbl,
+        std::vector<std::string> &joined_tables);
+    std::shared_ptr<Plan> seed_join_tree_from_remaining_conds(
+        std::vector<Condition> &conds,
+        std::vector<std::shared_ptr<Plan>> &table_scan_executors,
+        std::vector<int> &scantbl,
+        std::vector<std::string> &joined_tables);
+    void attach_remaining_conds(std::shared_ptr<Plan> &table_join_executors,
+                                std::vector<Condition> &conds,
+                                std::vector<std::shared_ptr<Plan>> &table_scan_executors,
+                                std::vector<int> &scantbl,
+                                std::vector<std::string> &joined_tables);
+    void append_unjoined_scans(std::shared_ptr<Plan> &table_join_executors,
+                               std::vector<std::shared_ptr<Plan>> &table_scan_executors,
+                               std::vector<int> &scantbl);
 
     std::shared_ptr<Plan> generate_sort_plan(std::shared_ptr<Query> query, std::shared_ptr<Plan> plan);
 
