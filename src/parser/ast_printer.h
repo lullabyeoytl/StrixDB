@@ -221,6 +221,9 @@ private:
             if (x->has_limit) {
                 print_node(x->limit_clause, offset);
             }
+        } else if (auto x = std::dynamic_pointer_cast<ExplainAnalyzeStmt>(node)) {
+            std::cout << "EXPLAIN_ANALYZE\n";
+            print_node(x->statement, offset);
         } else if (auto x = std::dynamic_pointer_cast<TxnBegin>(node)) {
             std::cout << "BEGIN\n";
         } else if (auto x = std::dynamic_pointer_cast<TxnCommit>(node)) {

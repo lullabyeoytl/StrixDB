@@ -105,6 +105,8 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "MAX" { return MAX; }
 "GROUP" { return GROUP; }
 "HAVING" { return HAVING; }
+"EXPLAIN" { return EXPLAIN; }
+"ANALYZE" { return ANALYZE; }
 "ENABLE_NESTLOOP" { return ENABLE_NESTLOOP; }
 "ENABLE_SORTMERGE" { return ENABLE_SORTMERGE; }
 "ENABLE_HASHJOIN" { return ENABLE_HASHJOIN; }

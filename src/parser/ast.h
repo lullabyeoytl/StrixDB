@@ -177,6 +177,15 @@ struct Col : public Expr {
             tab_name(std::move(tab_name_)), col_name(std::move(col_name_)) {}
 };
 
+struct TableRef : public TreeNode {
+    std::string name;
+    std::string alias;
+
+    explicit TableRef(std::string name_) : name(std::move(name_)), alias(name) {}
+
+    TableRef(std::string name_, std::string alias_) : name(std::move(name_)), alias(std::move(alias_)) {}
+};
+
 struct SelectItem : public TreeNode {
     std::shared_ptr<Expr> expr;
     bool has_alias = false;
@@ -290,17 +299,18 @@ struct JoinExpr : public TreeNode {
 
 struct SelectStmt : public TreeNode {
     std::vector<std::shared_ptr<SelectItem>> select_items;
-    std::vector<std::string> tabs;
+    std::vector<std::string> tabs;  // 仅表名列表（丢失别名）
+    std::vector<std::shared_ptr<TableRef>> table_refs;  // 查询涉及的所有表引用
     std::vector<std::shared_ptr<BinaryExpr>> conds;
     std::vector<std::shared_ptr<JoinExpr>> jointree;
 
-    
+
     bool has_sort;
     std::shared_ptr<OrderBy> order;
-    
+
     bool has_group_by;
     std::shared_ptr<GroupBy> group_by;
-    
+
     bool has_having;
     std::vector<std::shared_ptr<HavingCond>> having_conds;
     bool has_limit;
@@ -312,28 +322,18 @@ struct SelectStmt : public TreeNode {
                std::shared_ptr<OrderBy> order_,
                std::shared_ptr<GroupBy> group_by_,
                std::vector<std::shared_ptr<HavingCond>> having_conds_,
-               std::shared_ptr<LimitClause> limit_clause_) :
-            select_items(std::move(select_items_)), tabs(std::move(tabs_)), conds(std::move(conds_)),
+               std::shared_ptr<LimitClause> limit_clause_,
+               std::vector<std::shared_ptr<JoinExpr>> jointree_ = {},
+               std::vector<std::shared_ptr<TableRef>> table_refs_ = {}) :
+            select_items(std::move(select_items_)), tabs(std::move(tabs_)), table_refs(std::move(table_refs_)),
+            conds(std::move(conds_)), jointree(std::move(jointree_)),
             order(std::move(order_)), group_by(std::move(group_by_)), having_conds(std::move(having_conds_)),
             limit_clause(std::move(limit_clause_)) {
-                has_sort = (bool)order;
-                has_group_by = (bool)group_by;
-                has_having = !having_conds.empty();
-                has_limit = (bool)limit_clause;
-            }
-
-    SelectStmt(std::vector<std::shared_ptr<SelectItem>> select_items_,
-               std::vector<std::string> tabs_,
-               std::vector<std::shared_ptr<BinaryExpr>> conds_,
-               std::vector<std::shared_ptr<JoinExpr>> jointree_,
-               std::shared_ptr<OrderBy> order_,
-               std::shared_ptr<GroupBy> group_by_,
-               std::vector<std::shared_ptr<HavingCond>> having_conds_,
-               std::shared_ptr<LimitClause> limit_clause_) :
-            select_items(std::move(select_items_)), tabs(std::move(tabs_)), conds(std::move(conds_)),
-            jointree(std::move(jointree_)),
-            order(std::move(order_)), group_by(std::move(group_by_)), having_conds(std::move(having_conds_)),
-            limit_clause(std::move(limit_clause_)) {
+                if (table_refs.empty()) {
+                    for (const auto &tab : tabs) {
+                        table_refs.push_back(std::make_shared<TableRef>(tab));
+                    }
+                }
                 has_sort = (bool)order;
                 has_group_by = (bool)group_by;
                 has_having = !having_conds.empty();
@@ -341,12 +341,18 @@ struct SelectStmt : public TreeNode {
             }
 };
 
+struct ExplainAnalyzeStmt : public TreeNode {
+    std::shared_ptr<TreeNode> statement;
+
+    explicit ExplainAnalyzeStmt(std::shared_ptr<TreeNode> statement_) : statement(std::move(statement_)) {}
+};
+
 // set enable_nestloop
 struct SetStmt : public TreeNode {
     SetKnobType set_knob_type_;
     bool bool_val_;
 
-    SetStmt(SetKnobType &type, bool bool_value) : 
+    SetStmt(SetKnobType &type, bool bool_value) :
         set_knob_type_(type), bool_val_(bool_value) { }
 };
 
@@ -358,6 +364,7 @@ struct SemValue {
     bool sv_bool;
     OrderByDir sv_orderby_dir;
     std::vector<std::string> sv_strs;
+    std::vector<std::shared_ptr<TableRef>> sv_table_refs;
 
     std::shared_ptr<TreeNode> sv_node;
 
@@ -367,6 +374,7 @@ struct SemValue {
 
     std::shared_ptr<Field> sv_field;
     std::vector<std::shared_ptr<Field>> sv_fields;
+    std::shared_ptr<TableRef> sv_table_ref;
 
     std::shared_ptr<Expr> sv_expr;
     std::vector<std::shared_ptr<Expr>> sv_exprs;
@@ -385,7 +393,6 @@ struct SemValue {
     std::shared_ptr<BinaryExpr> sv_cond;
     std::vector<std::shared_ptr<BinaryExpr>> sv_conds;
 
-    std::shared_ptr<JoinExpr> sv_join_expr;
     std::vector<std::shared_ptr<JoinExpr>> sv_join_exprs;
     JoinType sv_join_type;
 
@@ -393,7 +400,7 @@ struct SemValue {
     std::vector<std::shared_ptr<OrderBy::Item>> sv_orderby_items;
     std::shared_ptr<OrderBy> sv_orderby;
     std::shared_ptr<LimitClause> sv_limit_clause;
-    
+
     // aggregation concerning
     std::shared_ptr<AggFunc> sv_agg_func;
     std::shared_ptr<GroupBy> sv_group_by;
@@ -403,6 +410,51 @@ struct SemValue {
     SetKnobType sv_setKnobType;
 };
 
+}
+
+// ================================================================
+// AST → internal type conversions
+// Pure data mapping from parser AST types to common internal types.
+// Shared by analyze and optimizer to avoid duplicated conversion logic.
+// ================================================================
+
+inline auto convert_sv_comp_op(ast::SvCompOp op) -> CompOp {
+    switch (op) {
+        case ast::SV_OP_EQ: return OP_EQ;
+        case ast::SV_OP_NE: return OP_NE;
+        case ast::SV_OP_LT: return OP_LT;
+        case ast::SV_OP_GT: return OP_GT;
+        case ast::SV_OP_LE: return OP_LE;
+        case ast::SV_OP_GE: return OP_GE;
+        default: throw InternalError("Unexpected comparison op");
+    }
+}
+
+inline auto convert_sv_value(const std::shared_ptr<ast::Value> &sv_val) -> Value {
+    Value val;
+    auto *raw = sv_val.get();
+    if (auto *int_lit = dynamic_cast<ast::IntLit *>(raw)) {
+        val.set_int(int_lit->val);
+    } else if (auto *float_lit = dynamic_cast<ast::FloatLit *>(raw)) {
+        val.set_float(float_lit->val);
+    } else if (auto *str_lit = dynamic_cast<ast::StringLit *>(raw)) {
+        val.set_str(str_lit->val);
+    } else if (auto *bool_lit = dynamic_cast<ast::BoolLit *>(raw)) {
+        val.set_int(bool_lit->val ? 1 : 0);
+    } else {
+        throw InternalError("Unexpected sv value type");
+    }
+    return val;
+}
+
+inline auto convert_sv_type(ast::SvType sv_type) -> ColType {
+    switch (sv_type) {
+        case ast::SV_TYPE_INT:      return TYPE_INT;
+        case ast::SV_TYPE_FLOAT:    return TYPE_FLOAT;
+        case ast::SV_TYPE_STRING:   return TYPE_STRING;
+        case ast::SV_TYPE_DATETIME: return TYPE_DATETIME;
+        default: throw InternalError("Unexpected sv type");
+    }
 }
 
 #define YYSTYPE ast::SemValue
