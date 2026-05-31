@@ -52,6 +52,11 @@ struct LimitSpec {
     size_t offset = 0;
 };
 
+// ================================================================
+// Column lookup & matching helpers
+// Utility functions to search and match TabCol references against ColMeta
+// ================================================================
+//
 inline auto make_sort_key_specs(const std::vector<TabCol> &cols, bool is_desc = false) -> std::vector<SortKeySpec> {
     std::vector<SortKeySpec> keys;
     keys.reserve(cols.size());
@@ -78,6 +83,9 @@ inline auto find_col_meta(const std::vector<ColMeta> &cols, const TabCol &target
     return *it;
 }
 
+// ================================================================
+// Type system & comparison enums
+// ================================================================
 enum AggType {
     AGG_COUNT, AGG_SUM, AGG_AVG, AGG_MIN, AGG_MAX
 };
@@ -96,6 +104,19 @@ inline auto is_range_comp_op(CompOp op) -> bool {
     return op == OP_LT || op == OP_LE || op == OP_GT || op == OP_GE;
 }
 
+inline auto compare_result_matches_op(int cmp, CompOp op) -> bool {
+    switch (op) {
+        case OP_EQ: return cmp == 0;
+        case OP_NE: return cmp != 0;
+        case OP_LT: return cmp < 0;
+        case OP_GT: return cmp > 0;
+        case OP_LE: return cmp <= 0;
+        case OP_GE: return cmp >= 0;
+    }
+    throw InternalError("Unexpected value type in compare_values");
+}
+
+
 template <typename T>
 inline auto three_way_compare(const T &lhs, const T &rhs) -> int {
     if (lhs < rhs) return -1;
@@ -107,6 +128,14 @@ const std::map<CompOp, CompOp> kSwapOp = {
     {OP_EQ, OP_EQ}, {OP_NE, OP_NE}, {OP_LT, OP_GT}, {OP_GT, OP_LT}, {OP_LE, OP_GE}, {OP_GE, OP_LE},
 };
 
+// =====================================================
+// DATETIME support — calendar arithmetic & literal parsing/formatting
+// Internal representation: seconds since epoch (int64_t)
+// Covers: leap year detection, days-in-month,
+// civil-date ↔ days conversion,
+//         'YYYY-MM-DD HH:MM:SS' literal → seconds,
+// seconds → formatted string
+// =====================================================
 static constexpr int kDatetimeLen = static_cast<int>(sizeof(int64_t));
 static constexpr int64_t kSecondsPerDay = 24 * 60 * 60;
 
@@ -204,6 +233,9 @@ inline auto format_datetime_value(int64_t seconds) -> std::string {
     return std::string(buffer);
 }
 
+// ================================================================
+// Value — a typed value holder for StrixDB
+// ================================================================
 struct Value {
     ColType type;  // type of value
     union {
@@ -332,6 +364,11 @@ inline auto coerce_value_to_type(const Value &src, ColType target_type, bool all
     throw IncompatibleTypeError(coltype2str(target_type), coltype2str(src.type));
 }
 
+// ================================================================
+// Condition display & ordering utilities
+// Operator symbol, column/value key formatting, canonical sort key,
+// and deterministic ordering for condition sets.
+// ================================================================
 struct Condition {
     TabCol lhs_col;   // left-hand side column
     CompOp op;        // comparison operator
@@ -349,10 +386,110 @@ struct Condition {
     }
 };
 
+inline auto condition_op_symbol(CompOp op) -> std::string {
+    switch (op) {
+        case OP_EQ:
+            return "=";
+        case OP_NE:
+            return "<>";
+        case OP_LT:
+            return "<";
+        case OP_GT:
+            return ">";
+        case OP_LE:
+            return "<=";
+        case OP_GE:
+            return ">=";
+    }
+    throw InternalError("Unexpected comparison operator");
+}
+
+inline auto render_table_name(const std::string &table,
+                              const std::map<std::string, std::string> &table_display_names = {}) -> std::string {
+    auto it = table_display_names.find(table);
+    return it == table_display_names.end() ? table : it->second;
+}
+
+inline auto render_col(const TabCol &col,
+                       const std::map<std::string, std::string> &table_display_names = {}) -> std::string {
+    if (col.tab_name.empty()) {
+        return col.col_name;
+    }
+    return render_table_name(col.tab_name, table_display_names) + "." + col.col_name;
+}
+
+inline auto render_value(const Value &value) -> std::string {
+    if (value.type == TYPE_INT) {
+        return std::to_string(value.int_val);
+    }
+    if (value.type == TYPE_FLOAT) {
+        char buffer[64];
+        std::snprintf(buffer, sizeof(buffer), "%.6f", value.float_val);
+        return std::string(buffer);
+    }
+    if (value.type == TYPE_STRING) {
+        return "'" + value.str_val + "'";
+    }
+    if (value.type == TYPE_DATETIME) {
+        return "'" + format_datetime_value(value.datetime_val) + "'";
+    }
+    throw InternalError("Unexpected value type");
+}
+
+inline auto render_condition(const Condition &cond,
+                             const std::map<std::string, std::string> &table_display_names = {}) -> std::string {
+    auto rhs = cond.is_rhs_val ? render_value(cond.rhs_val) : render_col(cond.rhs_col, table_display_names);
+    return render_col(cond.lhs_col, table_display_names) + " " + condition_op_symbol(cond.op) + " " + rhs;
+}
+
+inline auto render_condition_list(const std::vector<Condition> &conds,
+                                  const std::map<std::string, std::string> &table_display_names = {}) -> std::string {
+    std::vector<std::string> rendered;
+    rendered.reserve(conds.size());
+    for (const auto &cond : conds) {
+        rendered.push_back(render_condition(cond, table_display_names));
+    }
+    std::sort(rendered.begin(), rendered.end());
+
+    std::string result = "[";
+    for (size_t i = 0; i < rendered.size(); ++i) {
+        if (i != 0) {
+            result += ", ";
+        }
+        result += rendered[i];
+    }
+    result += "]";
+    return result;
+}
+
+inline auto condition_col_key(const TabCol &col) -> std::string {
+    return render_col(col);
+}
+
+inline auto condition_value_key(const Value &value) -> std::string {
+    return render_value(value);
+}
+
+inline auto condition_sort_key(const Condition &cond) -> std::string {
+    return render_condition(cond);
+}
+
+inline auto condition_less(const Condition &lhs, const Condition &rhs) -> bool {
+    return condition_sort_key(lhs) < condition_sort_key(rhs);
+}
+
+inline void sort_conditions(std::vector<Condition> &conds) {
+    std::sort(conds.begin(), conds.end(), condition_less);
+}
+
 struct SetClause {
     TabCol lhs;
     Value rhs;
 };
+
+// ================================================================
+// Aggregation information — type, column, and star-aggregation flag
+// ================================================================
 
 struct AggInfo {
     AggType agg_type;

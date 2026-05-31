@@ -45,6 +45,7 @@ static constexpr size_t kDefaultAggregationRows = 1000000;
 static constexpr size_t kMaxEstimatedGroups = 200000;
 static constexpr size_t kHashAggregationMemoryBudgetBytes = 8 * 1024 * 1024;
 static constexpr double kHashAggregationSafetyFactor = 1.5;
+static constexpr int kMaxPlanTreeDepth = 256;
 
 using frame_id_t = int32_t;  // frame id type, 帧页ID, 页在BufferPool中的存储单元称为帧,一帧对应一页
 using page_id_t = int32_t;   // page id type , 页ID

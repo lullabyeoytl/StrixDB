@@ -15,6 +15,10 @@ See the Mulan PSL v2 for more details. */
 
 namespace {
 
+// ================================================================================
+// ORDER BY expression classification helper methods
+// ================================================================================
+
 enum class OrderExprKind {
     Column,
     Aggregate
@@ -30,6 +34,10 @@ auto classify_order_expr(const std::shared_ptr<ast::Expr> &expr) -> OrderExprKin
     throw InternalError("Unsupported ORDER BY expression type");
 }
 
+// ================================================================================
+// LIMIT/OFFSET normalization helper methods
+// ================================================================================
+
 auto normalize_limit_clause(const std::shared_ptr<ast::LimitClause> &limit_clause) -> LimitSpec {
     if (limit_clause->limit < 0) {
         throw RMDBError("LIMIT must not be negative");
@@ -40,7 +48,80 @@ auto normalize_limit_clause(const std::shared_ptr<ast::LimitClause> &limit_claus
     return LimitSpec{static_cast<size_t>(limit_clause->limit), static_cast<size_t>(limit_clause->offset)};
 }
 
-}  // namespace
+// ================================================================================
+// Table alias rewriting helper methods
+// ================================================================================
+
+void rewrite_col_table(std::shared_ptr<ast::Col> &col, const std::map<std::string, std::string> &name_to_table) {
+    if (col == nullptr || col->tab_name.empty()) {
+        return;
+    }
+    auto it = name_to_table.find(col->tab_name);
+    if (it != name_to_table.end()) {
+        col->tab_name = it->second;
+    }
+}
+
+void rewrite_expr_tables(std::shared_ptr<ast::Expr> &expr, const std::map<std::string, std::string> &name_to_table) {
+    if (auto col = std::dynamic_pointer_cast<ast::Col>(expr)) {
+        rewrite_col_table(col, name_to_table);
+    } else if (auto agg = std::dynamic_pointer_cast<ast::AggFunc>(expr); agg != nullptr && !agg->is_star) {
+        rewrite_col_table(agg->col, name_to_table);
+    }
+}
+
+void rewrite_binary_expr_tables(const std::shared_ptr<ast::BinaryExpr> &expr,
+                                const std::map<std::string, std::string> &name_to_table) {
+    rewrite_col_table(expr->lhs, name_to_table);
+    if (auto rhs_col = std::dynamic_pointer_cast<ast::Col>(expr->rhs)) {
+        rewrite_col_table(rhs_col, name_to_table);
+    }
+}
+
+void rewrite_select_tables(ast::SelectStmt &select, const std::map<std::string, std::string> &name_to_table) {
+    for (auto &item : select.select_items) {
+        rewrite_expr_tables(item->expr, name_to_table);
+    }
+    for (auto &cond : select.conds) {
+        rewrite_binary_expr_tables(cond, name_to_table);
+    }
+    for (auto &join_expr : select.jointree) {
+        auto left_it = name_to_table.find(join_expr->left);
+        if (left_it != name_to_table.end()) {
+            join_expr->left = left_it->second;
+        }
+        auto right_it = name_to_table.find(join_expr->right);
+        if (right_it != name_to_table.end()) {
+            join_expr->right = right_it->second;
+        }
+        for (auto &cond : join_expr->conds) {
+            rewrite_binary_expr_tables(cond, name_to_table);
+        }
+    }
+    if (select.has_group_by) {
+        for (auto &col : select.group_by->cols) {
+            rewrite_col_table(col, name_to_table);
+        }
+    }
+    if (select.has_sort) {
+        for (auto &item : select.order->items) {
+            rewrite_expr_tables(item->expr, name_to_table);
+        }
+    }
+    for (auto &having : select.having_conds) {
+        if (having->is_agg) {
+            if (!having->agg->is_star) {
+                rewrite_col_table(having->agg->col, name_to_table);
+            }
+        } else {
+            rewrite_col_table(having->col, name_to_table);
+        }
+    }
+}
+
+// ================================================================================
+// Aggregate expression conversion helper methods
+// ================================================================================
 
 AggInfo convert_agg_func(const std::shared_ptr<ast::AggFunc> &sv_agg) {
     AggInfo agg;
@@ -61,6 +142,9 @@ void append_unique_agg(std::vector<AggInfo> &agg_infos, const AggInfo &agg) {
     }
 }
 
+}  // namespace
+
+
 
 /**
  * @description: 分析器，进行语义分析和查询重写，需要检查不符合语义规定的部分
@@ -70,10 +154,24 @@ void append_unique_agg(std::vector<AggInfo> &agg_infos, const AggInfo &agg) {
 std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
 {
     std::shared_ptr<Query> query = std::make_shared<Query>();
+    if (auto explain = std::dynamic_pointer_cast<ast::ExplainAnalyzeStmt>(parse)) {
+        query->is_explain_analyze = true;
+        parse = explain->statement;
+        if (std::dynamic_pointer_cast<ast::SelectStmt>(parse) == nullptr) {
+            throw RMDBError("EXPLAIN ANALYZE is only supported for SELECT statements");
+        }
+    }
     if (auto x = std::dynamic_pointer_cast<ast::SelectStmt>(parse))
     {
         // 处理表名
-        query->tables = std::move(x->tabs);
+        query->tables = x->tabs;
+        std::map<std::string, std::string> name_to_table;
+        for (const auto &ref : x->table_refs) {
+            name_to_table[ref->name] = ref->name;
+            name_to_table[ref->alias] = ref->name;
+            query->table_display_names[ref->name] = ref->alias;
+        }
+        rewrite_select_tables(*x, name_to_table);
         /** TODO: 检查表是否存在 */
         for (auto &tab_name : query->tables) {
             if (!sm_manager_->db_.is_table(tab_name)) {
@@ -356,35 +454,6 @@ void Analyze::check_clause(const std::vector<ColMeta> &all_cols, std::vector<Con
     }
 }
 
-
-Value Analyze::convert_sv_value(const std::shared_ptr<ast::Value> &sv_val) {
-    Value val;
-    auto *raw = sv_val.get();
-    if (auto *int_lit = dynamic_cast<ast::IntLit *>(raw)) {
-        val.set_int(int_lit->val);
-    } else if (auto *float_lit = dynamic_cast<ast::FloatLit *>(raw)) {
-        val.set_float(float_lit->val);
-    } else if (auto *str_lit = dynamic_cast<ast::StringLit *>(raw)) {
-        val.set_str(str_lit->val);
-    } else if (auto *bool_lit = dynamic_cast<ast::BoolLit *>(raw)) {
-        val.set_int(bool_lit->val ? 1 : 0);
-    } else {
-        throw InternalError("Unexpected sv value type");
-    }
-    return val;
-}
-
-CompOp Analyze::convert_sv_comp_op(ast::SvCompOp op) {
-    switch (op) {
-        case ast::SV_OP_EQ: return OP_EQ;
-        case ast::SV_OP_NE: return OP_NE;
-        case ast::SV_OP_LT: return OP_LT;
-        case ast::SV_OP_GT: return OP_GT;
-        case ast::SV_OP_LE: return OP_LE;
-        case ast::SV_OP_GE: return OP_GE;
-        default: throw InternalError("Unexpected comparison op");
-    }
-}
 
 ColType Analyze::get_column_type(const std::vector<ColMeta> &all_cols, const TabCol &target) {
     auto col = find_col_meta(all_cols, target);

@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <cassert>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -30,6 +31,7 @@ class Query{
     std::vector<TabCol> cols;
     // 表名
     std::vector<std::string> tables;
+    std::map<std::string, std::string> table_display_names;
     // update 的set 值
     std::vector<SetClause> set_clauses;
     //insert 的values值
@@ -43,6 +45,7 @@ class Query{
     // ORDER BY keys are normalized during analysis so downstream layers share one spec model.
     std::vector<SortKeySpec> order_by_keys;
     std::optional<LimitSpec> limit_spec;
+    bool is_explain_analyze = false;
 
     Query(){}
 
@@ -65,8 +68,8 @@ private:
     void normalize_sv_conds(std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds, const std::vector<ColMeta> &all_cols);
     // 直接传入已经构造好的all_cols防止重复获取
     void check_clause(const std::vector<ColMeta> &all_cols, std::vector<Condition> &conds);
-    Value convert_sv_value(const std::shared_ptr<ast::Value> &sv_val);
-    CompOp convert_sv_comp_op(ast::SvCompOp op);
+
+
     ColType get_column_type(const std::vector<ColMeta> &all_cols, const TabCol &target);
     ColType agg_result_type(const AggInfo &agg, const std::vector<ColMeta> &all_cols);
     void check_aggregate(const std::vector<ColMeta> &all_cols, Query &query);
