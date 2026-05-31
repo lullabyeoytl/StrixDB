@@ -102,6 +102,44 @@ class Portal
         return render_condition_list(conds, table_display_names_);
     }
 
+    auto format_explain_condition(const Condition &cond) const -> std::string {
+        auto rhs = cond.is_rhs_val ? format_explain_value(cond.rhs_val) : format_col(cond.rhs_col);
+        return format_col(cond.lhs_col) + condition_op_symbol(cond.op) + rhs;
+    }
+
+    auto format_explain_value(const Value &value) const -> std::string {
+        if (value.type != TYPE_FLOAT) {
+            return render_value(value);
+        }
+        std::string rendered = render_value(value);
+        while (!rendered.empty() && rendered.back() == '0') {
+            rendered.pop_back();
+        }
+        if (!rendered.empty() && rendered.back() == '.') {
+            rendered.pop_back();
+        }
+        return rendered.empty() ? "0" : rendered;
+    }
+
+    auto format_explain_condition_list(const std::vector<Condition> &conds) const -> std::string {
+        std::vector<std::string> rendered;
+        rendered.reserve(conds.size());
+        for (const auto &cond : conds) {
+            rendered.push_back(format_explain_condition(cond));
+        }
+        std::sort(rendered.begin(), rendered.end());
+
+        std::string result = "[";
+        for (size_t i = 0; i < rendered.size(); ++i) {
+            if (i != 0) {
+                result += ", ";
+            }
+            result += rendered[i];
+        }
+        result += "]";
+        return result;
+    }
+
     // Recursively collect all tables referenced in a plan
     void collect_plan_tables(const std::shared_ptr<Plan> &plan, std::set<std::string> &tables,
                              int depth = 0) const {
@@ -109,7 +147,7 @@ class Portal
             throw InternalError("Plan tree depth exceeds limit");
         }
         if (auto scan = std::dynamic_pointer_cast<ScanPlan>(plan)) {
-            tables.insert(display_table_name(scan->tab_name_));
+            tables.insert(scan->tab_name_);
             return;
         }
         if (auto project = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
@@ -289,9 +327,12 @@ class Portal
             executor->set_explain_info("Project", "columns=" + columns);
             return executor;
         } else if(auto x = std::dynamic_pointer_cast<FilterPlan>(plan)) {
+            if (x->conds_.empty()) {
+                return convert_plan_executor(x->subplan_, context);
+            }
             auto executor = std::make_unique<FilterExecutor>(convert_plan_executor(x->subplan_, context),
                                                              x->conds_);
-            executor->set_explain_info("Filter", "conditions=" + format_condition_list(x->conds_));
+            executor->set_explain_info("Filter", "condition=" + format_explain_condition_list(x->conds_));
             return executor;
         } else if(auto x = std::dynamic_pointer_cast<LimitPlan>(plan)) {
             auto executor = std::make_unique<LimitExecutor>(convert_plan_executor(x->subplan_, context),
@@ -316,7 +357,7 @@ class Portal
             if(x->tag == T_SeqScan) {
                 auto executor = std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->all_conds_,
                                                                   x->empty_result_, context);
-                executor->set_explain_info("Scan", "table=" + display_table_name(x->tab_name_) +
+                executor->set_explain_info("Scan", "table=" + x->tab_name_ +
                                                        ", type=SeqScan");
                 return executor;
             }
@@ -324,7 +365,7 @@ class Portal
                 auto executor = std::make_unique<IndexScanExecutor>(sm_manager_, x->tab_name_, x->access_conds_,
                                                                     x->residual_conds_, x->index_col_names_,
                                                                     x->index_meta_, context);
-                executor->set_explain_info("Scan", "table=" + display_table_name(x->tab_name_) +
+                executor->set_explain_info("Scan", "table=" + x->tab_name_ +
                                                        ", type=IndexScan");
                 return executor;
             }
@@ -334,7 +375,7 @@ class Portal
             auto executor = std::make_unique<NestedLoopJoinExecutor>(std::move(left), std::move(right),
                                                                      x->conds_, x->join_type_);
             executor->set_explain_info("Join", "tables=" + format_table_list(plan) +
-                                                   ", conditions=" + format_condition_list(x->conds_));
+                                                   ", condition=" + format_explain_condition_list(x->conds_));
             return executor;
         } else if(auto x = std::dynamic_pointer_cast<SortMergeJoinPlan>(plan)) {
             std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_, context);
@@ -346,7 +387,7 @@ class Portal
             auto conds = x->merge_conds_;
             conds.insert(conds.end(), x->residual_conds_.begin(), x->residual_conds_.end());
             executor->set_explain_info("Join", "tables=" + format_table_list(plan) +
-                                                   ", conditions=" + format_condition_list(conds));
+                                                   ", condition=" + format_explain_condition_list(conds));
             return executor;
         } else if(auto x = std::dynamic_pointer_cast<HashJoinPlan>(plan)) {
             std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_, context);
@@ -358,7 +399,7 @@ class Portal
             auto conds = x->hash_conds_;
             conds.insert(conds.end(), x->residual_conds_.begin(), x->residual_conds_.end());
             executor->set_explain_info("Join", "tables=" + format_table_list(plan) +
-                                                   ", conditions=" + format_condition_list(conds));
+                                                   ", condition=" + format_explain_condition_list(conds));
             return executor;
         } else if(auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
             throw InternalError("Logical JoinPlan must be physicalized before executor conversion");
