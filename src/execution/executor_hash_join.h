@@ -193,6 +193,7 @@ class HashJoinExecutor : public AbstractExecutor {
                      JoinType join_type = INNER_JOIN) {
         left_ = std::move(left);
         right_ = std::move(right);
+        set_children({left_.get(), right_.get()});
         join_type_ = join_type;
         hash_conds_ = std::move(hash_conds);
         residual_conds_ = std::move(residual_conds);
@@ -208,7 +209,7 @@ class HashJoinExecutor : public AbstractExecutor {
         }
     }
 
-    void beginTuple() override {
+    void beginTupleImpl() override {
         if (join_type_ != INNER_JOIN && join_type_ != SEMI_JOIN) {
             throw InternalError("HashJoinExecutor only supports INNER_JOIN and SEMI_JOIN");
         }
@@ -241,7 +242,7 @@ class HashJoinExecutor : public AbstractExecutor {
         seek_next_match();
     }
 
-    std::unique_ptr<RmRecord> Next() override {
+    std::unique_ptr<RmRecord> NextImpl() override {
         if (isend_ || left_rec_ == nullptr) {
             return nullptr;
         }
@@ -262,4 +263,5 @@ class HashJoinExecutor : public AbstractExecutor {
     size_t tupleLen() const override { return output_len_; }
 
     const std::vector<ColMeta> &cols() const override { return output_cols_; }
+
 };

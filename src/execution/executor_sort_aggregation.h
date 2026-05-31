@@ -83,6 +83,7 @@ class SortAggregationExecutor : public AbstractExecutor, private AggregationStat
                             std::vector<TabCol> group_by_cols, std::vector<HavingCond> having_conds,
                             std::vector<SortKeySpec> sort_keys) {
         prev_ = std::move(prev);
+        set_children({prev_.get()});
         agg_infos_ = std::move(agg_infos);
         group_by_cols_ = std::move(group_by_cols);
         having_conds_ = std::move(having_conds);
@@ -97,7 +98,7 @@ class SortAggregationExecutor : public AbstractExecutor, private AggregationStat
         rid_ = Rid{-1, -1};
     }
 
-    void beginTuple() override {
+    void beginTupleImpl() override {
         built_ = false;
         cursor_ = 0;
         build_groups();
@@ -110,7 +111,7 @@ class SortAggregationExecutor : public AbstractExecutor, private AggregationStat
         }
     }
 
-    std::unique_ptr<RmRecord> Next() override {
+    std::unique_ptr<RmRecord> NextImpl() override {
         if (is_end()) {
             return nullptr;
         }

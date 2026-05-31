@@ -10,6 +10,8 @@ See the Mulan PSL v2 for more details. */
 
 #include "execution_manager.h"
 
+#include <algorithm>
+
 #include "execution_common.h"
 #include "executor_delete.h"
 #include "executor_index_scan.h"
@@ -20,6 +22,87 @@ See the Mulan PSL v2 for more details. */
 #include "executor_update.h"
 #include "index/ix.h"
 #include "record_printer.h"
+
+namespace {
+
+auto indent(int depth) -> std::string {
+    return std::string(static_cast<size_t>(depth), '\t');
+}
+
+void append_executor_tree(const AbstractExecutor *executor, int depth, std::string &out) {
+    if (executor == nullptr) {
+        return;
+    }
+    if (depth >= kMaxPlanTreeDepth) {
+        throw InternalError("Executor tree depth exceeds limit");
+    }
+
+    std::string name = executor->explain_name();
+    out += indent(depth) + name + "(";
+    if (!executor->explain_attrs().empty()) {
+        out += executor->explain_attrs() + ", ";
+    }
+    out += "rows=" + std::to_string(executor->rows()) + ")\n";
+
+    auto children = executor->children();
+    if (name != "Join") {
+        std::stable_sort(children.begin(), children.end(),
+                         [](const AbstractExecutor *lhs, const AbstractExecutor *rhs) {
+                             auto rank = [](const AbstractExecutor *node) {
+                                 if (node == nullptr) {
+                                     return 5;
+                                 }
+                                 const auto &name = node->explain_name();
+                                 if (name == "Filter") {
+                                     return 0;
+                                 }
+                                 if (name == "Join") {
+                                     return 1;
+                                 }
+                                 if (name == "Project") {
+                                     return 2;
+                                 }
+                                 if (name == "Scan") {
+                                     return 3;
+                                 }
+                                 return 4;
+                             };
+                             return rank(lhs) < rank(rhs);
+                         });
+    }
+
+    for (const auto *child : children) {
+        append_executor_tree(child, depth + 1, out);
+    }
+}
+
+void write_bounded_output(const std::string &output, Context *context) {
+    if (context == nullptr || context->data_send_ == nullptr || context->offset_ == nullptr) {
+        return;
+    }
+    if (*(context->offset_) < 0) {
+        *(context->offset_) = 0;
+    }
+
+    auto offset = static_cast<size_t>(*(context->offset_));
+    if (offset >= BUFFER_LENGTH - 1) {
+        *(context->offset_) = BUFFER_LENGTH - 1;
+        context->data_send_[*(context->offset_)] = '\0';
+        context->ellipsis_ = true;
+        return;
+    }
+
+    size_t writable = BUFFER_LENGTH - 1 - offset;
+    size_t write_len = std::min(writable, output.size());
+    memcpy(context->data_send_ + offset, output.c_str(), write_len);
+    *(context->offset_) += static_cast<int>(write_len);
+    context->data_send_[*(context->offset_)] = '\0';
+    if (write_len < output.size()) {
+        context->ellipsis_ = true;
+    }
+}
+
+}  // namespace
 
 const char *help_info = "Supported SQL syntax:\n"
                    "  command ;\n"
@@ -230,6 +313,20 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     rec_printer.print_separator(context);
     // Print record count into buffer
     RecordPrinter::print_record_count(num_rec, context);
+}
+
+void QlManager::explain_analyze(std::unique_ptr<AbstractExecutor> executorTreeRoot, Context *context) {
+    for (executorTreeRoot->beginTuple(); !executorTreeRoot->is_end(); executorTreeRoot->nextTuple()) {
+        executorTreeRoot->Next();
+    }
+
+    std::string output;
+    if (executorTreeRoot->explain_name().empty()) {
+        output = "Project(rows=" + std::to_string(executorTreeRoot->rows()) + ")\n";
+    } else {
+        append_executor_tree(executorTreeRoot.get(), 0, output);
+    }
+    write_bounded_output(output, context);
 }
 
 // 执行DML语句

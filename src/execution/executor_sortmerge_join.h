@@ -181,6 +181,7 @@ class SortMergeJoinExecutor : public AbstractExecutor {
                           JoinType join_type = INNER_JOIN) {
         left_ = std::move(left);
         right_ = std::move(right);
+        set_children({left_.get(), right_.get()});
         join_type_ = join_type;
         merge_conds_ = std::move(merge_conds);
         residual_conds_ = std::move(residual_conds);
@@ -197,7 +198,7 @@ class SortMergeJoinExecutor : public AbstractExecutor {
         }
     }
 
-    void beginTuple() override {
+    void beginTupleImpl() override {
         if (merge_conds_.empty()) {
             throw InternalError("SortMergeJoinExecutor requires at least one merge key");
         }
@@ -233,7 +234,7 @@ class SortMergeJoinExecutor : public AbstractExecutor {
         seek_next_match();
     }
 
-    std::unique_ptr<RmRecord> Next() override {
+    std::unique_ptr<RmRecord> NextImpl() override {
         if (isend_ || left_rec_ == nullptr) {
             return nullptr;
         }
@@ -254,4 +255,5 @@ class SortMergeJoinExecutor : public AbstractExecutor {
     size_t tupleLen() const override { return output_len_; }
 
     const std::vector<ColMeta> &cols() const override { return output_cols_; }
+
 };

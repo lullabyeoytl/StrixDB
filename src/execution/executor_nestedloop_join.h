@@ -57,7 +57,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
             }
             left_rid_ = left_->rid();
             left_rec_ = left_->Next();
-            right_->beginTuple();
+            right_->restartTuple();
         }
 
         while (!left_->is_end()) {
@@ -75,7 +75,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
             }
             left_rid_ = left_->rid();
             left_rec_ = left_->Next();
-            right_->beginTuple();
+            right_->restartTuple();
         }
 
         set_end();
@@ -86,6 +86,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
                             std::vector<Condition> conds, JoinType join_type = INNER_JOIN) {
         left_ = std::move(left);
         right_ = std::move(right);
+        set_children({left_.get(), right_.get()});
         join_type_ = join_type;
         left_len_ = left_->tupleLen();
         right_len_ = right_->tupleLen();
@@ -99,7 +100,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
 
     }
 
-    void beginTuple() override {
+    void beginTupleImpl() override {
         left_->beginTuple();
         if (left_->is_end()) {
             set_end();
@@ -124,7 +125,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
         seek_next_match(false);
     }
 
-    std::unique_ptr<RmRecord> Next() override {
+    std::unique_ptr<RmRecord> NextImpl() override {
         if (isend || left_rec_ == nullptr || right_rec_ == nullptr) {
             return nullptr;
         }
@@ -142,4 +143,5 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
     size_t tupleLen() const override { return output_len_; }
 
     const std::vector<ColMeta> &cols() const override { return output_cols_; }
+
 };

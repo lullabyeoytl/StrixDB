@@ -66,7 +66,11 @@ class SeqScanExecutor : public AbstractExecutor {
         set_end();
     }
 
-    void beginTuple() override {
+    void beginTupleImpl() override {
+        restartTupleImpl();
+    }
+
+    void restartTupleImpl() override {
         if (empty_result_) {
             scan_.reset();
             set_end();
@@ -86,7 +90,7 @@ class SeqScanExecutor : public AbstractExecutor {
         seek_to_next_valid();
     }
 
-    std::unique_ptr<RmRecord> Next() override {
+    std::unique_ptr<RmRecord> NextImpl() override {
         if (is_end()) {
             return nullptr;
         }

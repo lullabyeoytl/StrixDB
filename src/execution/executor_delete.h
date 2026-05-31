@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_defs.h"
 #include "execution_manager.h"
 #include "executor_abstract.h"
+#include "executor_filter.h"
 #include "index/ix.h"
 #include "system/sm.h"
 #include <memory>
@@ -22,11 +23,18 @@ See the Mulan PSL v2 for more details. */
 class DeleteExecutor : public AbstractExecutor {
    private:
     TabMeta tab_;                   // 表的元数据
-    std::vector<Condition> conds_;  // delete的条件
     RmFileHandle *fh_;              // 表的数据文件句柄
     std::string tab_name_;          // 表名称
     SmManager *sm_manager_;
     std::unique_ptr<AbstractExecutor> scan_executor_;  // 扫描子执行器，负责提供待删除记录与位置
+
+    auto leaf_scan_type(AbstractExecutor *executor) const -> std::string {
+        auto *current = executor;
+        while (auto *filter = dynamic_cast<FilterExecutor *>(current)) {
+            current = filter->child_executor();
+        }
+        return current == nullptr ? std::string() : current->getType();
+    }
 
     /**
      * @brief Delete index entries for a single record across all indexes.
@@ -41,14 +49,14 @@ class DeleteExecutor : public AbstractExecutor {
     }
 
    public:
-    DeleteExecutor(SmManager *sm_manager, const std::string &tab_name, std::vector<Condition> conds,
+    DeleteExecutor(SmManager *sm_manager, const std::string &tab_name,
                    std::unique_ptr<AbstractExecutor> scan_executor, Context *context) {
         sm_manager_ = sm_manager;
         tab_name_ = tab_name;
         tab_ = sm_manager_->db_.get_table(tab_name);
         fh_ = sm_manager_->fhs_.at(tab_name).get();
-        conds_ = std::move(conds);
         scan_executor_ = std::move(scan_executor);
+        set_children({scan_executor_.get()});
         context_ = context;
         if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
             context_->lock_mgr_->lock_IX_on_table(context_->txn_, fh_->GetFd());
@@ -61,7 +69,7 @@ class DeleteExecutor : public AbstractExecutor {
      * Sequential scans can delete rows as they are produced.
      * Index scans must be drained first so index mutations do not destabilize iteration.
      */
-    std::unique_ptr<RmRecord> Next() override {
+    std::unique_ptr<RmRecord> NextImpl() override {
         // Pre-compute index handles (loop-invariant across rows)
         std::vector<IxIndexHandle *> index_handles;
         index_handles.reserve(tab_.indexes.size());
@@ -69,7 +77,9 @@ class DeleteExecutor : public AbstractExecutor {
             index_handles.push_back(sm_manager_->get_ih(tab_name_, tab_.indexes[i].cols));
         }
 
-        if (scan_executor_->getType() == "SeqScanExecutor") {
+        auto scan_type = leaf_scan_type(scan_executor_.get());
+
+        if (scan_type == "SeqScanExecutor") {
             // Sequential scans can stream records one by one because deleting the current row
             // does not invalidate the remaining table scan order.
             for (scan_executor_->beginTuple(); !scan_executor_->is_end(); scan_executor_->nextTuple()) {
@@ -97,7 +107,7 @@ class DeleteExecutor : public AbstractExecutor {
             return nullptr;
         }
 
-        if (scan_executor_->getType() == "IndexScanExecutor") {
+        if (scan_type == "IndexScanExecutor") {
             struct DeleteCandidate {
                 Rid rid;
                 std::unique_ptr<RmRecord> rec;

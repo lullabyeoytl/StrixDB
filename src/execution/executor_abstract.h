@@ -10,6 +10,11 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include "execution_defs.h"
 #include "execution_common.h"
 #include "common/common.h"
@@ -17,6 +22,24 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm.h"
 
 class AbstractExecutor: public NonCopyable {
+   private:
+    size_t rows_ = 0;
+    std::vector<AbstractExecutor *> children_;
+    std::string explain_name_;
+    std::string explain_attrs_;
+
+   protected:
+    void set_children(std::vector<AbstractExecutor *> children) {
+        children_ = std::move(children);
+    }
+
+    virtual void beginTupleImpl(){};
+    
+    // 只用于nestedloop join, 对子树反复回归后统计值保留
+    virtual void restartTupleImpl() { beginTupleImpl(); };
+
+    virtual std::unique_ptr<RmRecord> NextImpl() = 0;
+
    public:
     Rid _abstract_rid;
 
@@ -27,21 +50,60 @@ class AbstractExecutor: public NonCopyable {
     virtual size_t tupleLen() const { return 0; };
 
     virtual const std::vector<ColMeta> &cols() const {
-        std::vector<ColMeta> *_cols = nullptr;
-        return *_cols;
+        throw InternalError("Executor does not expose output columns");
     };
 
     virtual std::string getType() { return "AbstractExecutor"; };
 
-    virtual void beginTuple(){};
+    void set_explain_info(std::string name, std::string attrs = std::string()) {
+        explain_name_ = std::move(name);
+        explain_attrs_ = std::move(attrs);
+    }
+
+    const std::string &explain_name() const { return explain_name_; }
+
+    const std::string &explain_attrs() const { return explain_attrs_; }
+
+    void beginTuple() {
+        reset_rows();
+        beginTupleImpl();
+    };
+
+    void restartTuple() { restartTupleImpl(); };
 
     virtual void nextTuple(){};
 
     virtual bool is_end() const { return true; };
 
+    virtual size_t rows() const { return rows_; }
+
+    void reset_rows() {
+        rows_ = 0;
+        for (auto *child : children_) {
+            if (child != nullptr) {
+                child->reset_rows();
+            }
+        }
+    }
+
+    std::vector<const AbstractExecutor *> children() const {
+        std::vector<const AbstractExecutor *> result;
+        result.reserve(children_.size());
+        for (const auto *child : children_) {
+            result.push_back(child);
+        }
+        return result;
+    }
+
     virtual Rid &rid() = 0;
 
-    virtual std::unique_ptr<RmRecord> Next() = 0;
+    std::unique_ptr<RmRecord> Next() {
+        auto record = NextImpl();
+        if (record != nullptr) {
+            ++rows_;
+        }
+        return record;
+    }
 
     virtual ColMeta get_col_offset(const TabCol &target) { return ColMeta();};
 

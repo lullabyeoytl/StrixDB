@@ -21,6 +21,7 @@ class LimitExecutor : public AbstractExecutor {
     void skip_offset_rows() {
         size_t skipped = 0;
         while (skipped < offset_ && !prev_->is_end()) {
+            prev_->Next();
             prev_->nextTuple();
             ++skipped;
         }
@@ -37,6 +38,7 @@ class LimitExecutor : public AbstractExecutor {
    public:
     LimitExecutor(std::unique_ptr<AbstractExecutor> prev, const LimitSpec &limit_spec) {
         prev_ = std::move(prev);
+        set_children({prev_.get()});
         cols_ = prev_->cols();
         if (!cols_.empty()) {
             len_ = cols_.back().offset + cols_.back().len;
@@ -45,7 +47,7 @@ class LimitExecutor : public AbstractExecutor {
         offset_ = limit_spec.offset;
     }
 
-    void beginTuple() override {
+    void beginTupleImpl() override {
         emitted_ = 0;
         positioned_ = true;
         prev_->beginTuple();
@@ -66,7 +68,7 @@ class LimitExecutor : public AbstractExecutor {
         refresh_rid();
     }
 
-    std::unique_ptr<RmRecord> Next() override {
+    std::unique_ptr<RmRecord> NextImpl() override {
         if (is_end()) {
             return nullptr;
         }

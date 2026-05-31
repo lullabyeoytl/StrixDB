@@ -49,6 +49,7 @@ class SortExecutor : public AbstractExecutor {
    public:
     SortExecutor(std::unique_ptr<AbstractExecutor> prev, std::vector<SortKeySpec> sort_keys) {
         prev_ = std::move(prev);
+        set_children({prev_.get()});
         cols_ = prev_->cols();
         if (sort_keys.empty()) {
             throw InternalError("SortExecutor requires at least one sort key");
@@ -66,7 +67,7 @@ class SortExecutor : public AbstractExecutor {
         : SortExecutor(std::move(prev), std::vector<SortKeySpec>{std::move(sort_key)}) {
     }
 
-    void beginTuple() override { 
+    void beginTupleImpl() override {
         tuples_.clear();
         tuple_rids_.clear();
         order_.clear();
@@ -105,7 +106,7 @@ class SortExecutor : public AbstractExecutor {
         }
     }
 
-    std::unique_ptr<RmRecord> Next() override {
+    std::unique_ptr<RmRecord> NextImpl() override {
         if (is_end()) {
             return nullptr;
         }

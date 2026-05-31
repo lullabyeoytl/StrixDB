@@ -306,6 +306,7 @@ class AggregationExecutor : public AbstractExecutor, private AggregationStateHel
     AggregationExecutor(std::unique_ptr<AbstractExecutor> prev, std::vector<AggInfo> agg_infos,
                         std::vector<TabCol> group_by_cols, std::vector<HavingCond> having_conds) {
         prev_ = std::move(prev);
+        set_children({prev_.get()});
         agg_infos_ = std::move(agg_infos);
         group_by_cols_ = std::move(group_by_cols);
         having_conds_ = std::move(having_conds);
@@ -314,7 +315,7 @@ class AggregationExecutor : public AbstractExecutor, private AggregationStateHel
         build_output_cols(prev_->cols());
     }
 
-    void beginTuple() override {
+    void beginTupleImpl() override {
         build_groups();
         iter_ = groups_.begin();
         built_ = true;
@@ -327,7 +328,7 @@ class AggregationExecutor : public AbstractExecutor, private AggregationStateHel
         ++iter_;
     }
 
-    std::unique_ptr<RmRecord> Next() override {
+    std::unique_ptr<RmRecord> NextImpl() override {
         if (is_end()) {
             return nullptr;
         }

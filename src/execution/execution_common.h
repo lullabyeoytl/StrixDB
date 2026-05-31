@@ -11,18 +11,11 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <vector>
-#include <optional>
 
 
 #include "transaction/transaction.h"
 #include "transaction/transaction_manager.h"
 #include "common/common.h"
-
-auto ReconstructTuple(const TabMeta *schema, const RmRecord &base_tuple, const TupleMeta &base_meta,
-                      const std::vector<UndoLog> &undo_logs) -> std::optional<RmRecord>;
-
-
-auto IsWriteWriteConflict(timestamp_t tuple_ts, Transaction *txn) -> bool;
 
 
 inline auto get_col_value(const RmRecord &record, const ColMeta &col) -> Value {
@@ -45,16 +38,7 @@ inline auto get_col_value(const RmRecord &record, const ColMeta &col) -> Value {
 }
 
 inline auto compare_values(const Value &lhs, const Value &rhs, CompOp op) -> bool {
-    int cmp = lhs.compare(rhs);
-    switch (op) {
-        case OP_EQ: return cmp == 0;
-        case OP_NE: return cmp != 0;
-        case OP_LT: return cmp < 0;
-        case OP_GT: return cmp > 0;
-        case OP_LE: return cmp <= 0;
-        case OP_GE: return cmp >= 0;
-    }
-    throw InternalError("Unexpected value type in compare_values");
+    return compare_result_matches_op(lhs.compare(rhs), op);
 }
 
 inline auto evaluate_condition(const Condition &cond, const RmRecord &record, const std::vector<ColMeta> &cols) -> bool {

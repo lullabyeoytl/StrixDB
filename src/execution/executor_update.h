@@ -28,12 +28,19 @@ See the Mulan PSL v2 for more details. */
 class UpdateExecutor : public AbstractExecutor {
    private:
     TabMeta tab_;
-    std::vector<Condition> conds_;
     RmFileHandle *fh_;
     std::unique_ptr<AbstractExecutor> scan_executor_;
     std::string tab_name_;
     std::vector<SetClause> set_clauses_;
     SmManager *sm_manager_;
+
+    auto leaf_scan_type(AbstractExecutor *executor) const -> std::string {
+        auto *current = executor;
+        while (auto *filter = dynamic_cast<FilterExecutor *>(current)) {
+            current = filter->child_executor();
+        }
+        return current == nullptr ? std::string() : current->getType();
+    }
 
     struct PreparedIndexState {
         std::vector<ColMeta *> set_cols;
@@ -262,14 +269,14 @@ class UpdateExecutor : public AbstractExecutor {
 
    public:
     UpdateExecutor(SmManager *sm_manager, const std::string &tab_name, std::vector<SetClause> set_clauses,
-                   std::vector<Condition> conds, std::unique_ptr<AbstractExecutor> scan_executor, Context *context) {
+                   std::unique_ptr<AbstractExecutor> scan_executor, Context *context) {
         sm_manager_ = sm_manager;
         tab_name_ = tab_name;
         set_clauses_ = set_clauses;
         tab_ = sm_manager_->db_.get_table(tab_name);
         fh_ = sm_manager_->fhs_.at(tab_name).get();
-        conds_ = conds;
         scan_executor_ = std::move(scan_executor);
+        set_children({scan_executor_.get()});
         context_ = context;
         if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
             context_->lock_mgr_->lock_IX_on_table(context_->txn_, fh_->GetFd());
@@ -282,15 +289,17 @@ class UpdateExecutor : public AbstractExecutor {
      * Sequential scans persist row by row.
      * Index scans are fully consumed first to keep the scan cursor stable.
      */
-    std::unique_ptr<RmRecord> Next() override {
+    std::unique_ptr<RmRecord> NextImpl() override {
         PreparedIndexState state = prepare_update_state();
 
-        if (scan_executor_->getType() == "SeqScanExecutor") {
+        auto scan_type = leaf_scan_type(scan_executor_.get());
+
+        if (scan_type == "SeqScanExecutor") {
             execute_seq_scan_path(state);
             return nullptr;
         }
 
-        if (scan_executor_->getType() == "IndexScanExecutor") {
+        if (scan_type == "IndexScanExecutor") {
             execute_index_scan_path(state);
             return nullptr;
         }
