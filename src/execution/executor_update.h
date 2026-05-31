@@ -42,7 +42,7 @@ class UpdateExecutor : public AbstractExecutor {
         rids_ = rids;
         context_ = context;
     }
-    std::unique_ptr<RmRecord> Next() override {
+    std::unique_ptr<RmRecord> NextImpl() override {
         // Pre-compute: type check + raw buffer + column pointers (loop-invariant)
         std::vector<ColMeta *> set_cols;
         set_cols.reserve(set_clauses_.size());

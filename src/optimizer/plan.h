@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <cassert>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -45,6 +46,7 @@ typedef enum PlanTag{
     T_NestLoop,
     T_SortMerge,    // sort merge join
     T_Sort,
+    T_Filter,
     T_Projection,
     T_Aggregation
 } PlanTag;
@@ -148,7 +150,21 @@ class ProjectionPlan : public Plan
         ~ProjectionPlan(){}
         std::shared_ptr<Plan> subplan_;
         std::vector<TabCol> sel_cols_;
-        
+
+};
+
+class FilterPlan : public Plan
+{
+    public:
+        FilterPlan(std::shared_ptr<Plan> subplan, std::vector<Condition> conds)
+        {
+            Plan::tag = T_Filter;
+            subplan_ = std::move(subplan);
+            conds_ = std::move(conds);
+        }
+        ~FilterPlan(){}
+        std::shared_ptr<Plan> subplan_;
+        std::vector<Condition> conds_;
 };
 
 class SortPlan : public Plan
@@ -195,7 +211,8 @@ class DMLPlan : public Plan
     public:
         DMLPlan(PlanTag tag, std::shared_ptr<Plan> subplan,std::string tab_name,
                 std::vector<Value> values, std::vector<Condition> conds,
-                std::vector<SetClause> set_clauses)
+                std::vector<SetClause> set_clauses, bool is_explain_analyze = false,
+                std::map<std::string, std::string> table_display_names = {}, bool display_wildcard = false)
         {
             Plan::tag = tag;
             subplan_ = std::move(subplan);
@@ -203,6 +220,9 @@ class DMLPlan : public Plan
             values_ = std::move(values);
             conds_ = std::move(conds);
             set_clauses_ = std::move(set_clauses);
+            is_explain_analyze_ = is_explain_analyze;
+            table_display_names_ = std::move(table_display_names);
+            display_wildcard_ = display_wildcard;
         }
         ~DMLPlan(){}
         std::shared_ptr<Plan> subplan_;
@@ -210,6 +230,9 @@ class DMLPlan : public Plan
         std::vector<Value> values_;
         std::vector<Condition> conds_;
         std::vector<SetClause> set_clauses_;
+        bool is_explain_analyze_ = false;
+        std::map<std::string, std::string> table_display_names_;
+        bool display_wildcard_ = false;
 };
 
 // ddl语句, 包括create/drop table; create/drop index;

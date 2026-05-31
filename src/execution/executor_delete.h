@@ -36,7 +36,7 @@ class DeleteExecutor : public AbstractExecutor {
         context_ = context;
     }
 
-    std::unique_ptr<RmRecord> Next() override {
+    std::unique_ptr<RmRecord> NextImpl() override {
         // Pre-compute index handles (loop-invariant across rows)
         std::vector<IxIndexHandle *> index_handles;
         index_handles.reserve(tab_.indexes.size());

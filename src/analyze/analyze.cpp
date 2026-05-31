@@ -12,8 +12,77 @@ See the Mulan PSL v2 for more details. */
 #include "errors.h"
 
 #include <algorithm>
+#include <map>
 
 namespace {
+
+void rewrite_col_table(std::shared_ptr<ast::Col> &col, const std::map<std::string, std::string> &name_to_table) {
+    if (col == nullptr || col->tab_name.empty()) {
+        return;
+    }
+    auto it = name_to_table.find(col->tab_name);
+    if (it != name_to_table.end()) {
+        col->tab_name = it->second;
+    }
+}
+
+void rewrite_expr_tables(std::shared_ptr<ast::Expr> &expr, const std::map<std::string, std::string> &name_to_table) {
+    if (auto col = std::dynamic_pointer_cast<ast::Col>(expr)) {
+        rewrite_col_table(col, name_to_table);
+    } else if (auto agg = std::dynamic_pointer_cast<ast::AggFunc>(expr); agg != nullptr && !agg->is_star) {
+        rewrite_col_table(agg->col, name_to_table);
+    }
+}
+
+void rewrite_binary_expr_tables(const std::shared_ptr<ast::BinaryExpr> &expr,
+                                const std::map<std::string, std::string> &name_to_table) {
+    if (expr == nullptr) {
+        return;
+    }
+    rewrite_col_table(expr->lhs, name_to_table);
+    if (auto rhs_col = std::dynamic_pointer_cast<ast::Col>(expr->rhs)) {
+        rewrite_col_table(rhs_col, name_to_table);
+    }
+}
+
+void rewrite_select_tables(ast::SelectStmt &select, const std::map<std::string, std::string> &name_to_table) {
+    for (auto &expr : select.cols) {
+        rewrite_expr_tables(expr, name_to_table);
+    }
+    for (auto &cond : select.conds) {
+        rewrite_binary_expr_tables(cond, name_to_table);
+    }
+    for (auto &join_expr : select.jointree) {
+        auto left_it = name_to_table.find(join_expr->left);
+        if (left_it != name_to_table.end()) {
+            join_expr->left = left_it->second;
+        }
+        auto right_it = name_to_table.find(join_expr->right);
+        if (right_it != name_to_table.end()) {
+            join_expr->right = right_it->second;
+        }
+        for (auto &cond : join_expr->conds) {
+            rewrite_binary_expr_tables(cond, name_to_table);
+        }
+    }
+    if (select.has_group_by) {
+        for (auto &col : select.group_by->cols) {
+            rewrite_col_table(col, name_to_table);
+        }
+    }
+    if (select.has_sort) {
+        rewrite_col_table(select.order->cols, name_to_table);
+    }
+    for (auto &having : select.having_conds) {
+        if (having->is_agg) {
+            if (!having->agg->is_star) {
+                rewrite_col_table(having->agg->col, name_to_table);
+            }
+        } else {
+            rewrite_col_table(having->col, name_to_table);
+        }
+    }
+}
 
 AggInfo convert_agg_func(const std::shared_ptr<ast::AggFunc> &sv_agg) {
     AggInfo agg;
@@ -44,10 +113,24 @@ void append_unique_agg(std::vector<AggInfo> &agg_infos, const AggInfo &agg) {
 std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
 {
     std::shared_ptr<Query> query = std::make_shared<Query>();
+    if (auto explain = std::dynamic_pointer_cast<ast::ExplainAnalyzeStmt>(parse)) {
+        query->is_explain_analyze = true;
+        parse = explain->statement;
+        if (std::dynamic_pointer_cast<ast::SelectStmt>(parse) == nullptr) {
+            throw RMDBError("EXPLAIN ANALYZE is only supported for SELECT statements");
+        }
+    }
     if (auto x = std::dynamic_pointer_cast<ast::SelectStmt>(parse))
     {
         // 处理表名
-        query->tables = std::move(x->tabs);
+        query->tables = x->tabs;
+        std::map<std::string, std::string> name_to_table;
+        for (const auto &ref : x->table_refs) {
+            name_to_table[ref->name] = ref->name;
+            name_to_table[ref->alias] = ref->name;
+            query->table_display_names[ref->name] = ref->alias;
+        }
+        rewrite_select_tables(*x, name_to_table);
         /** TODO: 检查表是否存在 */
         for (auto &tab_name : query->tables) {
             if (!sm_manager_->db_.is_table(tab_name)) {

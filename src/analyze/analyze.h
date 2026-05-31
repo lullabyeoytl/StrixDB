@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <cassert>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -30,6 +31,7 @@ class Query{
     std::vector<TabCol> cols;
     // 表名
     std::vector<std::string> tables;
+    std::map<std::string, std::string> table_display_names;
     // update 的set 值
     std::vector<SetClause> set_clauses;
     //insert 的values值
@@ -39,6 +41,7 @@ class Query{
     std::vector<TabCol> select_items;
     std::vector<TabCol> group_by_cols;
     std::vector<HavingCond> having_conds;
+    bool is_explain_analyze = false;
 
     Query(){}
 

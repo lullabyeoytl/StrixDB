@@ -11,6 +11,15 @@ void yyerror(YYLTYPE *locp, const char* s) {
 }
 
 using namespace ast;
+
+void append_join_clause(std::vector<std::shared_ptr<JoinExpr>> &join_exprs,
+                        std::vector<std::shared_ptr<TableRef>> &right_refs,
+                        std::shared_ptr<TableRef> right_ref,
+                        std::vector<std::shared_ptr<BinaryExpr>> conds,
+                        JoinType type) {
+    join_exprs.push_back(std::make_shared<JoinExpr>(std::string(), right_ref->alias, std::move(conds), type));
+    right_refs.push_back(std::move(right_ref));
+}
 %}
 
 // request a pure (reentrant) parser
@@ -22,8 +31,8 @@ using namespace ast;
 
 // keywords
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
-WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX UNIQUE AND ON SEMI JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
-%token COUNT SUM AVG MIN MAX GROUP HAVING
+WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX UNIQUE AS AND ON SEMI JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
+%token COUNT SUM AVG MIN MAX GROUP HAVING EXPLAIN ANALYZE
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
 
@@ -34,7 +43,7 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX UNIQUE AND ON SEMI JOIN EXIT HELP T
 %token <sv_bool> VALUE_BOOL
 
 // specify types for non-terminal symbol
-%type <sv_node> stmt dbStmt ddl dml txnStmt setStmt
+%type <sv_node> stmt dbStmt ddl dml txnStmt setStmt selectStmt
 %type <sv_field> field
 %type <sv_fields> fieldList
 %type <sv_type_len> type
@@ -45,7 +54,9 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX UNIQUE AND ON SEMI JOIN EXIT HELP T
 %type <sv_val> value
 %type <sv_vals> valueList
 %type <sv_str> tbName colName
-%type <sv_strs> tableList colNameList
+%type <sv_strs> colNameList
+%type <sv_table_ref> tableRef
+%type <sv_table_refs> tableRefList
 %type <sv_join_exprs> joinClauseList
 %type <sv_join_type> joinType
 %type <sv_col> col
@@ -86,7 +97,11 @@ start:
     ;
 
 stmt:
-        dbStmt
+        EXPLAIN ANALYZE selectStmt
+    {
+        $$ = std::make_shared<ExplainAnalyzeStmt>($3);
+    }
+    |   dbStmt
     |   ddl
     |   dml
     |   txnStmt
@@ -170,34 +185,59 @@ dml:
     {
         $$ = std::make_shared<UpdateStmt>($2, $4, $5);
     }
-    |   SELECT selector FROM tableList optWhereClause opt_group_clause opt_having_clause opt_order_clause
+    |   selectStmt
+    ;
+
+selectStmt:
+        SELECT selector FROM tableRefList optWhereClause opt_group_clause opt_having_clause opt_order_clause
     {
-        $$ = std::make_shared<SelectStmt>($2, $4, $5, $8, $6, $7);
+        std::vector<std::string> tabs;
+        tabs.reserve($4.size());
+        for (const auto &ref : $4) {
+            tabs.push_back(ref->name);
+        }
+        $$ = std::make_shared<SelectStmt>($2, std::move(tabs), $5, $8, $6, $7,
+                                          std::move($4));
     }
-    |   SELECT selector FROM tbName joinClauseList optWhereClause opt_group_clause opt_having_clause opt_order_clause
+    |   SELECT selector FROM tableRef joinClauseList optWhereClause opt_group_clause opt_having_clause opt_order_clause
     {
-        std::vector<std::string> tabs{$4};
-        std::string current_left = $4;
-        for (auto &join_expr : $5) {
+        std::vector<std::shared_ptr<TableRef>> table_refs{$4};
+        std::vector<std::string> tabs{$4->name};
+        std::string current_left = $4->alias;
+        auto right_refs = std::move($<sv_table_refs>5);
+        for (size_t i = 0; i < $5.size(); ++i) {
+            auto &join_expr = $5[i];
+            const auto &right_ref = right_refs[i];
             join_expr->left = current_left;
-            tabs.push_back(join_expr->right);
+            table_refs.push_back(right_ref);
+            tabs.push_back(right_ref->name);
             current_left = join_expr->right;
         }
-        $$ = std::make_shared<SelectStmt>($2, std::move(tabs), $6, std::move($5), $9, $7, $8);
+        $$ = std::make_shared<SelectStmt>($2, std::move(tabs), $6, std::move($5), $9, $7, $8,
+                                          std::move(table_refs));
     }
     ;
 
 joinClauseList:
-        joinType JOIN tbName ON whereClause
+        JOIN tableRef ON whereClause
     {
-        $$ = std::vector<std::shared_ptr<JoinExpr>>{
-            std::make_shared<JoinExpr>(std::string(), $3, $5, $1)
-        };
+        append_join_clause($$, $<sv_table_refs>$, $2, $4, INNER_JOIN);
     }
-    |   joinClauseList joinType JOIN tbName ON whereClause
+    |   joinType JOIN tableRef ON whereClause
     {
-        $1.push_back(std::make_shared<JoinExpr>(std::string(), $4, $6, $2));
+        append_join_clause($$, $<sv_table_refs>$, $3, $5, $1);
+    }
+    |   joinClauseList JOIN tableRef ON whereClause
+    {
         $$ = std::move($1);
+        $<sv_table_refs>$ = std::move($<sv_table_refs>1);
+        append_join_clause($$, $<sv_table_refs>$, $3, $5, INNER_JOIN);
+    }
+    |   joinClauseList joinType JOIN tableRef ON whereClause
+    {
+        $$ = std::move($1);
+        $<sv_table_refs>$ = std::move($<sv_table_refs>1);
+        append_join_clause($$, $<sv_table_refs>$, $4, $6, $2);
     }
     ;
 
@@ -508,18 +548,28 @@ having_cond:
     }
     ;
 
-tableList:
+tableRefList:
+        tableRef
+    {
+        $$ = std::vector<std::shared_ptr<TableRef>>{$1};
+    }
+    |   tableRefList ',' tableRef
+    {
+        $$.push_back($3);
+    }
+
+tableRef:
         tbName
     {
-        $$ = std::vector<std::string>{$1};
+        $$ = std::make_shared<TableRef>($1);
     }
-    |   tableList ',' tbName
+    |   tbName IDENTIFIER
     {
-        $$.push_back($3);
+        $$ = std::make_shared<TableRef>($1, $2);
     }
-    |   tableList JOIN tbName
+    |   tbName AS IDENTIFIER
     {
-        $$.push_back($3);
+        $$ = std::make_shared<TableRef>($1, $3);
     }
     ;
 

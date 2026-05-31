@@ -10,13 +10,18 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <map>
+#include <set>
+#include <sstream>
 #include <string>
 #include "optimizer/plan.h"
 #include "execution/executor_abstract.h"
 #include "execution/executor_nestedloop_join.h"
 #include "execution/executor_projection.h"
+#include "execution/executor_filter.h"
 #include "execution/executor_seq_scan.h"
 #include "execution/executor_index_scan.h"
 #include "execution/executor_update.h"
@@ -26,9 +31,14 @@ See the Mulan PSL v2 for more details. */
 #include "execution/execution_sort.h"
 #include "common/common.h"
 
+namespace explain_analyze_detail {
+constexpr int kTreeMaxDepth = 64;
+}
+
 typedef enum portalTag{
     PORTAL_Invalid_Query = 0,
     PORTAL_ONE_SELECT,
+    PORTAL_EXPLAIN_ANALYZE,
     PORTAL_DML_WITHOUT_SELECT,
     PORTAL_MULTI_QUERY,
     PORTAL_CMD_UTILITY
@@ -53,7 +63,142 @@ class Portal
 {
    private:
     SmManager *sm_manager_;
-    
+
+    std::map<std::string, std::string> table_display_names_;
+
+    std::string format_col(const TabCol &col) const {
+        if (col.tab_name.empty()) {
+            return col.col_name;
+        }
+        std::string table = col.tab_name;
+        auto it = table_display_names_.find(col.tab_name);
+        if (it != table_display_names_.end()) {
+            table = it->second;
+        }
+        return table + "." + col.col_name;
+    }
+
+    std::string format_col_list(const std::vector<TabCol> &cols) const {
+        if (cols.empty()) {
+            return "[*]";
+        }
+        std::vector<std::string> rendered;
+        rendered.reserve(cols.size());
+        for (const auto &col : cols) {
+            rendered.push_back(format_col(col));
+        }
+        std::sort(rendered.begin(), rendered.end());
+        std::string result = "[";
+        for (size_t i = 0; i < rendered.size(); ++i) {
+            if (i != 0) {
+                result += ", ";
+            }
+            result += rendered[i];
+        }
+        result += "]";
+        return result;
+    }
+
+    std::string format_value(const Value &value) const {
+        std::ostringstream os;
+        if (value.type == TYPE_INT) {
+            return std::to_string(value.int_val);
+        }
+        if (value.type == TYPE_FLOAT) {
+            os << value.float_val;
+            return os.str();
+        }
+        if (value.type == TYPE_STRING) {
+            return value.str_val;
+        }
+        throw InternalError("Unexpected value type in explain output");
+    }
+
+    std::string format_op(CompOp op) const {
+        switch (op) {
+            case OP_EQ: return "=";
+            case OP_NE: return "<>";
+            case OP_LT: return "<";
+            case OP_GT: return ">";
+            case OP_LE: return "<=";
+            case OP_GE: return ">=";
+        }
+        throw InternalError("Unexpected comparison op");
+    }
+
+    std::string format_condition(const Condition &cond) const {
+        std::string rhs = cond.is_rhs_val ? format_value(cond.rhs_val) : format_col(cond.rhs_col);
+        return format_col(cond.lhs_col) + format_op(cond.op) + rhs;
+    }
+
+    std::string format_condition_list(const std::vector<Condition> &conds) const {
+        std::vector<std::string> rendered;
+        rendered.reserve(conds.size());
+        for (const auto &cond : conds) {
+            rendered.push_back(format_condition(cond));
+        }
+        std::sort(rendered.begin(), rendered.end());
+        std::string result = "[";
+        for (size_t i = 0; i < rendered.size(); ++i) {
+            if (i != 0) {
+                result += ", ";
+            }
+            result += rendered[i];
+        }
+        result += "]";
+        return result;
+    }
+
+    void collect_plan_tables(const std::shared_ptr<Plan> &plan, std::set<std::string> &tables,
+                             int depth = 0) const {
+        if (plan == nullptr) {
+            return;
+        }
+        if (depth >= explain_analyze_detail::kTreeMaxDepth) {
+            throw InternalError("Plan tree depth exceeds limit");
+        }
+        if (auto scan = std::dynamic_pointer_cast<ScanPlan>(plan)) {
+            tables.insert(scan->tab_name_);
+            return;
+        }
+        if (auto project = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
+            collect_plan_tables(project->subplan_, tables, depth + 1);
+            return;
+        }
+        if (auto filter = std::dynamic_pointer_cast<FilterPlan>(plan)) {
+            collect_plan_tables(filter->subplan_, tables, depth + 1);
+            return;
+        }
+        if (auto aggregation = std::dynamic_pointer_cast<AggregationPlan>(plan)) {
+            collect_plan_tables(aggregation->subplan_, tables, depth + 1);
+            return;
+        }
+        if (auto sort = std::dynamic_pointer_cast<SortPlan>(plan)) {
+            collect_plan_tables(sort->subplan_, tables, depth + 1);
+            return;
+        }
+        if (auto join = std::dynamic_pointer_cast<JoinPlan>(plan)) {
+            collect_plan_tables(join->left_, tables, depth + 1);
+            collect_plan_tables(join->right_, tables, depth + 1);
+            return;
+        }
+    }
+
+    std::string format_table_list(const std::shared_ptr<Plan> &plan) const {
+        std::set<std::string> tables;
+        collect_plan_tables(plan, tables);
+        std::string result = "[";
+        size_t i = 0;
+        for (const auto &table : tables) {
+            if (i != 0) {
+                result += ", ";
+            }
+            result += table;
+            ++i;
+        }
+        result += "]";
+        return result;
+    }
 
    public:
     Portal(SmManager *sm_manager) : sm_manager_(sm_manager){}
@@ -70,12 +215,17 @@ class Portal
         } else if (auto x = std::dynamic_pointer_cast<DDLPlan>(plan)) {
             return std::make_shared<PortalStmt>(PORTAL_MULTI_QUERY, std::vector<TabCol>(), std::unique_ptr<AbstractExecutor>(),plan);
         } else if (auto x = std::dynamic_pointer_cast<DMLPlan>(plan)) {
+            table_display_names_ = x->table_display_names_;
             switch(x->tag) {
                 case T_select:
                 {
                     std::shared_ptr<ProjectionPlan> p = std::dynamic_pointer_cast<ProjectionPlan>(x->subplan_);
                     std::unique_ptr<AbstractExecutor> root= convert_plan_executor(p, context);
-                    return std::make_shared<PortalStmt>(PORTAL_ONE_SELECT, std::move(p->sel_cols_), std::move(root), plan);
+                    if (x->is_explain_analyze_ && x->display_wildcard_) {
+                        root->set_explain_info("Project", "columns=[*]");
+                    }
+                    auto tag = x->is_explain_analyze_ ? PORTAL_EXPLAIN_ANALYZE : PORTAL_ONE_SELECT;
+                    return std::make_shared<PortalStmt>(tag, std::move(p->sel_cols_), std::move(root), plan);
                 }
                     
                 case T_Update:
@@ -131,6 +281,12 @@ class Portal
                 break;
             }
 
+            case PORTAL_EXPLAIN_ANALYZE:
+            {
+                ql->explain_analyze(std::move(portal->root), context);
+                break;
+            }
+
             case PORTAL_DML_WITHOUT_SELECT:
             {
                 ql->run_dml(std::move(portal->root));
@@ -160,32 +316,48 @@ class Portal
     std::unique_ptr<AbstractExecutor> convert_plan_executor(std::shared_ptr<Plan> plan, Context *context)
     {
         if(auto x = std::dynamic_pointer_cast<ProjectionPlan>(plan)){
-            return std::make_unique<ProjectionExecutor>(convert_plan_executor(x->subplan_, context), 
-                                                        x->sel_cols_);
+            auto executor = std::make_unique<ProjectionExecutor>(convert_plan_executor(x->subplan_, context),
+                                                                 x->sel_cols_);
+            executor->set_explain_info("Project", "columns=" + format_col_list(x->sel_cols_));
+            return executor;
+        } else if(auto x = std::dynamic_pointer_cast<FilterPlan>(plan)) {
+            auto executor = std::make_unique<FilterExecutor>(convert_plan_executor(x->subplan_, context), x->conds_);
+            executor->set_explain_info("Filter", "condition=" + format_condition_list(x->conds_));
+            return executor;
         } else if(auto x = std::dynamic_pointer_cast<AggregationPlan>(plan)) {
-            return std::make_unique<AggregationExecutor>(convert_plan_executor(x->subplan_, context),
-                                                         x->agg_infos_, x->group_by_cols_,
-                                                         x->having_conds_);
+            auto executor = std::make_unique<AggregationExecutor>(convert_plan_executor(x->subplan_, context),
+                                                                  x->agg_infos_, x->group_by_cols_,
+                                                                  x->having_conds_);
+            executor->set_explain_info("Aggregation");
+            return executor;
         } else if(auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
             if(x->tag == T_SeqScan) {
-                return std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->all_conds_,
-                                                         x->empty_result_, context);
+                auto executor = std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->all_conds_,
+                                                                  x->empty_result_, context);
+                executor->set_explain_info("Scan", "table=" + x->tab_name_ + ", type=SeqScan");
+                return executor;
             }
             else {
-                return std::make_unique<IndexScanExecutor>(sm_manager_, x->tab_name_, x->index_lookup_conds_,
-                                                           x->residual_conds_, x->index_col_names_,
-                                                           x->index_meta_, context);
-            } 
+                auto executor = std::make_unique<IndexScanExecutor>(sm_manager_, x->tab_name_, x->index_lookup_conds_,
+                                                                    x->residual_conds_, x->index_col_names_,
+                                                                    x->index_meta_, context);
+                executor->set_explain_info("Scan", "table=" + x->tab_name_ + ", type=IndexScan");
+                return executor;
+            }
         } else if(auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
             std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_, context);
             std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_, context);
-            std::unique_ptr<AbstractExecutor> join = std::make_unique<NestedLoopJoinExecutor>(
-                                std::move(left), 
-                                std::move(right), std::move(x->conds_), x->type, x->reverse_right_scan_);
-            return join;
+            auto executor = std::make_unique<NestedLoopJoinExecutor>(
+                                std::move(left),
+                                std::move(right), x->conds_, x->type, x->reverse_right_scan_);
+            executor->set_explain_info("Join", "tables=" + format_table_list(plan) +
+                                               ", condition=" + format_condition_list(x->conds_));
+            return executor;
         } else if(auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
-            return std::make_unique<SortExecutor>(convert_plan_executor(x->subplan_, context), 
-                                            x->sel_col_, x->is_desc_);
+            auto executor = std::make_unique<SortExecutor>(convert_plan_executor(x->subplan_, context),
+                                                           x->sel_col_, x->is_desc_);
+            executor->set_explain_info("Sort");
+            return executor;
         }
         return nullptr;
     }

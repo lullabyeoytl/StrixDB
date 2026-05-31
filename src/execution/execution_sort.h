@@ -44,6 +44,7 @@ class SortExecutor : public AbstractExecutor {
    public:
     SortExecutor(std::unique_ptr<AbstractExecutor> prev, TabCol sel_cols, bool is_desc) {
         prev_ = std::move(prev);
+        set_children({prev_.get()});
         cols_ = prev_->cols();
         sort_col_ = find_col_meta(cols_, sel_cols);
         is_desc_ = is_desc;
@@ -52,7 +53,7 @@ class SortExecutor : public AbstractExecutor {
         }
     }
 
-    void beginTuple() override { 
+    void beginTupleImpl() override {
         tuples_.clear();
         tuple_rids_.clear();
         order_.clear();
@@ -79,6 +80,8 @@ class SortExecutor : public AbstractExecutor {
         }
     }
 
+    void restartTupleImpl() override { beginTupleImpl(); }
+
     void nextTuple() override {
         if (is_end()) {
             return;
@@ -91,7 +94,7 @@ class SortExecutor : public AbstractExecutor {
         }
     }
 
-    std::unique_ptr<RmRecord> Next() override {
+    std::unique_ptr<RmRecord> NextImpl() override {
         if (is_end()) {
             return nullptr;
         }

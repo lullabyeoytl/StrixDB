@@ -135,6 +135,10 @@ private:
             std::cout << "COL\n";
             print_val(x->tab_name, offset);
             print_val(x->col_name, offset);
+        } else if (auto x = std::dynamic_pointer_cast<TableRef>(node)) {
+            std::cout << "TABLE_REF\n";
+            print_val(x->name, offset);
+            print_val(x->alias, offset);
         } else if (auto x = std::dynamic_pointer_cast<AggFunc>(node)) {
             std::cout << "AGG_FUNC\n";
             print_val(agg2str(x->agg_type), offset);
@@ -193,7 +197,8 @@ private:
         } else if (auto x = std::dynamic_pointer_cast<SelectStmt>(node)) {
             std::cout << "SELECT\n";
             print_node_list(x->cols, offset);
-            print_val_list(x->tabs, offset);
+            print_node_list(x->table_refs, offset);
+            print_node_list(x->jointree, offset);
             print_node_list(x->conds, offset);
             if (x->has_group_by) {
                 print_node(x->group_by, offset);
@@ -204,6 +209,14 @@ private:
             if (x->has_sort) {
                 print_node(x->order, offset);
             }
+        } else if (auto x = std::dynamic_pointer_cast<JoinExpr>(node)) {
+            std::cout << "JOIN\n";
+            print_val(x->left, offset);
+            print_val(x->right, offset);
+            print_node_list(x->conds, offset);
+        } else if (auto x = std::dynamic_pointer_cast<ExplainAnalyzeStmt>(node)) {
+            std::cout << "EXPLAIN_ANALYZE\n";
+            print_node(x->statement, offset);
         } else if (auto x = std::dynamic_pointer_cast<TxnBegin>(node)) {
             std::cout << "BEGIN\n";
         } else if (auto x = std::dynamic_pointer_cast<TxnCommit>(node)) {

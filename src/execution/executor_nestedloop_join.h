@@ -53,7 +53,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
 
     void begin_right_scan() {
         if (!reverse_right_scan_) {
-            right_->beginTuple();
+            right_->restartTuple();
             return;
         }
         right_pos_ = 0;
@@ -149,6 +149,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
                             bool reverse_right_scan = false) {
         left_ = std::move(left);
         right_ = std::move(right);
+        set_children({left_.get(), right_.get()});
         join_type_ = join_type;
         reverse_right_scan_ = reverse_right_scan;
         left_len_ = left_->tupleLen();
@@ -163,7 +164,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
 
     }
 
-    void beginTuple() override {
+    void beginTupleImpl() override {
         left_->beginTuple();
         if (left_->is_end()) {
             set_end();
@@ -172,7 +173,11 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
         cache_right_records();
         left_rid_ = left_->rid();
         left_rec_ = left_->Next();
-        begin_right_scan();
+        if (reverse_right_scan_) {
+            begin_right_scan();
+        } else {
+            right_->beginTuple();
+        }
         isend = false;
         seek_next_match(false);
     }
@@ -189,7 +194,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
         seek_next_match(false);
     }
 
-    std::unique_ptr<RmRecord> Next() override {
+    std::unique_ptr<RmRecord> NextImpl() override {
         if (isend || left_rec_ == nullptr || right_rec_ == nullptr) {
             return nullptr;
         }

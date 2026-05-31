@@ -25,6 +25,7 @@ class ProjectionExecutor : public AbstractExecutor {
    public:
     ProjectionExecutor(std::unique_ptr<AbstractExecutor> prev, const std::vector<TabCol> &sel_cols) {
         prev_ = std::move(prev);
+        set_children({prev_.get()});
 
         size_t curr_offset = 0;
         auto &prev_cols = prev_->cols();
@@ -39,11 +40,13 @@ class ProjectionExecutor : public AbstractExecutor {
         len_ = curr_offset;
     }
 
-    void beginTuple() override { prev_->beginTuple(); }
+    void beginTupleImpl() override { prev_->beginTuple(); }
+
+    void restartTupleImpl() override { prev_->restartTuple(); }
 
     void nextTuple() override { prev_->nextTuple(); }
 
-    std::unique_ptr<RmRecord> Next() override {
+    std::unique_ptr<RmRecord> NextImpl() override {
         // return nullptr;
         auto src = prev_->Next();
         if (src == nullptr) {

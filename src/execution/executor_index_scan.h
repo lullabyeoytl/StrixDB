@@ -279,7 +279,11 @@ class IndexScanExecutor : public AbstractExecutor {
         set_end();
     }
 
-    void beginTuple() override {
+    void beginTupleImpl() override {
+        restartTupleImpl();
+    }
+
+    void restartTupleImpl() override {
         auto ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_);
         auto *ih = sm_manager_->ihs_.at(ix_name).get();
 
@@ -329,7 +333,7 @@ class IndexScanExecutor : public AbstractExecutor {
         seek_to_next_valid();
     }
 
-    std::unique_ptr<RmRecord> Next() override {
+    std::unique_ptr<RmRecord> NextImpl() override {
         if (is_end()) {
             return nullptr;
         }

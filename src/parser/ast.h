@@ -177,6 +177,14 @@ struct Col : public Expr {
             tab_name(std::move(tab_name_)), col_name(std::move(col_name_)) {}
 };
 
+struct TableRef : public TreeNode {
+    std::string name;
+    std::string alias;
+
+    explicit TableRef(std::string name_) : name(std::move(name_)), alias(name) {}
+
+    TableRef(std::string name_, std::string alias_) : name(std::move(name_)), alias(std::move(alias_)) {}
+};
 
 struct SetClause : public TreeNode {
     std::string col_name;
@@ -261,6 +269,7 @@ struct JoinExpr : public TreeNode {
 struct SelectStmt : public TreeNode {
     std::vector<std::shared_ptr<Expr>> cols;
     std::vector<std::string> tabs;
+    std::vector<std::shared_ptr<TableRef>> table_refs;
     std::vector<std::shared_ptr<BinaryExpr>> conds;
     std::vector<std::shared_ptr<JoinExpr>> jointree;
 
@@ -279,9 +288,15 @@ struct SelectStmt : public TreeNode {
                std::vector<std::shared_ptr<BinaryExpr>> conds_,
                std::shared_ptr<OrderBy> order_,
                std::shared_ptr<GroupBy> group_by_,
-               std::vector<std::shared_ptr<HavingCond>> having_conds_) :
-            cols(std::move(cols_)), tabs(std::move(tabs_)), conds(std::move(conds_)), 
+               std::vector<std::shared_ptr<HavingCond>> having_conds_,
+               std::vector<std::shared_ptr<TableRef>> table_refs_ = {}) :
+            cols(std::move(cols_)), tabs(std::move(tabs_)), table_refs(std::move(table_refs_)), conds(std::move(conds_)),
             order(std::move(order_)), group_by(std::move(group_by_)), having_conds(std::move(having_conds_)) {
+                if (table_refs.empty()) {
+                    for (const auto &tab : tabs) {
+                        table_refs.push_back(std::make_shared<TableRef>(tab));
+                    }
+                }
                 has_sort = (bool)order;
                 has_group_by = (bool)group_by;
                 has_having = !having_conds.empty();
@@ -293,14 +308,26 @@ struct SelectStmt : public TreeNode {
                std::vector<std::shared_ptr<JoinExpr>> jointree_,
                std::shared_ptr<OrderBy> order_,
                std::shared_ptr<GroupBy> group_by_,
-               std::vector<std::shared_ptr<HavingCond>> having_conds_) :
-            cols(std::move(cols_)), tabs(std::move(tabs_)), conds(std::move(conds_)),
+               std::vector<std::shared_ptr<HavingCond>> having_conds_,
+               std::vector<std::shared_ptr<TableRef>> table_refs_ = {}) :
+            cols(std::move(cols_)), tabs(std::move(tabs_)), table_refs(std::move(table_refs_)), conds(std::move(conds_)),
             jointree(std::move(jointree_)), order(std::move(order_)),
             group_by(std::move(group_by_)), having_conds(std::move(having_conds_)) {
+                if (table_refs.empty()) {
+                    for (const auto &tab : tabs) {
+                        table_refs.push_back(std::make_shared<TableRef>(tab));
+                    }
+                }
                 has_sort = (bool)order;
                 has_group_by = (bool)group_by;
                 has_having = !having_conds.empty();
             }
+};
+
+struct ExplainAnalyzeStmt : public TreeNode {
+    std::shared_ptr<TreeNode> statement;
+
+    explicit ExplainAnalyzeStmt(std::shared_ptr<TreeNode> statement_) : statement(std::move(statement_)) {}
 };
 
 // set enable_nestloop
@@ -320,6 +347,7 @@ struct SemValue {
     bool sv_bool;
     OrderByDir sv_orderby_dir;
     std::vector<std::string> sv_strs;
+    std::vector<std::shared_ptr<TableRef>> sv_table_refs;
 
     std::shared_ptr<TreeNode> sv_node;
 
@@ -329,6 +357,7 @@ struct SemValue {
 
     std::shared_ptr<Field> sv_field;
     std::vector<std::shared_ptr<Field>> sv_fields;
+    std::shared_ptr<TableRef> sv_table_ref;
 
     std::shared_ptr<Expr> sv_expr;
     std::vector<std::shared_ptr<Expr>> sv_exprs;

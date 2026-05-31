@@ -13,6 +13,8 @@ See the Mulan PSL v2 for more details. */
 #include <cassert>
 #include <cstring>
 #include <memory>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -28,6 +30,27 @@ See the Mulan PSL v2 for more details. */
 
 class Planner {
    private:
+    struct LogicalJoin {
+        std::string left;
+        std::string right;
+        std::vector<Condition> conds;
+        JoinType type;
+    };
+
+    struct LogicalPlanContext {
+        std::vector<Condition> all_conds;
+        std::map<std::string, std::vector<Condition>> table_conds;
+        std::set<std::string> empty_tables;
+        std::vector<Condition> join_conds;
+        std::map<std::string, std::vector<TabCol>> table_required_cols;
+        std::vector<LogicalJoin> explicit_joins;
+    };
+
+    struct ScanBuildResult {
+        std::shared_ptr<ScanPlan> scan;
+        std::vector<Condition> filter_conds;
+    };
+
     SmManager *sm_manager_;
 
     bool enable_nestedloop_join = true;
@@ -46,10 +69,20 @@ class Planner {
     void set_enable_sortmerge_join(bool set_val) { enable_sortmerge_join = set_val; }
     
    private:
-    std::shared_ptr<Query> logical_optimization(std::shared_ptr<Query> query, Context *context);
-    std::shared_ptr<Plan> physical_optimization(std::shared_ptr<Query> query, Context *context);
+    LogicalPlanContext logical_optimization(const std::shared_ptr<Query> &query, Context *context);
+    std::shared_ptr<Plan> physical_optimization(std::shared_ptr<Query> query,
+                                                const LogicalPlanContext &plan_context,
+                                                Context *context);
 
-    std::shared_ptr<Plan> make_one_rel(std::shared_ptr<Query> query);
+    std::shared_ptr<Plan> make_one_rel(std::shared_ptr<Query> query, const LogicalPlanContext &plan_context);
+
+    std::vector<std::pair<std::string, std::shared_ptr<Plan>>> build_table_plans(
+        const std::shared_ptr<Query> &query, const LogicalPlanContext &plan_context);
+
+    std::shared_ptr<Plan> build_join_tree(
+        std::vector<std::pair<std::string, std::shared_ptr<Plan>>> &table_plans,
+        std::vector<Condition> conds,
+        const std::vector<LogicalJoin> &jointree);
 
     std::shared_ptr<Plan> generate_sort_plan(std::shared_ptr<Query> query, std::shared_ptr<Plan> plan);
 
@@ -57,8 +90,9 @@ std::shared_ptr<Plan> generate_select_plan(std::shared_ptr<Query> query, Context
 
 
     // int get_indexNo(std::string tab_name, std::vector<Condition> curr_conds);
-    std::shared_ptr<ScanPlan> make_scan_plan(const std::string &tab_name, std::vector<Condition> conds,
-                                             std::vector<TabCol> required_cols = {});
+    ScanBuildResult make_scan_plan(const std::string &tab_name, const std::vector<Condition> &semantic_conds,
+                                   std::vector<TabCol> required_cols = {});
+    std::shared_ptr<Plan> build_dml_scan_plan(const LogicalPlanContext &plan_context, const std::string &tab_name);
 
     ColType interp_sv_type(ast::SvType sv_type) {
         std::map<ast::SvType, ColType> m = {
