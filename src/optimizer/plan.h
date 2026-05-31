@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <cassert>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -49,6 +50,7 @@ typedef enum PlanTag{
     T_HashJoin,     // hash join
     T_Sort,
     T_Limit,
+    T_Filter,
     T_Projection,
     T_Aggregation
 } PlanTag;
@@ -90,10 +92,8 @@ class ScanPlan : public Plan
             TabMeta &tab = sm_manager->db_.get_table(tab_name_);
             cols_ = tab.cols;
             len_ = cols_.back().offset + cols_.back().len;
-            index_lookup_conds_ = std::move(index_lookup_conds);
+            access_conds_ = std::move(index_lookup_conds);
             residual_conds_ = std::move(residual_conds);
-            all_conds_ = index_lookup_conds_;
-            all_conds_.insert(all_conds_.end(), residual_conds_.begin(), residual_conds_.end());
             index_col_names_ = std::move(index_col_names);
             if (index_meta.has_value()) {
                 index_meta_ = std::move(index_meta);
@@ -103,16 +103,16 @@ class ScanPlan : public Plan
         }
         ~ScanPlan(){}
         // 以下变量同ScanExecutor中的变量
-        std::string tab_name_;                     
-        std::vector<ColMeta> cols_;                
-        std::vector<Condition> index_lookup_conds_;
+        std::string tab_name_;
+        std::vector<ColMeta> cols_;
+        std::vector<Condition> access_conds_;   // 索引访问条件
         std::vector<Condition> residual_conds_;
         std::vector<Condition> all_conds_;
-        size_t len_;                               
+        size_t len_;
         std::vector<std::string> index_col_names_;
         std::optional<IndexMeta> index_meta_;
         bool empty_result_ = false;
-    
+
 };
 
 class JoinPlan : public Plan
@@ -203,6 +203,9 @@ class HashJoinPlan : public PhysicalJoinPlan
         std::vector<Condition> residual_conds_;
 };
 
+/**
+ * @brief: 查询计划树中的投影操作，最顶层
+ */
 class ProjectionPlan : public Plan
 {
     public:
@@ -218,7 +221,25 @@ class ProjectionPlan : public Plan
         std::shared_ptr<Plan> subplan_;
         std::vector<TabCol> sel_cols_;
         std::vector<std::string> output_names_;
-        
+
+};
+
+/**
+ * @brief: 统一查询计划树中的过滤操作
+ */
+class FilterPlan : public Plan
+{
+    public:
+        FilterPlan(std::shared_ptr<Plan> subplan, std::vector<Condition> conds)
+        {
+            Plan::tag = T_Filter;
+            subplan_ = std::move(subplan);
+            conds_ = std::move(conds);
+            sort_conditions(conds_);
+        }
+        ~FilterPlan(){}
+        std::shared_ptr<Plan> subplan_;
+        std::vector<Condition> conds_;
 };
 
 class SortPlan : public Plan
@@ -235,7 +256,7 @@ class SortPlan : public Plan
         ~SortPlan(){}
         std::shared_ptr<Plan> subplan_;
         std::vector<SortKeySpec> sort_keys_;
-        
+
 };
 
 class LimitPlan : public Plan
@@ -257,8 +278,7 @@ class AggregationPlan : public Plan
     public:
         AggregationPlan(std::shared_ptr<Plan> subplan, std::vector<AggInfo> agg_infos,
                         std::vector<TabCol> group_by_cols, std::vector<HavingCond> having_conds,
-                        AggStrategy strategy = AggStrategy_Hash,
-                        std::vector<SortKeySpec> sort_keys = {})
+                        AggStrategy strategy = AggStrategy_Hash)
         {
             Plan::tag = T_Aggregation;
             strategy_ = strategy;
@@ -266,7 +286,6 @@ class AggregationPlan : public Plan
             agg_infos_ = std::move(agg_infos);
             group_by_cols_ = std::move(group_by_cols);
             having_conds_ = std::move(having_conds);
-            sort_keys_ = std::move(sort_keys);
         }
         ~AggregationPlan(){}
         AggStrategy strategy_;
@@ -274,7 +293,6 @@ class AggregationPlan : public Plan
         std::vector<AggInfo> agg_infos_;
         std::vector<TabCol> group_by_cols_;
         std::vector<HavingCond> having_conds_;
-        std::vector<SortKeySpec> sort_keys_;
 };
 
 // dml语句，包括insert; delete; update; select语句　
@@ -283,7 +301,8 @@ class DMLPlan : public Plan
     public:
         DMLPlan(PlanTag tag, std::shared_ptr<Plan> subplan,std::string tab_name,
                 std::vector<Value> values, std::vector<Condition> conds,
-                std::vector<SetClause> set_clauses)
+                std::vector<SetClause> set_clauses, bool is_explain_analyze = false,
+                std::map<std::string, std::string> table_display_names = {}, bool display_wildcard = false)
         {
             Plan::tag = tag;
             subplan_ = std::move(subplan);
@@ -291,6 +310,9 @@ class DMLPlan : public Plan
             values_ = std::move(values);
             conds_ = std::move(conds);
             set_clauses_ = std::move(set_clauses);
+            is_explain_analyze_ = is_explain_analyze;
+            table_display_names_ = std::move(table_display_names);
+            display_wildcard_ = display_wildcard;
         }
         ~DMLPlan(){}
         std::shared_ptr<Plan> subplan_;
@@ -298,6 +320,9 @@ class DMLPlan : public Plan
         std::vector<Value> values_;
         std::vector<Condition> conds_;
         std::vector<SetClause> set_clauses_;
+        bool is_explain_analyze_ = false;
+        std::map<std::string, std::string> table_display_names_;
+        bool display_wildcard_ = false;     // 是否使用通配符， explain 输出展示优化
 };
 
 // ddl语句, 包括create/drop table; create/drop index;
@@ -329,7 +354,7 @@ class OtherPlan : public Plan
         OtherPlan(PlanTag tag, std::string tab_name)
         {
             Plan::tag = tag;
-            tab_name_ = std::move(tab_name);            
+            tab_name_ = std::move(tab_name);
         }
         ~OtherPlan(){}
         std::string tab_name_;
