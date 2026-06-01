@@ -118,3 +118,9 @@ Rid IxScan::rid() const {
     assert(current_node_ != nullptr);
     return *current_node_->get_rid(iid_.slot_no);
 }
+
+const char *IxScan::key() const {
+    assert(!is_end_);
+    assert(current_node_ != nullptr);
+    return current_node_->get_key(iid_.slot_no);
+}

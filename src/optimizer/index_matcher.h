@@ -47,6 +47,12 @@ struct IndexMatchResult {
     std::vector<Condition> residual_conds;
     std::vector<std::string> index_col_names;
     std::optional<IndexMeta> index_meta;
+    // Covering-index properties: whether the index structurally covers what the
+    // query needs.  These are pure structural checks — they do NOT influence
+    // index selection scoring.  The planner still decides whether to actually
+    // enable covering read (e.g. only on the query path, not on write paths).
+    bool covers_required_cols = false;   // all required_cols present in the index key
+    bool covers_residual_conds = false;  // all residual_conds reference only index columns
 };
 
 inline auto index_cond_matches_storage_type(const Condition &cond, const ColMeta &index_col) -> bool {
@@ -56,12 +62,42 @@ inline auto index_cond_matches_storage_type(const Condition &cond, const ColMeta
     return cond.rhs_val.type == index_col.type;
 }
 
+// --- Covering-index structural helpers ------------------------------------
+// These answer "does the index contain the needed columns?" without any
+// planner-side policy.  The planner uses the answers to decide whether to
+// enable covering read on the query path.
+
+inline auto index_has_column(const IndexMeta &index_meta, const TabCol &target) -> bool {
+    return std::any_of(index_meta.cols.begin(), index_meta.cols.end(), [&](const ColMeta &col) {
+        return col_meta_matches(col, target);
+    });
+}
+
+inline auto index_covers_columns(const IndexMeta &index_meta,
+                                 const std::vector<TabCol> &required_cols) -> bool {
+    return std::all_of(required_cols.begin(), required_cols.end(), [&](const TabCol &required_col) {
+        return index_has_column(index_meta, required_col);
+    });
+}
+
+inline auto condition_covered_by_index(const IndexMeta &index_meta, const Condition &cond) -> bool {
+    if (!index_has_column(index_meta, cond.lhs_col)) {
+        return false;
+    }
+    return cond.is_rhs_val || index_has_column(index_meta, cond.rhs_col);
+}
+
+inline auto conditions_covered_by_index(const IndexMeta &index_meta,
+                                        const std::vector<Condition> &conds) -> bool {
+    return std::all_of(conds.begin(), conds.end(), [&](const Condition &cond) {
+        return condition_covered_by_index(index_meta, cond);
+    });
+}
+
 inline auto match_index(const IndexMeta &index_meta, const std::vector<Condition> &conds,
                         const std::vector<TabCol> &required_cols) -> IndexMatchResult {
     IndexMatchResult result;
-    // Covering is intentionally excluded from scoring until the executor can avoid heap fetches.
-    // TODO: covering index implementation
-    (void)required_cols;
+    // Access path scoring depends only on lookup predicates and index width.
     result.index_col_names = index_meta.col_names();
     result.index_meta = index_meta;
     result.score.index_width = index_meta.col_num;
@@ -124,6 +160,12 @@ inline auto match_index(const IndexMeta &index_meta, const std::vector<Condition
             result.residual_conds.push_back(conds[i]);
         }
     }
+
+    // Compute covering-index properties from the structural match.
+    // These are pure checks on column containment — they do not affect scoring.
+    result.covers_required_cols = index_covers_columns(index_meta, required_cols);
+    result.covers_residual_conds = conditions_covered_by_index(index_meta, result.residual_conds);
+
     return result;
 }
 

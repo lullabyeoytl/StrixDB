@@ -364,7 +364,8 @@ class Portal
             else {
                 auto executor = std::make_unique<IndexScanExecutor>(sm_manager_, x->tab_name_, x->access_conds_,
                                                                     x->residual_conds_, x->index_col_names_,
-                                                                    x->index_meta_, context);
+                                                                    x->index_meta_, x->use_covering_index_,
+                                                                    x->cols_, context);
                 executor->set_explain_info("Scan", "table=" + x->tab_name_ +
                                                        ", type=IndexScan");
                 return executor;

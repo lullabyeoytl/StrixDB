@@ -53,6 +53,8 @@ class IndexScanExecutor : public AbstractExecutor {
 
     std::vector<std::string> index_col_names_;  // index scan涉及到的索引包含的字段
     IndexMeta index_meta_;                      // index scan涉及到的索引元数据
+    bool use_covering_index_ = false;
+    std::vector<int> covered_key_offsets_;
 
     Rid rid_;
     std::unique_ptr<RecScan> scan_;
@@ -63,7 +65,82 @@ class IndexScanExecutor : public AbstractExecutor {
         rid_ = Rid{-1, -1};
     }
 
+    auto current_index_scan() const -> const IxScan * {
+        auto *ix_scan = dynamic_cast<IxScan *>(scan_.get());
+        if (ix_scan == nullptr) {
+            throw InternalError("Index scan cursor is unavailable");
+        }
+        return ix_scan;
+    }
+
+    void build_covered_key_offsets() {
+        covered_key_offsets_.clear();
+        covered_key_offsets_.reserve(cols_.size());
+        for (const auto &output_col : cols_) {
+            int offset = 0;
+            bool found = false;
+            for (const auto &index_col : index_meta_.cols) {
+                if (col_meta_matches(index_col, TabCol{output_col.tab_name, output_col.name})) {
+                    if (output_col.len != index_col.len) {
+                        throw InternalError("Column length mismatch between table and index metadata");
+                    }
+                    covered_key_offsets_.push_back(offset);
+                    found = true;
+                    break;
+                }
+                offset += index_col.len;
+            }
+            if (!found) {
+                throw InternalError("Covered output column is not present in index key");
+            }
+        }
+    }
+
+    auto make_record_from_index_key() const -> std::unique_ptr<RmRecord> {
+        const auto *ix_scan = current_index_scan();
+        const char *key = ix_scan->key();
+        auto record = std::make_unique<RmRecord>(len_);
+        for (size_t i = 0; i < cols_.size(); ++i) {
+            const auto &col = cols_[i];
+            assert(covered_key_offsets_[i] + col.len <= index_meta_.col_tot_len);
+            assert(col.offset + col.len <= len_);
+            memcpy(record->data + col.offset, key + covered_key_offsets_[i], col.len);
+        }
+        return record;
+    }
+
+    auto seek_to_next_covered_tuple() -> bool {
+        if (scan_ == nullptr || scan_->is_end()) {
+            rid_ = Rid{-1, -1};
+            return false;
+        }
+
+        while (!scan_->is_end()) {
+            rid_ = scan_->rid();
+            if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
+                context_->lock_mgr_->lock_shared_on_record(context_->txn_, rid_, fh_->GetFd());
+            }
+            if (residual_conds_.empty()) {
+                return true;
+            }
+            auto record = make_record_from_index_key();
+            if (evaluate_conditions(residual_conds_, *record, cols_)) {
+                return true;
+            }
+            scan_->next();
+        }
+
+        rid_ = Rid{-1, -1};
+        return false;
+    }
+
     void seek_to_next_valid() {
+        if (use_covering_index_) {
+            if (!seek_to_next_covered_tuple()) {
+                set_end();
+            }
+            return;
+        }
         if (!seek_to_next_valid_tuple(scan_.get(), rid_, residual_conds_, cols_, [&](const Rid &rid) {
                 if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
                     context_->lock_mgr_->lock_shared_on_record(context_->txn_, rid, fh_->GetFd());
@@ -265,7 +342,8 @@ class IndexScanExecutor : public AbstractExecutor {
    public:
     IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> index_lookup_conds,
                       std::vector<Condition> residual_conds, std::vector<std::string> index_col_names,
-                      std::optional<IndexMeta> index_meta, Context *context) {
+                      std::optional<IndexMeta> index_meta, bool use_covering_index,
+                      std::vector<ColMeta> covered_cols, Context *context) {
         sm_manager_ = sm_manager;
         context_ = context;
         tab_name_ = std::move(tab_name);
@@ -281,6 +359,12 @@ class IndexScanExecutor : public AbstractExecutor {
         fh_ = sm_manager_->fhs_.at(tab_name_).get();
         cols_ = tab_.cols;
         len_ = cols_.back().offset + cols_.back().len;
+        use_covering_index_ = use_covering_index;
+        if (use_covering_index_) {
+            cols_ = std::move(covered_cols);
+            len_ = cols_.empty() ? 0 : cols_.back().offset + cols_.back().len;
+            build_covered_key_offsets();
+        }
 
         normalize_conds(index_lookup_conds_, tab_name_);
         normalize_conds(residual_conds_, tab_name_);
@@ -339,6 +423,9 @@ class IndexScanExecutor : public AbstractExecutor {
     std::unique_ptr<RmRecord> NextImpl() override {
         if (is_end()) {
             return nullptr;
+        }
+        if (use_covering_index_) {
+            return make_record_from_index_key();
         }
         return fh_->get_record(rid_, context_);
     }

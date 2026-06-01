@@ -112,6 +112,14 @@ class ScanPlan : public Plan
         std::vector<std::string> index_col_names_;
         std::optional<IndexMeta> index_meta_;
         bool empty_result_ = false;
+        bool use_covering_index_ = false;
+
+        void enable_covering_index(std::vector<ColMeta> covered_cols)
+        {
+            use_covering_index_ = true;
+            cols_ = std::move(covered_cols);
+            len_ = cols_.empty() ? 0 : cols_.back().offset + cols_.back().len;
+        }
 
 };
 

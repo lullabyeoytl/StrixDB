@@ -150,6 +150,19 @@ void prepare_index_lookup_values(const IndexMeta &index_meta, std::vector<Condit
     }
 }
 
+auto build_covered_cols(const TabMeta &tab, const std::vector<TabCol> &required_cols) -> std::vector<ColMeta> {
+    std::vector<ColMeta> covered_cols;
+    covered_cols.reserve(required_cols.size());
+    int offset = 0;
+    for (const auto &required_col : required_cols) {
+        auto col = find_col_meta(tab.cols, required_col);
+        col.offset = offset;
+        offset += col.len;
+        covered_cols.push_back(std::move(col));
+    }
+    return covered_cols;
+}
+
 // ================================================================
 // Join expression helpers
 // ================================================================
@@ -562,7 +575,8 @@ auto is_aggregate_query(const Query &query) -> bool {
 
 Planner::ScanBuildResult Planner::make_scan_plan(const std::string &tab_name,
                                                  const std::vector<Condition> &semantic_conds,
-                                                 std::vector<TabCol> required_cols) {
+                                                 std::vector<TabCol> required_cols,
+                                                 bool allow_covering_index) {
     ScanBuildResult result;
     const auto &tab = sm_manager_->db_.get_table(tab_name);
     auto best_match = match_best_index(tab, semantic_conds, required_cols);
@@ -579,6 +593,9 @@ Planner::ScanBuildResult Planner::make_scan_plan(const std::string &tab_name,
                                              std::move(best_match.residual_conds),
                                              std::move(best_match.index_col_names),
                                              std::move(best_match.index_meta));
+    if (allow_covering_index && best_match.covers_required_cols && best_match.covers_residual_conds) {
+        result.scan->enable_covering_index(build_covered_cols(tab, required_cols));
+    }
     return result;
 }
 
@@ -594,7 +611,7 @@ std::shared_ptr<Plan> Planner::build_dml_scan_plan(const LogicalPlanContext &pla
     if (cols_it != plan_context.table_required_cols.end()) {
         required_cols = cols_it->second;
     }
-    auto scan_result = make_scan_plan(tab_name, table_conds, std::move(required_cols));
+    auto scan_result = make_scan_plan(tab_name, table_conds, std::move(required_cols), false);
     if (plan_context.empty_tables.count(tab_name) != 0) {
         scan_result.scan->empty_result_ = true;
     }
@@ -699,7 +716,7 @@ std::vector<std::pair<std::string, std::shared_ptr<Plan>>> Planner::build_table_
         if (it != plan_context.table_conds.end()) {
             curr_conds = it->second;
         }
-        auto scan_result = make_scan_plan(tab_name, curr_conds, required_cols);
+        auto scan_result = make_scan_plan(tab_name, curr_conds, required_cols, true);
         if (plan_context.empty_tables.count(tab_name) != 0) {
             scan_result.scan->empty_result_ = true;
         }
