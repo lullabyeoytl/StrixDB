@@ -40,7 +40,7 @@ void append_join_clause(std::vector<std::shared_ptr<JoinExpr>> &join_exprs,
 
 // keywords
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY LIMIT OFFSET AS
-WHERE UPDATE SET SELECT INT CHAR FLOAT DATETIME INDEX UNIQUE AND ON SEMI JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE ENABLE_HASHJOIN
+WHERE UPDATE SET SELECT INT CHAR FLOAT DATETIME INDEX AND ON SEMI JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE ENABLE_HASHJOIN
 %token COUNT SUM AVG MIN MAX GROUP HAVING EXPLAIN ANALYZE
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
@@ -165,7 +165,7 @@ setStmt:
         SET set_knob_type '=' VALUE_BOOL
     {
         $$ = std::make_shared<SetStmt>($2, $4);
-    }
+    }
     ;
 
 ddl:
@@ -183,11 +183,7 @@ ddl:
     }
     |   CREATE INDEX tbName '(' colNameList ')'
     {
-        $$ = std::make_shared<CreateIndex>($3, $5, false);
-    }
-    |   CREATE UNIQUE INDEX tbName '(' colNameList ')'
-    {
-        $$ = std::make_shared<CreateIndex>($4, $6, true);
+        $$ = std::make_shared<CreateIndex>($3, $5);
     }
     |   DROP INDEX tbName '(' colNameList ')'
     {
@@ -296,15 +292,7 @@ colNameList:
 field:
         colName type
     {
-        $$ = std::make_shared<ColDef>($1, $2, false);
-    }
-    |   colName type UNIQUE
-    {
-        $$ = std::make_shared<ColDef>($1, $2, true);
-    }
-    |   UNIQUE '(' colNameList ')'
-    {
-        $$ = std::make_shared<UniqueDef>($3);
+        $$ = std::make_shared<ColDef>($1, $2);
     }
     ;
 

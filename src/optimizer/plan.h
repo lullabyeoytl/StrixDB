@@ -338,21 +338,19 @@ class DDLPlan : public Plan
 {
     public:
         DDLPlan(PlanTag tag, std::string tab_name, std::vector<std::string> col_names,
-                std::vector<ColDef> cols, std::vector<IndexSpec> index_specs = {}, bool unique = false)
+                std::vector<ColDef> cols, std::vector<IndexSpec> index_specs = {})
         {
             Plan::tag = tag;
             tab_name_ = std::move(tab_name);
             cols_ = std::move(cols);
             tab_col_names_ = std::move(col_names);
-            index_specs_ = std::move(index_specs);
-            unique_ = unique;
+            index_specs_ = std::move(index_specs);
         }
         ~DDLPlan(){}
         std::string tab_name_;
         std::vector<std::string> tab_col_names_;
         std::vector<ColDef> cols_;
-        std::vector<IndexSpec> index_specs_;
-        bool unique_;
+        std::vector<IndexSpec> index_specs_;
 };
 
 // help; show tables; desc tables; begin; abort; commit; rollback语句对应的plan

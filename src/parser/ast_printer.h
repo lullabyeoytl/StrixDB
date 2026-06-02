@@ -83,6 +83,7 @@ private:
         return m.at(dir);
     }
 
+
     template<typename T>
     static void print_node_list(std::vector<T> nodes, int offset) {
         std::cout << offset2string(offset);
@@ -113,7 +114,6 @@ private:
         } else if (auto x = std::dynamic_pointer_cast<CreateIndex>(node)) {
             std::cout << "CREATE_INDEX\n";
             print_val(x->tab_name, offset);
-            print_val(x->unique ? "UNIQUE" : "NORMAL", offset);
             for(auto col_name: x->col_names)
                 print_val(col_name, offset);
         } else if (auto x = std::dynamic_pointer_cast<DropIndex>(node)) {
@@ -122,15 +122,9 @@ private:
             // print_val(x->col_name, offset);
             for(auto col_name: x->col_names)
                 print_val(col_name, offset);
-        } else if (auto x = std::dynamic_pointer_cast<UniqueDef>(node)) {
-            std::cout << "UNIQUE_DEF\n";
-            for (auto col_name : x->col_names) {
-                print_val(col_name, offset);
-            }
         } else if (auto x = std::dynamic_pointer_cast<ColDef>(node)) {
             std::cout << "COL_DEF\n";
             print_val(x->col_name, offset);
-            print_val(x->unique ? "UNIQUE" : "NORMAL", offset);
             print_node(x->type_len, offset);
         } else if (auto x = std::dynamic_pointer_cast<Col>(node)) {
             std::cout << "COL\n";

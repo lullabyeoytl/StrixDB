@@ -79,16 +79,9 @@ struct Field : public TreeNode {
 struct ColDef : public Field {
     std::string col_name;
     std::shared_ptr<TypeLen> type_len;
-    bool unique;
 
-    ColDef(std::string col_name_, std::shared_ptr<TypeLen> type_len_, bool unique_ = false) :
-            col_name(std::move(col_name_)), type_len(std::move(type_len_)), unique(unique_) {}
-};
-
-struct UniqueDef : public Field {
-    std::vector<std::string> col_names;
-
-    explicit UniqueDef(std::vector<std::string> col_names_) : col_names(std::move(col_names_)) {}
+    ColDef(std::string col_name_, std::shared_ptr<TypeLen> type_len_) :
+            col_name(std::move(col_name_)), type_len(std::move(type_len_)) {}
 };
 
 struct CreateTable : public TreeNode {
@@ -114,10 +107,9 @@ struct DescTable : public TreeNode {
 struct CreateIndex : public TreeNode {
     std::string tab_name;
     std::vector<std::string> col_names;
-    bool unique;
 
-    CreateIndex(std::string tab_name_, std::vector<std::string> col_names_, bool unique_ = false) :
-            tab_name(std::move(tab_name_)), col_names(std::move(col_names_)), unique(unique_) {}
+    CreateIndex(std::string tab_name_, std::vector<std::string> col_names_) :
+            tab_name(std::move(tab_name_)), col_names(std::move(col_names_)) {}
 };
 
 struct DropIndex : public TreeNode {
@@ -356,105 +348,3 @@ struct SetStmt : public TreeNode {
         set_knob_type_(type), bool_val_(bool_value) { }
 };
 
-// Semantic value
-struct SemValue {
-    int sv_int;
-    float sv_float;
-    std::string sv_str;
-    bool sv_bool;
-    OrderByDir sv_orderby_dir;
-    std::vector<std::string> sv_strs;
-    std::vector<std::shared_ptr<TableRef>> sv_table_refs;
-
-    std::shared_ptr<TreeNode> sv_node;
-
-    SvCompOp sv_comp_op;
-
-    std::shared_ptr<TypeLen> sv_type_len;
-
-    std::shared_ptr<Field> sv_field;
-    std::vector<std::shared_ptr<Field>> sv_fields;
-    std::shared_ptr<TableRef> sv_table_ref;
-
-    std::shared_ptr<Expr> sv_expr;
-    std::vector<std::shared_ptr<Expr>> sv_exprs;
-    std::shared_ptr<SelectItem> sv_select_item;
-    std::vector<std::shared_ptr<SelectItem>> sv_select_items;
-
-    std::shared_ptr<Value> sv_val;
-    std::vector<std::shared_ptr<Value>> sv_vals;
-
-    std::shared_ptr<Col> sv_col;
-    std::vector<std::shared_ptr<Col>> sv_cols;
-
-    std::shared_ptr<SetClause> sv_set_clause;
-    std::vector<std::shared_ptr<SetClause>> sv_set_clauses;
-
-    std::shared_ptr<BinaryExpr> sv_cond;
-    std::vector<std::shared_ptr<BinaryExpr>> sv_conds;
-
-    std::vector<std::shared_ptr<JoinExpr>> sv_join_exprs;
-    JoinType sv_join_type;
-
-    std::shared_ptr<OrderBy::Item> sv_orderby_item;
-    std::vector<std::shared_ptr<OrderBy::Item>> sv_orderby_items;
-    std::shared_ptr<OrderBy> sv_orderby;
-    std::shared_ptr<LimitClause> sv_limit_clause;
-
-    // aggregation concerning
-    std::shared_ptr<AggFunc> sv_agg_func;
-    std::shared_ptr<GroupBy> sv_group_by;
-    std::shared_ptr<HavingCond> sv_having_cond;
-    std::vector<std::shared_ptr<HavingCond>> sv_having_conds;
-
-    SetKnobType sv_setKnobType;
-};
-
-}
-
-// ================================================================
-// AST → internal type conversions
-// Pure data mapping from parser AST types to common internal types.
-// Shared by analyze and optimizer to avoid duplicated conversion logic.
-// ================================================================
-
-inline auto convert_sv_comp_op(ast::SvCompOp op) -> CompOp {
-    switch (op) {
-        case ast::SV_OP_EQ: return OP_EQ;
-        case ast::SV_OP_NE: return OP_NE;
-        case ast::SV_OP_LT: return OP_LT;
-        case ast::SV_OP_GT: return OP_GT;
-        case ast::SV_OP_LE: return OP_LE;
-        case ast::SV_OP_GE: return OP_GE;
-        default: throw InternalError("Unexpected comparison op");
-    }
-}
-
-inline auto convert_sv_value(const std::shared_ptr<ast::Value> &sv_val) -> Value {
-    Value val;
-    auto *raw = sv_val.get();
-    if (auto *int_lit = dynamic_cast<ast::IntLit *>(raw)) {
-        val.set_int(int_lit->val);
-    } else if (auto *float_lit = dynamic_cast<ast::FloatLit *>(raw)) {
-        val.set_float(float_lit->val);
-    } else if (auto *str_lit = dynamic_cast<ast::StringLit *>(raw)) {
-        val.set_str(str_lit->val);
-    } else if (auto *bool_lit = dynamic_cast<ast::BoolLit *>(raw)) {
-        val.set_int(bool_lit->val ? 1 : 0);
-    } else {
-        throw InternalError("Unexpected sv value type");
-    }
-    return val;
-}
-
-inline auto convert_sv_type(ast::SvType sv_type) -> ColType {
-    switch (sv_type) {
-        case ast::SV_TYPE_INT:      return TYPE_INT;
-        case ast::SV_TYPE_FLOAT:    return TYPE_FLOAT;
-        case ast::SV_TYPE_STRING:   return TYPE_STRING;
-        case ast::SV_TYPE_DATETIME: return TYPE_DATETIME;
-        default: throw InternalError("Unexpected sv type");
-    }
-}
-
-#define YYSTYPE ast::SemValue

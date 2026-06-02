@@ -980,29 +980,23 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context 
     if (auto x = std::dynamic_pointer_cast<ast::CreateTable>(query->parse)) {
         // create table;
         std::vector<ColDef> col_defs;
-        std::vector<IndexSpec> index_specs;
         for (auto &field : x->fields) {
             if (auto sv_col_def = std::dynamic_pointer_cast<ast::ColDef>(field)) {
                 ColDef col_def = {.name = sv_col_def->col_name,
                                   .type = convert_sv_type(sv_col_def->type_len->type),
                                   .len = sv_col_def->type_len->len};
                 col_defs.push_back(col_def);
-                if (sv_col_def->unique) {
-                    index_specs.push_back(IndexSpec{{sv_col_def->col_name}, true});
-                }
-            } else if (auto sv_unique_def = std::dynamic_pointer_cast<ast::UniqueDef>(field)) {
-                index_specs.push_back(IndexSpec{sv_unique_def->col_names, true});
             } else {
                 throw InternalError("Unexpected field type");
             }
         }
-        plannerRoot = std::make_shared<DDLPlan>(T_CreateTable, x->tab_name, std::vector<std::string>(), col_defs, index_specs, false);
+        plannerRoot = std::make_shared<DDLPlan>(T_CreateTable, x->tab_name, std::vector<std::string>(), col_defs);
     } else if (auto x = std::dynamic_pointer_cast<ast::DropTable>(query->parse)) {
         // drop table;
         plannerRoot = std::make_shared<DDLPlan>(T_DropTable, x->tab_name, std::vector<std::string>(), std::vector<ColDef>());
     } else if (auto x = std::dynamic_pointer_cast<ast::CreateIndex>(query->parse)) {
         // create index;
-        plannerRoot = std::make_shared<DDLPlan>(T_CreateIndex, x->tab_name, x->col_names, std::vector<ColDef>(), std::vector<IndexSpec>(), x->unique);
+        plannerRoot = std::make_shared<DDLPlan>(T_CreateIndex, x->tab_name, x->col_names, std::vector<ColDef>());
     } else if (auto x = std::dynamic_pointer_cast<ast::DropIndex>(query->parse)) {
         // drop index
         plannerRoot = std::make_shared<DDLPlan>(T_DropIndex, x->tab_name, x->col_names, std::vector<ColDef>());

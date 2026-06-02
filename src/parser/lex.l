@@ -85,7 +85,6 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "FLOAT" { return FLOAT; }
 "DATETIME" { return DATETIME; }
 "INDEX" { return INDEX; }
-"UNIQUE" { return UNIQUE; }
 "AND" { return AND; }
 "ON" { return ON; }
 "SEMI" { return SEMI; }
