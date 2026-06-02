@@ -46,6 +46,7 @@ typedef enum PlanTag{
     T_IndexScan,
     T_Join,
     T_NestLoop,
+    T_IndexNestLoop,
     T_SortMerge,    // sort merge join
     T_HashJoin,     // hash join
     T_Sort,
@@ -175,6 +176,27 @@ class NestedLoopJoinPlan : public PhysicalJoinPlan
         ~NestedLoopJoinPlan() override = default;
         // Nested Loop Join re-checks the full predicate list on each candidate pair.
         std::vector<Condition> conds_;
+};
+
+class IndexNestedLoopJoinPlan : public PhysicalJoinPlan
+{
+    public:
+        IndexNestedLoopJoinPlan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
+                                std::vector<Condition> conds, TabCol outer_lookup_col,
+                                TabCol inner_lookup_col,
+                                JoinType join_type = INNER_JOIN)
+            : PhysicalJoinPlan(T_IndexNestLoop, std::move(left), std::move(right), join_type)
+        {
+            conds_ = std::move(conds);
+            outer_lookup_col_ = std::move(outer_lookup_col);
+            inner_lookup_col_ = std::move(inner_lookup_col);
+        }
+        ~IndexNestedLoopJoinPlan() override = default;
+        // All join predicates are rechecked after the indexed probe returns a candidate row.
+        std::vector<Condition> conds_;
+        // The lookup predicate is bound at runtime from the outer tuple into the inner index scan.
+        TabCol outer_lookup_col_;
+        TabCol inner_lookup_col_;
 };
 
 class SortMergeJoinPlan : public PhysicalJoinPlan

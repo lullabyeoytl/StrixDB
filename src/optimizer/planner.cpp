@@ -28,6 +28,7 @@ namespace {
 
 enum class JoinImplementation {
     NestedLoop,
+    IndexNestedLoop,
     SortMerge,
     Hash
 };
@@ -39,8 +40,9 @@ struct JoinPredicateAnalysis {
 
 struct JoinImplementationConfig {
     bool enable_nestedloop = true;
-    bool enable_sortmerge = true;
-    bool enable_hash = true;
+    bool enable_index_nestedloop = true;
+    bool enable_sortmerge = false;
+    bool enable_hash = false;
 };
 
 struct JoinImplementationDecision {
@@ -50,6 +52,16 @@ struct JoinImplementationDecision {
 struct JoinSubtree {
     std::shared_ptr<Plan> plan;
     std::set<std::string> tables;
+};
+
+struct SingleTablePlanInfo {
+    std::string table_name;
+    std::vector<Condition> conds;
+};
+
+struct IndexNestedLoopJoinCandidate {
+    Condition index_cond;
+    std::shared_ptr<Plan> right_plan;
 };
 
 class ColumnUsageCollector {
@@ -398,21 +410,94 @@ auto join_right_key_cols(const JoinPredicateAnalysis &analysis) -> std::vector<T
     return cols;
 }
 
+auto append_conditions(std::vector<Condition> &target, const std::vector<Condition> &source) -> void {
+    target.insert(target.end(), source.begin(), source.end());
+}
+
+auto extract_single_table_plan_info(const std::shared_ptr<Plan> &plan) -> std::optional<SingleTablePlanInfo> {
+    if (auto projection = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
+        return extract_single_table_plan_info(projection->subplan_);
+    }
+    if (auto filter = std::dynamic_pointer_cast<FilterPlan>(plan)) {
+        auto info = extract_single_table_plan_info(filter->subplan_);
+        if (!info.has_value()) {
+            return std::nullopt;
+        }
+        append_conditions(info->conds, filter->conds_);
+        return info;
+    }
+    if (auto scan = std::dynamic_pointer_cast<ScanPlan>(plan)) {
+        SingleTablePlanInfo info;
+        info.table_name = scan->tab_name_;
+        append_conditions(info.conds, scan->all_conds_);
+        append_conditions(info.conds, scan->access_conds_);
+        append_conditions(info.conds, scan->residual_conds_);
+        return info;
+    }
+    return std::nullopt;
+}
+
+auto find_runtime_bindable_index_scan(const std::shared_ptr<Plan> &plan) -> std::shared_ptr<ScanPlan> {
+    if (auto projection = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
+        return find_runtime_bindable_index_scan(projection->subplan_);
+    }
+    if (auto filter = std::dynamic_pointer_cast<FilterPlan>(plan)) {
+        return find_runtime_bindable_index_scan(filter->subplan_);
+    }
+    auto scan = std::dynamic_pointer_cast<ScanPlan>(plan);
+    if (scan == nullptr || scan->tag != T_IndexScan) {
+        return nullptr;
+    }
+    return scan;
+}
+
+auto index_scan_supports_runtime_probe(const ScanPlan &scan, const TabCol &lookup_col) -> bool {
+    return std::any_of(scan.access_conds_.begin(), scan.access_conds_.end(), [&](const Condition &cond) {
+        return cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.equals(lookup_col);
+    });
+}
+
+auto find_index_nestedloop_join_candidate(const JoinPredicateAnalysis &analysis, const std::shared_ptr<Plan> &right)
+    -> std::optional<IndexNestedLoopJoinCandidate> {
+    auto right_info = extract_single_table_plan_info(right);
+    if (!right_info.has_value()) {
+        return std::nullopt;
+    }
+    auto right_index_scan = find_runtime_bindable_index_scan(right);
+    if (right_index_scan == nullptr || right_index_scan->tab_name_ != right_info->table_name) {
+        return std::nullopt;
+    }
+
+    for (const auto &cond : analysis.equi_conds) {
+        if (cond.is_rhs_val || cond.rhs_col.tab_name != right_info->table_name) {
+            continue;
+        }
+        if (!index_scan_supports_runtime_probe(*right_index_scan, cond.rhs_col)) {
+            continue;
+        }
+        return IndexNestedLoopJoinCandidate{cond, right};
+    }
+    return std::nullopt;
+}
+
 // ================================================================
 // Join implementation helpers
 // ================================================================
 
-auto build_join_implementation_config(bool enable_nestedloop_join, bool enable_sortmerge_join, bool enable_hash_join)
+auto build_join_implementation_config(bool enable_nestedloop_join, bool enable_index_nestedloop_join,
+                                      bool enable_sortmerge_join, bool enable_hash_join)
     -> JoinImplementationConfig {
     JoinImplementationConfig config;
     config.enable_nestedloop = enable_nestedloop_join;
+    config.enable_index_nestedloop = enable_index_nestedloop_join;
     config.enable_sortmerge = enable_sortmerge_join;
     config.enable_hash = enable_hash_join;
     return config;
 }
 
 void validate_join_executor_config(const JoinImplementationConfig &config) {
-    if (!config.enable_nestedloop && !config.enable_sortmerge && !config.enable_hash) {
+    if (!config.enable_nestedloop && !config.enable_index_nestedloop &&
+        !config.enable_sortmerge && !config.enable_hash) {
         throw RMDBError("No join executor selected!");
     }
 }
@@ -421,6 +506,8 @@ auto supports_join_implementation(JoinImplementation implementation, JoinType jo
     switch (implementation) {
         case JoinImplementation::NestedLoop:
             return true;
+        case JoinImplementation::IndexNestedLoop:
+            break;
         case JoinImplementation::SortMerge:
         case JoinImplementation::Hash:
             break;
@@ -435,8 +522,14 @@ auto supports_join_implementation(JoinImplementation implementation, JoinType jo
 }
 
 auto choose_join_implementation(const JoinPredicateAnalysis &analysis, JoinType join_type,
-                                const JoinImplementationConfig &config) -> JoinImplementationDecision {
+                                const JoinImplementationConfig &config,
+                                bool has_index_nestedloop_candidate) -> JoinImplementationDecision {
     JoinImplementationDecision decision;
+    if (config.enable_index_nestedloop && has_index_nestedloop_candidate &&
+        supports_join_implementation(JoinImplementation::IndexNestedLoop, join_type)) {
+        decision.implementation = JoinImplementation::IndexNestedLoop;
+        return decision;
+    }
     if (config.enable_hash && join_has_equi_keys(analysis) &&
         supports_join_implementation(JoinImplementation::Hash, join_type)) {
         decision.implementation = JoinImplementation::Hash;
@@ -464,6 +557,14 @@ auto build_nestedloop_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan
     return std::make_shared<NestedLoopJoinPlan>(std::move(left), std::move(right), analysis.all_conds, join_type);
 }
 
+auto build_index_nestedloop_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
+                                      const JoinPredicateAnalysis &analysis, JoinType join_type,
+                                      const IndexNestedLoopJoinCandidate &candidate) -> std::shared_ptr<Plan> {
+    return std::make_shared<IndexNestedLoopJoinPlan>(std::move(left), std::move(right), analysis.all_conds,
+                                                     candidate.index_cond.lhs_col, candidate.index_cond.rhs_col,
+                                                     join_type);
+}
+
 auto build_sortmerge_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
                                const JoinPredicateAnalysis &analysis, JoinType join_type)
     -> std::shared_ptr<Plan> {
@@ -486,10 +587,18 @@ auto physicalize_logical_join(const std::shared_ptr<JoinPlan> &join, std::shared
                               std::shared_ptr<Plan> right, const JoinImplementationConfig &config)
     -> std::shared_ptr<Plan> {
     auto analysis = analyze_join_predicates(join->conds_);
-    auto decision = choose_join_implementation(analysis, join->join_type_, config);
+    auto index_nestedloop_candidate = find_index_nestedloop_join_candidate(analysis, right);
+    auto decision = choose_join_implementation(analysis, join->join_type_, config,
+                                               index_nestedloop_candidate.has_value());
     switch (decision.implementation) {
         case JoinImplementation::NestedLoop:
             return build_nestedloop_join_plan(std::move(left), std::move(right), analysis, join->join_type_);
+        case JoinImplementation::IndexNestedLoop:
+            if (!index_nestedloop_candidate.has_value()) {
+                throw InternalError("Index nested loop join selected without a candidate");
+            }
+            return build_index_nestedloop_join_plan(std::move(left), std::move(index_nestedloop_candidate->right_plan), analysis,
+                                                    join->join_type_, *index_nestedloop_candidate);
         case JoinImplementation::SortMerge:
             return build_sortmerge_join_plan(std::move(left), std::move(right), analysis, join->join_type_);
         case JoinImplementation::Hash:
@@ -797,8 +906,10 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query, const 
 
     auto plan = build_join_tree(table_plans, plan_context.join_conds, plan_context.explicit_joins);
 
-    auto join_impl_config =
-        build_join_implementation_config(enable_nestedloop_join, enable_sortmerge_join, this->enable_hash_join);
+    auto join_impl_config = build_join_implementation_config(enable_nestedloop_join,
+                                                             enable_nestedloop_join,
+                                                             enable_sortmerge_join,
+                                                             this->enable_hash_join);
     validate_join_executor_config(join_impl_config);
 
     return physicalize_join_tree(plan, join_impl_config);

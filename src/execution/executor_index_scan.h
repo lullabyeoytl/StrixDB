@@ -432,6 +432,32 @@ class IndexScanExecutor : public AbstractExecutor {
 
     Rid &rid() override { return rid_; }
 
+    void bind_runtime_index_lookup(const TabCol &lookup_col, const Value &value) override {
+        bool matched = false;
+        for (auto &cond : index_lookup_conds_) {
+            if (!cond.is_rhs_val || !cond.lhs_col.equals(lookup_col)) {
+                continue;
+            }
+            auto col_it = std::find_if(index_meta_.cols.begin(), index_meta_.cols.end(),
+                                       [&](const ColMeta &col) { return col_meta_matches(col, cond.lhs_col); });
+            if (col_it == index_meta_.cols.end()) {
+                continue;
+            }
+            auto coerced = coerce_value_to_type(value, col_it->type, true);
+            if (coerced.raw == nullptr) {
+                coerced.init_raw(col_it->len);
+            } else if (coerced.raw->size != col_it->len) {
+                coerced.raw.reset();
+                coerced.init_raw(col_it->len);
+            }
+            cond.rhs_val = std::move(coerced);
+            matched = true;
+        }
+        if (!matched) {
+            throw InternalError("Runtime index lookup binding target is not an access condition");
+        }
+    }
+
     bool is_end() const override {
         return rid_.page_no == -1 && rid_.slot_no == -1;
     }

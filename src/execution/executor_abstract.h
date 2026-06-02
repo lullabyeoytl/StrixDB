@@ -97,6 +97,11 @@ class AbstractExecutor: public NonCopyable {
 
     virtual Rid &rid() = 0;
 
+    virtual void bind_runtime_index_lookup(const TabCol &lookup_col, const Value &value) {
+        throw InternalError("Executor does not support runtime index lookup binding: " + lookup_col.tab_name + "." +
+                            lookup_col.col_name);
+    }
+
     std::unique_ptr<RmRecord> Next() {
         auto record = NextImpl();
         if (record != nullptr) {

@@ -21,6 +21,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_abstract.h"
 #include "execution/executor_filter.h"
 #include "execution/executor_hash_join.h"
+#include "execution/executor_index_nestedloop_join.h"
 #include "execution/executor_limit.h"
 #include "execution/executor_nestedloop_join.h"
 #include "execution/executor_sortmerge_join.h"
@@ -171,6 +172,11 @@ class Portal
             return;
         }
         if (auto join = std::dynamic_pointer_cast<NestedLoopJoinPlan>(plan)) {
+            collect_plan_tables(join->left_, tables, depth + 1);
+            collect_plan_tables(join->right_, tables, depth + 1);
+            return;
+        }
+        if (auto join = std::dynamic_pointer_cast<IndexNestedLoopJoinPlan>(plan)) {
             collect_plan_tables(join->left_, tables, depth + 1);
             collect_plan_tables(join->right_, tables, depth + 1);
             return;
@@ -375,6 +381,16 @@ class Portal
             std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_, context);
             auto executor = std::make_unique<NestedLoopJoinExecutor>(std::move(left), std::move(right),
                                                                      x->conds_, x->join_type_);
+            executor->set_explain_info("Join", "tables=" + format_table_list(plan) +
+                                                   ", condition=" + format_explain_condition_list(x->conds_));
+            return executor;
+        } else if(auto x = std::dynamic_pointer_cast<IndexNestedLoopJoinPlan>(plan)) {
+            std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_, context);
+            std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_, context);
+            auto executor = std::make_unique<IndexNestedLoopJoinExecutor>(std::move(left), std::move(right),
+                                                                          x->conds_, x->outer_lookup_col_,
+                                                                          x->inner_lookup_col_,
+                                                                          x->join_type_);
             executor->set_explain_info("Join", "tables=" + format_table_list(plan) +
                                                    ", condition=" + format_explain_condition_list(x->conds_));
             return executor;

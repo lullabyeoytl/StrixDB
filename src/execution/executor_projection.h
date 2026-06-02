@@ -69,6 +69,10 @@ class ProjectionExecutor : public AbstractExecutor {
 
     Rid &rid() override { return _abstract_rid; }
 
+    void bind_runtime_index_lookup(const TabCol &lookup_col, const Value &value) override {
+        prev_->bind_runtime_index_lookup(lookup_col, value);
+    }
+
     size_t tupleLen() const override { return len_; }
 
     const std::vector<ColMeta> &cols() const override { return cols_; }

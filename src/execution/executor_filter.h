@@ -76,6 +76,10 @@ class FilterExecutor : public AbstractExecutor {
 
     Rid &rid() override { return rid_; }
 
+    void bind_runtime_index_lookup(const TabCol &lookup_col, const Value &value) override {
+        prev_->bind_runtime_index_lookup(lookup_col, value);
+    }
+
     size_t tupleLen() const override { return prev_->tupleLen(); }
 
     const std::vector<ColMeta> &cols() const override { return prev_->cols(); }
