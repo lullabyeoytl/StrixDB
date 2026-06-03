@@ -10,13 +10,82 @@ See the Mulan PSL v2 for more details. */
 
 #include "transaction_manager.h"
 
+#include <algorithm>
+#include <cstring>
 #include <iostream>
+#include <limits>
 
+#include "common/common.h"
 #include "index/ix.h"
 #include "record/rm_file_handle.h"
 #include "system/sm_manager.h"
 
-std::unordered_map<txn_id_t, Transaction *> TransactionManager::txn_map = {};
+
+namespace {
+//--------------------------------------------------------------------------
+// Timestamp / transaction ID utilities
+//--------------------------------------------------------------------------
+auto is_uncommitted_ts(timestamp_t ts) -> bool {
+    return ts >= TXN_START_ID;
+}
+
+auto make_txn_write_ts(Transaction *txn) -> timestamp_t {
+    return TXN_START_ID + txn->get_transaction_id();
+}
+
+auto txn_id_from_write_ts(timestamp_t ts) -> txn_id_t {
+    return ts - TXN_START_ID;
+}
+
+// Returns the end timestamp of a transaction, or max if not committed.
+auto txn_interval_end(Transaction *txn) -> timestamp_t {
+    if (txn == nullptr || txn->get_state() != TransactionState::COMMITTED) {
+        return std::numeric_limits<timestamp_t>::max();
+    }
+    return txn->get_commit_ts();
+}
+
+// Returns true if two transactions overlap in time.
+auto transactions_overlap(Transaction *lhs, Transaction *rhs) -> bool {
+    if (lhs == nullptr || rhs == nullptr) {
+        return false;
+    }
+    return lhs->get_start_ts() < txn_interval_end(rhs) && rhs->get_start_ts() < txn_interval_end(lhs);
+}
+
+//-------------------------------------------------------------------------
+// SSI visibility helper.
+//-------------------------------------------------------------------------
+auto ssi_writer_visible_to(Transaction *writer, Transaction *reader) -> bool {
+    if (writer == nullptr || reader == nullptr) {
+        return false;
+    }
+    if (writer->get_transaction_id() == reader->get_transaction_id()) {
+        return true;
+    }
+    if (writer->get_state() == TransactionState::COMMITTED) {
+        timestamp_t commit_ts = writer->get_commit_ts();
+        return commit_ts != INVALID_TS && commit_ts <= reader->get_start_ts();
+    }
+    return false;
+}
+//--------------------------------------------------------------------------
+// SSI record value / condition matching
+//--------------------------------------------------------------------------
+
+auto ssi_write_matches_conditions(const TabMeta &tab, const SsiWriteRecord &write,
+                                  const std::vector<Condition> &conditions) -> bool {
+    if (write.has_old_record_ && evaluate_conditions(conditions, write.old_record_, tab.cols)) {
+        return true;
+    }
+    return write.has_new_record_ && evaluate_conditions(conditions, write.new_record_, tab.cols);
+}
+
+}  // namespace
+
+//--------------------------------------------------------------------------
+// Resource cleanup helpers
+//--------------------------------------------------------------------------
 
 void delete_write_set(Transaction *txn) {
     for (auto *write_record : *txn->get_write_set()) {
@@ -35,6 +104,30 @@ void release_locks(Transaction *txn, LockManager *lock_manager) {
     }
     txn->get_lock_set()->clear();
 }
+
+//--------------------------------------------------------------------------
+// File handle, index, and CLR helpers
+//--------------------------------------------------------------------------
+
+auto find_file_handle_by_fd(SmManager *sm_manager, int fd) -> RmFileHandle * {
+    if (sm_manager == nullptr) {
+        return nullptr;
+    }
+    for (auto &[_, fh] : sm_manager->fhs_) {
+        if (fh != nullptr && fh->GetFd() == fd) {
+            return fh.get();
+        }
+    }
+    return nullptr;
+}
+
+/**
+ * Represents a delete record for garbage collection.
+ */
+struct GcDeleteRecord {
+    int fd;
+    Rid rid;
+};
 
 enum class IndexEntryOp { INSERT, DELETE };
 
@@ -65,23 +158,75 @@ void append_txn_clr(Transaction *txn, LogManager *log_manager, ClrRecord &clr, L
     txn->set_prev_lsn(lsn);
 }
 
+//--------------------------------------------------------------------------
+// Transaction Table Operations — locked txn registry
+//--------------------------------------------------------------------------
+
+TransactionManager::~TransactionManager() {
+}
+
+Transaction *TransactionManager::GetTransactionLocked(txn_id_t txn_id) {
+    auto it = txn_map.find(txn_id);
+    if (it == txn_map.end()) {
+        return nullptr;
+    }
+    return it->second.Get();
+}
+
+void TransactionManager::RegisterTransactionLocked(std::unique_ptr<Transaction> txn) {
+    txn_id_t txn_id = txn->get_transaction_id();
+    txn_map[txn_id] = TxnEntry{std::move(txn), false};
+}
+
+void TransactionManager::SetTransactionRetainedLocked(txn_id_t txn_id, bool retained) {
+    auto it = txn_map.find(txn_id);
+    if (it == txn_map.end()) {
+        return;
+    }
+    it->second.retained = retained;
+}
+
+void TransactionManager::RemoveTransactionLocked(txn_id_t txn_id,
+                                                 std::vector<std::unique_ptr<Transaction>> *released_txns) {
+    auto it = txn_map.find(txn_id);
+    if (it == txn_map.end()) {
+        return;
+    }
+    if (released_txns != nullptr && it->second.txn != nullptr) {
+        released_txns->push_back(std::move(it->second.txn));
+    }
+    txn_map.erase(it);
+}
+
+//--------------------------------------------------------------------------
+// begin  — start a new transaction
+//--------------------------------------------------------------------------
 /**
  * @description: 事务的开始方法
  * @return {Transaction*} 开始事务的指针
  * @param {Transaction*} txn 事务指针，空指针代表需要创建新事务，否则开始已有事务
  * @param {LogManager*} log_manager 日志管理器指针
+ * @param {IsolationLevel} isolation_level 隔离级别
  */
-Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manager) {
-    // 1. 判断传入事务参数是否为空指针
-    // 2. 如果为空指针，创建新事务
-    // 3. 把开始事务加入到全局事务表中
-    // 4. 返回当前事务指针
-    // 如果需要支持MVCC请在上述过程中添加代码
-    if (txn == nullptr) {
-        txn = new Transaction(next_txn_id_++);
-    }
+Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manager,
+                                       IsolationLevel isolation_level) {
+    // 1. 创建新事务（忽略传入的 txn 参数，始终由 Manager 管理所有权）
+    // 2. 把开始事务加入到全局事务表中
+    // 3. 返回当前事务指针
+    std::unique_lock<std::shared_mutex> txn_lock(txn_map_mutex_);
+    auto owned = std::make_unique<Transaction>(next_txn_id_++, isolation_level);
+    txn = owned.get();
     txn->set_state(TransactionState::GROWING);
-    txn->set_start_ts(next_timestamp_++);
+    txn->set_isolation_level(isolation_level);
+    timestamp_t start_ts = last_commit_ts_.load(std::memory_order_acquire);
+    txn->set_start_ts(start_ts);
+    {
+        std::lock_guard<std::mutex> wm_lock(watermark_mutex_);
+        // 注册到水线追踪器
+        running_txns_.AddTxn(start_ts);
+    }
+    RegisterTransactionLocked(std::move(owned));
+    txn_lock.unlock();
 
     if (log_manager != nullptr) {
         BeginLogRecord log_record(txn->get_transaction_id());
@@ -91,10 +236,12 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
         txn->set_prev_lsn(lsn);
     }
 
-    std::unique_lock<std::mutex> lock(latch_);
-    txn_map[txn->get_transaction_id()] = txn;
     return txn;
 }
+
+//--------------------------------------------------------------------------
+// commit  — commit a transaction
+//--------------------------------------------------------------------------
 
 /**
  * @description: 事务的提交方法
@@ -111,6 +258,9 @@ void TransactionManager::commit(Transaction *txn, LogManager *log_manager) {
     if (txn == nullptr) {
         return;
     }
+    txn_id_t txn_id = txn->get_transaction_id();
+    timestamp_t commit_ts = INVALID_TS;
+
     if (log_manager != nullptr) {
         CommitLogRecord log_record(txn->get_transaction_id());
         log_record.prev_lsn_ = txn->get_prev_lsn();
@@ -118,14 +268,89 @@ void TransactionManager::commit(Transaction *txn, LogManager *log_manager) {
         txn->set_prev_lsn(lsn);
         log_manager->flush_log_to_disk();
     }
-    txn->set_state(TransactionState::SHRINKING);
-    release_locks(txn, lock_manager_);
-    delete_write_set(txn);
-    txn->set_state(TransactionState::COMMITTED);
 
-    std::unique_lock<std::mutex> lock(latch_);
-    txn_map.erase(txn->get_transaction_id());
+    bool has_ssi_state = txn->get_isolation_level() == IsolationLevel::SERIALIZABLE &&
+                         (!txn->GetRecordReadSet().empty() || !txn->GetPredicateReadSet().empty() ||
+                          !txn->GetWriteSetRecords().empty() || !txn->GetRwInEdges().empty() ||
+                          !txn->GetRwOutEdges().empty());
+    bool retain_txn = IsMvccActive(txn) && (txn->GetUndoLogNum() > 0 || has_ssi_state);
+    txn->set_state(TransactionState::SHRINKING);
+    std::vector<std::unique_ptr<Transaction>> released_txns;
+
+    // Phase 1: assign commit_ts (atomic, no global lock needed)
+    commit_ts = next_timestamp_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    txn->set_commit_ts(commit_ts);
+    txn->set_state(TransactionState::COMMITTED);
+    last_commit_ts_.store(commit_ts, std::memory_order_release);
+
+    // Phase 2: commit version links (uses per-page mutexes, no global lock)
+    if (IsMvccActive(txn) && sm_manager_ != nullptr) {
+        // for all write records set version link head to committed
+        for (auto *write_record : *txn->get_write_set()) {
+            const auto &tab_name = write_record->GetTableName();
+            auto fh_it = sm_manager_->fhs_.find(tab_name);
+            if (fh_it == sm_manager_->fhs_.end()) {
+                continue;
+            }
+            CommitVersionLink(fh_it->second->GetFd(), write_record->GetRid(),
+                              txn_id, commit_ts,
+                              write_record->GetWriteType() == WType::DELETE_TUPLE);
+        }
+    }
+
+    // Phase 3: update watermark
+    {
+        std::lock_guard<std::mutex> wm_lock(watermark_mutex_);
+        running_txns_.UpdateCommitTs(commit_ts);
+        running_txns_.RemoveTxn(txn->get_start_ts());
+    }
+
+    // Phase 4: update txn_map
+    {
+        std::unique_lock<std::shared_mutex> txn_lock(txn_map_mutex_);
+        if (retain_txn) {
+            SetTransactionRetainedLocked(txn_id, true);
+        } else {
+            RemoveTransactionLocked(txn_id, &released_txns);
+        }
+    }
+
+    release_locks(txn, lock_manager_);
+    if (!retain_txn) {
+        delete_write_set(txn);
+    }
+    GarbageCollection();
 }
+
+//--------------------------------------------------------------------------
+// MVCC index cleanup helpers
+//--------------------------------------------------------------------------
+
+auto index_key_equal(const IndexMeta &index, const RmRecord &lhs, const RmRecord &rhs) -> bool {
+    auto lhs_key = std::make_unique<char[]>(index.col_tot_len);
+    auto rhs_key = std::make_unique<char[]>(index.col_tot_len);
+    index.build_key(lhs_key.get(), lhs.data);
+    index.build_key(rhs_key.get(), rhs.data);
+    return memcmp(lhs_key.get(), rhs_key.get(), index.col_tot_len) == 0;
+}
+
+void delete_changed_mvcc_index_entries(SmManager *sm_manager, const std::string &tab_name, const TabMeta &tab,
+                                       const RmRecord &old_record, const RmRecord &current_record, const Rid &rid,
+                                       Transaction *txn) {
+    for (auto &index : tab.indexes) {
+        if (index_key_equal(index, old_record, current_record)) {
+            continue;
+        }
+        auto ih = sm_manager->get_ih(tab_name, index.cols);
+        auto key = std::make_unique<char[]>(index.col_tot_len);
+        index.build_key(key.get(), current_record.data);
+        ih->delete_entry(key.get(), rid, txn);
+    }
+}
+
+//--------------------------------------------------------------------------
+// abort  — roll back a transaction
+//--------------------------------------------------------------------------
 
 /**
  * @description: 事务的终止（回滚）方法
@@ -142,9 +367,15 @@ void TransactionManager::abort(Transaction *txn, LogManager *log_manager) {
     if (txn == nullptr) {
         return;
     }
+    txn_id_t txn_id = txn->get_transaction_id();
     txn->set_state(TransactionState::ABORTED);
+    bool use_mvcc = IsMvccActive(txn);
+    bool undo_failed = false;
     auto &write_set = *txn->get_write_set();
     for (auto it = write_set.rbegin(); it != write_set.rend(); ++it) {
+        if (undo_failed) {
+            break;
+        }
         WriteRecord *write_record = *it;
         try {
             const std::string &tab_name = write_record->GetTableName();
@@ -166,18 +397,30 @@ void TransactionManager::abort(Transaction *txn, LogManager *log_manager) {
                 InsertLogRecord clr(txn->get_transaction_id(), write_record->GetRecord(), write_record->GetRid(),
                                     tab_name);
                 append_txn_clr(txn, log_manager, clr, LogType::CLR_INSERT, write_record->GetOpPrevLsn());
-                fh->insert_record(write_record->GetRid(), write_record->GetRecord().data, txn->get_prev_lsn());
-                apply_index_op(sm_manager_, tab_name, tab, write_record->GetRecord(), write_record->GetRid(), txn,
-                               IndexEntryOp::INSERT);
+                if (fh->is_record(write_record->GetRid())) {
+                    fh->update_record(write_record->GetRid(), write_record->GetRecord().data, nullptr,
+                                      txn->get_prev_lsn());
+                } else {
+                    fh->insert_record(write_record->GetRid(), write_record->GetRecord().data, txn->get_prev_lsn());
+                }
+                if (!use_mvcc) {
+                    apply_index_op(sm_manager_, tab_name, tab, write_record->GetRecord(), write_record->GetRid(), txn,
+                                   IndexEntryOp::INSERT);
+                }
             } else if (write_record->GetWriteType() == WType::UPDATE_TUPLE) {
                 auto current_rec = fh->get_record(write_record->GetRid(), nullptr);
                 UpdateLogRecord clr(txn->get_transaction_id(), *current_rec, write_record->GetRecord(),
                                     write_record->GetRid(), tab_name);
                 append_txn_clr(txn, log_manager, clr, LogType::CLR_UPDATE, write_record->GetOpPrevLsn());
-                apply_index_op(sm_manager_, tab_name, tab, *current_rec, write_record->GetRid(), txn,
-                               IndexEntryOp::DELETE);
-                apply_index_op(sm_manager_, tab_name, tab, write_record->GetRecord(), write_record->GetRid(), txn,
-                               IndexEntryOp::INSERT);
+                if (use_mvcc) {
+                    delete_changed_mvcc_index_entries(sm_manager_, tab_name, tab, write_record->GetRecord(),
+                                                      *current_rec, write_record->GetRid(), txn);
+                } else {
+                    apply_index_op(sm_manager_, tab_name, tab, *current_rec, write_record->GetRid(), txn,
+                                   IndexEntryOp::DELETE);
+                    apply_index_op(sm_manager_, tab_name, tab, write_record->GetRecord(), write_record->GetRid(), txn,
+                                   IndexEntryOp::INSERT);
+                }
                 fh->update_record(write_record->GetRid(), write_record->GetRecord().data, nullptr,
                                   txn->get_prev_lsn());
             }
@@ -185,10 +428,14 @@ void TransactionManager::abort(Transaction *txn, LogManager *log_manager) {
             UndoError undo_error(txn->get_transaction_id(), write_record->GetTableName(), write_record->GetRid(),
                                  error.what());
             std::cerr << undo_error.what() << std::endl;
+            undo_failed = true;
+            break;
         } catch (...) {
             UndoError undo_error(txn->get_transaction_id(), write_record->GetTableName(), write_record->GetRid(),
                                  "unknown exception");
             std::cerr << undo_error.what() << std::endl;
+            undo_failed = true;
+            break;
         }
     }
 
@@ -201,10 +448,661 @@ void TransactionManager::abort(Transaction *txn, LogManager *log_manager) {
     }
 
     txn->set_state(TransactionState::SHRINKING);
+    CleanupTransaction(txn);
     release_locks(txn, lock_manager_);
     delete_write_set(txn);
     txn->set_state(TransactionState::ABORTED);
 
-    std::unique_lock<std::mutex> lock(latch_);
-    txn_map.erase(txn->get_transaction_id());
+    std::vector<std::unique_ptr<Transaction>> released_txns;
+    {
+        std::lock_guard<std::mutex> wm_lock(watermark_mutex_);
+        running_txns_.RemoveTxn(txn->get_start_ts());
+    }
+    {
+        std::unique_lock<std::shared_mutex> txn_lock(txn_map_mutex_);
+        RemoveTransactionLocked(txn_id, &released_txns);
+    }
+    GarbageCollection();
+}
+
+//--------------------------------------------------------------------------
+// Version Link Management — MVCC version chain accessors
+//--------------------------------------------------------------------------
+
+bool TransactionManager::UpdateVersionLink(int fd, Rid rid, std::optional<VersionUndoLink> prev_version,
+                                           std::function<bool(std::optional<VersionUndoLink>)> &&check) {
+    VersionPageKey key{fd, rid.page_no};
+    std::shared_ptr<PageVersionInfo> page_info;
+    {
+        std::unique_lock<std::shared_mutex> table_lock(version_info_mutex_);
+        auto &slot = version_info_[key];
+        if (slot == nullptr) {
+            slot = std::make_shared<PageVersionInfo>();
+        }
+        page_info = slot;
+    }
+
+    std::unique_lock<std::shared_mutex> page_lock(page_info->mutex_);
+    std::optional<VersionUndoLink> current = std::nullopt;
+    auto it = page_info->prev_version_.find(rid.slot_no);
+    if (it != page_info->prev_version_.end()) {
+        current = it->second;
+    }
+    if (check != nullptr && !check(current)) {
+        return false;
+    }
+    if (prev_version.has_value()) {
+        page_info->prev_version_[rid.slot_no] = *prev_version;
+    } else {
+        page_info->prev_version_.erase(rid.slot_no);
+    }
+    return true;
+}
+
+std::optional<VersionUndoLink> TransactionManager::GetVersionLink(int fd, Rid rid) {
+    VersionPageKey key{fd, rid.page_no};
+    std::shared_lock<std::shared_mutex> table_lock(version_info_mutex_);
+    auto page_it = version_info_.find(key);
+    if (page_it == version_info_.end()) {
+        return std::nullopt;
+    }
+    auto page_info = page_it->second;
+    table_lock.unlock();
+
+    std::shared_lock<std::shared_mutex> page_lock(page_info->mutex_);
+    auto slot_it = page_info->prev_version_.find(rid.slot_no);
+    if (slot_it == page_info->prev_version_.end()) {
+        return std::nullopt;
+    }
+    return slot_it->second;
+}
+
+//--------------------------------------------------------------------------
+// Undo Log Access
+//--------------------------------------------------------------------------
+
+std::optional<UndoLog> TransactionManager::GetUndoLogOptional(UndoLink link) {
+    if (!link.IsValid()) {
+        return std::nullopt;
+    }
+    std::shared_lock<std::shared_mutex> lock(txn_map_mutex_);
+    auto *txn = GetTransactionLocked(link.prev_txn_);
+    if (txn == nullptr) {
+        return std::nullopt;
+    }
+    return txn->GetUndoLog(link.prev_log_idx_);
+}
+
+UndoLog TransactionManager::GetUndoLog(UndoLink link) {
+    auto log = GetUndoLogOptional(link);
+    if (!log.has_value()) {
+        throw InternalError("Undo log not found");
+    }
+    return *log;
+}
+
+//--------------------------------------------------------------------------
+// MVCC Visibility & Conflict Detection
+//--------------------------------------------------------------------------
+
+//--------------------------------------------------------------------------
+// GetVisibleRecord  — resolve MVCC snapshot visibility
+//--------------------------------------------------------------------------
+auto TransactionManager::GetVisibleRecord(int fd, const Rid &rid, const RmRecord &base_record, Transaction *txn)
+    -> std::unique_ptr<RmRecord> {
+    if (!IsMvccActive(txn)) {
+        return std::make_unique<RmRecord>(base_record);
+    }
+
+    auto visible_from_log = [&](const UndoLog &log) -> bool {
+        if (is_uncommitted_ts(log.ts_)) {
+            return txn_id_from_write_ts(log.ts_) == txn->get_transaction_id();
+        }
+        return log.ts_ != INVALID_TS && log.ts_ <= txn->get_start_ts();
+    };
+
+    auto link = GetVersionLink(fd, rid);
+    if (!link.has_value()) {
+        return std::make_unique<RmRecord>(base_record);
+    }
+
+    if (link->in_progress_ && link->prev_.prev_txn_ == txn->get_transaction_id()) {
+        if (link->is_deleted_) {
+            return nullptr;
+        }
+        return std::make_unique<RmRecord>(base_record);
+    }
+
+    if (!link->in_progress_ && link->ts_ != INVALID_TS && link->ts_ <= txn->get_start_ts()) {
+        if (link->is_deleted_) {
+            return nullptr;
+        }
+        return std::make_unique<RmRecord>(base_record);
+    }
+
+    // Re-read when the version link is in_progress but owned by another
+    // transaction.  The owner may have been mid-commit when we first looked;
+    // re-reading under the page mutex picks up the committed state so we can
+    // resolve visibility through the version link directly instead of falling
+    // through to a costly (and possibly doomed) undo-chain walk.
+    if (link->in_progress_ && link->prev_.prev_txn_ != txn->get_transaction_id()) {
+        link = GetVersionLink(fd, rid);
+        if (!link.has_value()) {
+            return std::make_unique<RmRecord>(base_record);
+        }
+        if (link->in_progress_ && link->prev_.prev_txn_ == txn->get_transaction_id()) {
+            if (link->is_deleted_) return nullptr;
+            return std::make_unique<RmRecord>(base_record);
+        }
+        if (!link->in_progress_ && link->ts_ != INVALID_TS && link->ts_ <= txn->get_start_ts()) {
+            if (link->is_deleted_) return nullptr;
+            return std::make_unique<RmRecord>(base_record);
+        }
+        // Still can't resolve — fall through to chain walk below with the
+        // latest snapshot of the version link.
+    }
+
+    UndoLink undo_link = link->prev_;
+    while (undo_link.IsValid()) {
+        auto undo_log = GetUndoLogOptional(undo_link);
+        if (!undo_log.has_value()) {
+            break;
+        }
+        if (visible_from_log(*undo_log)) {
+            if (undo_log->is_deleted_) {
+                return nullptr;
+            }
+            return std::make_unique<RmRecord>(*undo_log->old_record_);
+        }
+        undo_link = undo_log->prev_version_;
+    }
+
+    return nullptr;
+}
+
+//--------------------------------------------------------------------------
+// CheckWriteConflict  — detect write-write conflicts
+//--------------------------------------------------------------------------
+void TransactionManager::CheckWriteConflict(int fd, const Rid &rid, Transaction *txn) {
+    if (!IsMvccActive(txn)) {
+        return;
+    }
+    auto current = GetVersionLink(fd, rid);
+    if (!current.has_value()) {
+        return;
+    }
+    if (current->prev_.prev_txn_ == txn->get_transaction_id()) {
+        return;
+    }
+    // 其他事务在修改这行且尚未提交
+    if (current->in_progress_) {
+        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WRITE_CONFLICT);
+    }
+    // 其他事务还是后提交，基于过期快照
+    if (current->ts_ != INVALID_TS && current->ts_ > txn->get_start_ts()) {
+        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::WRITE_CONFLICT);
+    }
+}
+
+//--------------------------------------------------------------------------
+// Serializable Snapshot Isolation (SSI) — Conflict Detection
+//--------------------------------------------------------------------------
+
+//--------------------------------------------------------------------------
+// TrackSsiPredicateRead  — register and check predicate-based reads
+//--------------------------------------------------------------------------
+void TransactionManager::TrackSsiPredicateRead(const std::string &table_name,
+                                               const std::vector<Condition> &conditions, Transaction *txn) {
+    if (!IsSerializableActive(txn)) {
+        return;
+    }
+    txn->AddPredicateRead(table_name, conditions);
+
+    TabMeta &tab = sm_manager_->db_.get_table(table_name);
+    {
+        std::shared_lock<std::shared_mutex> lock(txn_map_mutex_);
+        ForEachTransactionLocked([&](Transaction *writer) {
+            if (!IsSerializableActive(writer) || writer->get_transaction_id() == txn->get_transaction_id()) {
+                return;
+            }
+            if (ssi_writer_visible_to(writer, txn)) {
+                return;
+            }
+            auto write_records = writer->GetWriteSetRecords();
+            for (const auto &write : write_records) {
+                if (write.table_name_ == table_name && ssi_write_matches_conditions(tab, write, conditions)) {
+                    AddRwDependency(txn, writer, txn, "serializable predicate read sees older snapshot");
+                    break;
+                }
+            }
+        });
+    }
+}
+
+//--------------------------------------------------------------------------
+// TrackSsiRecordRead  — register and check record-level reads
+//--------------------------------------------------------------------------
+void TransactionManager::TrackSsiRecordRead(const std::string &table_name, const std::vector<Condition> &conditions,
+                                            const Rid &rid, const RmRecord &record, Transaction *txn) {
+    if (!IsSerializableActive(txn)) {
+        return;
+    }
+    
+    txn->AddRecordRead(table_name, rid);
+    TabMeta &tab = sm_manager_->db_.get_table(table_name);
+
+    {
+        std::shared_lock<std::shared_mutex> lock(txn_map_mutex_);
+        // 遍历其他事务检查有无写者改动
+        ForEachTransactionLocked([&](Transaction *writer) {
+            if (!IsSerializableActive(writer) || writer->get_transaction_id() == txn->get_transaction_id()) {
+                return;
+            }
+            if (ssi_writer_visible_to(writer, txn)) {
+                return;
+            }
+            // 检查写集
+            auto write_records = writer->GetWriteSetRecords();
+            for (const auto &write : write_records) {
+                if (write.table_name_ != table_name) {
+                    continue;
+                }
+                if (write.rid_ == rid || ssi_write_matches_conditions(tab, write, conditions)) {
+                    AddRwDependency(txn, writer, txn, "serializable read sees older snapshot");
+                    break;
+                }
+            }
+        });
+    }
+}
+
+//--------------------------------------------------------------------------
+// TrackSsiWrite  — register writes and detect rw-conflicts
+//--------------------------------------------------------------------------
+void TransactionManager::TrackSsiWrite(const std::string &table_name, const Rid &rid, const RmRecord *old_record,
+                                       const RmRecord *new_record, Transaction *txn) {
+    if (!IsSerializableActive(txn)) {
+        return;
+    }
+
+    const RmRecord *stored_old = old_record != nullptr ? old_record : new_record;
+    const RmRecord *stored_new = new_record != nullptr ? new_record : old_record;
+    if (stored_old == nullptr || stored_new == nullptr) {
+        return;
+    }
+    txn->AddSsiWriteSetRecord(table_name, rid, *stored_old, *stored_new, old_record != nullptr, new_record != nullptr);
+
+    TabMeta &tab = sm_manager_->db_.get_table(table_name);
+    {
+        std::shared_lock<std::shared_mutex> lock(txn_map_mutex_);
+        ForEachTransactionLocked([&](Transaction *reader) {
+            if (!IsSerializableActive(reader) || reader->get_transaction_id() == txn->get_transaction_id()) {
+                return;
+            }
+            if (ssi_writer_visible_to(txn, reader)) {
+                return;
+            }
+
+            auto record_reads = reader->GetRecordReadSet();
+            bool matches = std::any_of(record_reads.begin(), record_reads.end(), [&](const SsiRecordRead &read) {
+                return read.table_name_ == table_name && read.rid_ == rid;
+            });
+
+            if (!matches) {
+                auto predicate_reads = reader->GetPredicateReadSet();
+                for (const auto &predicate : predicate_reads) {
+                    if (predicate.table_name_ != table_name) {
+                        continue;
+                    }
+                    bool old_matches = old_record != nullptr &&
+                                       evaluate_conditions(predicate.conditions_, *old_record, tab.cols);
+                    bool new_matches = new_record != nullptr &&
+                                       evaluate_conditions(predicate.conditions_, *new_record, tab.cols);
+                    if (old_matches || new_matches) {
+                        matches = true;
+                        break;
+                    }
+                }
+            }
+
+            if (matches) {
+                AddRwDependency(reader, txn, txn, "serializable write changes prior read");
+            }
+        });
+    }
+}
+
+//--------------------------------------------------------------------------
+// AddRwDependency  — add rw-edge and check for dangerous structures
+//--------------------------------------------------------------------------
+bool TransactionManager::AddRwDependency(Transaction *from, Transaction *to, Transaction *current,
+                                         const std::string &reason) {
+    if (!IsSerializableActive(from) || !IsSerializableActive(to) ||
+        from->get_transaction_id() == to->get_transaction_id()) {
+        return false;
+    }
+
+    from->AddRwDependencyOut(to->get_transaction_id(), reason);
+    to->AddRwDependencyIn(from->get_transaction_id(), reason);
+
+    // Always check for dangerous structures, even when the same edge was
+    // previously added — transaction state may have changed since the first
+    // check, creating a new pivot structure that needs detection.
+    if (HasDangerousStructure(from, to)) {
+        throw TransactionAbortException(current->get_transaction_id(), AbortReason::SERIALIZATION_CONFLICT);
+    }
+    return true;
+}
+
+//--------------------------------------------------------------------------
+// HasDangerousStructure  — detect dangerous pivot structures: if a txn has 
+//   a read-write dependency path that crosses a pivot transaction, it may
+//   be unsafe to commit.
+//--------------------------------------------------------------------------
+bool TransactionManager::HasDangerousStructure(Transaction *from, Transaction *to) {
+    if (from == nullptr || to == nullptr) {
+        return false;
+    }
+
+    auto completes_structure = [&](Transaction *tin, Transaction *tpivot, Transaction *tout) {
+        if (!IsSerializableActive(tin) || !IsSerializableActive(tpivot) || !IsSerializableActive(tout)) {
+            return false;
+        }
+        if (!transactions_overlap(tin, tpivot) || !transactions_overlap(tpivot, tout)) {
+            return false;
+        }
+        if (tin->get_transaction_id() == tout->get_transaction_id()) {
+            return true;
+        }
+        if (tout->get_state() != TransactionState::COMMITTED) {
+            return true;
+        }
+        if (tin->get_state() == TransactionState::COMMITTED) {
+            return tout->get_commit_ts() < tin->get_commit_ts();
+        }
+        return tout->get_commit_ts() < tin->get_start_ts();
+    };
+
+    auto find_txn_locked = [&](txn_id_t txn_id) -> Transaction * {
+        auto it = txn_map.find(txn_id);
+        if (it == txn_map.end()) return nullptr;
+        return it->second.Get();
+    };
+
+    // Take both edge snapshots before iterating, so both reflect the same
+    // logical moment.  Otherwise edges added/removed between the two copies
+    // could produce an inconsistent view.
+    auto out_edges = to->GetRwOutEdges();
+    auto in_edges = from->GetRwInEdges();
+
+    for (const auto &[candidate_id, _] : out_edges) {
+        auto *candidate = find_txn_locked(candidate_id);
+        if (completes_structure(from, to, candidate)) {
+            return true;
+        }
+    }
+
+    for (const auto &[candidate_id, _] : in_edges) {
+        auto *candidate = find_txn_locked(candidate_id);
+        if (completes_structure(candidate, from, to)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+//--------------------------------------------------------------------------
+// MVCC Write Preparation — build undo logs and link version chains
+//--------------------------------------------------------------------------
+
+//--------------------------------------------------------------------------
+// PrepareInsert  — set up version link for INSERT
+//--------------------------------------------------------------------------
+void TransactionManager::PrepareInsert(int fd, const Rid &rid, const RmRecord &new_record, Transaction *txn) {
+    if (!IsMvccActive(txn)) {
+        return;
+    }
+    UndoLog log;
+    log.is_deleted_ = true;
+    log.old_record_ = std::make_unique<RmRecord>(new_record);
+    log.ts_ = make_txn_write_ts(txn);
+    auto prev = GetVersionLink(fd, rid);
+    if (prev.has_value()) {
+        log.prev_version_ = prev->prev_;
+    }
+    UndoLink undo_link = txn->AppendUndoLog(std::move(log));
+    UpdateVersionLink(fd, rid, VersionUndoLink{undo_link, true, make_txn_write_ts(txn), false});
+}
+
+//--------------------------------------------------------------------------
+// BuildUndoLogForWrite  — construct undo log for UPDATE/DELETE
+//--------------------------------------------------------------------------
+UndoLog TransactionManager::BuildUndoLogForWrite(int fd, const Rid &rid, const RmRecord &base_record,
+                                                  Transaction *txn) {
+    UndoLog log;
+    log.is_deleted_ = false;  // default: the pre-image was a live tuple
+    log.old_record_ = std::make_unique<RmRecord>(base_record);
+    auto current = GetVersionLink(fd, rid);
+    if (current.has_value()) {
+        if (current->prev_.prev_txn_ == txn->get_transaction_id()) {
+            // Same transaction already owns this slot: inherit the earlier undo log so
+            // the chain points to the state before the first write of this transaction.
+            auto previous_log = GetUndoLog(current->prev_);
+            log.is_deleted_ = previous_log.is_deleted_;
+            log.old_record_ = std::make_unique<RmRecord>(*previous_log.old_record_);
+            log.ts_ = previous_log.ts_;
+            log.prev_version_ = previous_log.prev_version_;
+        } else {
+            log.ts_ = current->ts_;
+            log.prev_version_ = current->prev_;
+        }
+    } else {
+        log.ts_ = 0;
+    }
+    return log;
+}
+
+//--------------------------------------------------------------------------
+// PrepareUpdate / PrepareDelete  — set up version links
+//--------------------------------------------------------------------------
+void TransactionManager::PrepareUpdate(int fd, const Rid &rid, const RmRecord &old_record, Transaction *txn) {
+    if (!IsMvccActive(txn)) {
+        return;
+    }
+    // build undo log
+    UndoLog log = BuildUndoLogForWrite(fd, rid, old_record, txn);
+    UndoLink undo_link = txn->AppendUndoLog(std::move(log));
+    UpdateVersionLink(fd, rid, VersionUndoLink{undo_link, true, make_txn_write_ts(txn), false});
+}
+
+void TransactionManager::PrepareDelete(int fd, const Rid &rid, const RmRecord &old_record, Transaction *txn) {
+    if (!IsMvccActive(txn)) {
+        return;
+    }
+    UndoLog log = BuildUndoLogForWrite(fd, rid, old_record, txn);
+    UndoLink undo_link = txn->AppendUndoLog(std::move(log));
+    UpdateVersionLink(fd, rid, VersionUndoLink{undo_link, true, make_txn_write_ts(txn), true});
+}
+
+//--------------------------------------------------------------------------
+// Version Link Finalization
+//--------------------------------------------------------------------------
+
+//--------------------------------------------------------------------------
+// CommitVersionLink  — finalize in-progress version link on commit
+//--------------------------------------------------------------------------
+void TransactionManager::CommitVersionLink(int fd, const Rid &rid, txn_id_t txn_id,
+                                           timestamp_t commit_ts, bool is_delete) {
+    VersionPageKey key{fd, rid.page_no};
+    std::shared_ptr<PageVersionInfo> page_info;
+    {
+        std::unique_lock<std::shared_mutex> table_lock(version_info_mutex_);
+        auto it = version_info_.find(key);
+        if (it == version_info_.end()) {
+            return;
+        }
+        page_info = it->second;
+    }
+    {
+        std::unique_lock<std::shared_mutex> page_lock(page_info->mutex_);
+        auto slot_it = page_info->prev_version_.find(rid.slot_no);
+        if (slot_it == page_info->prev_version_.end()) {
+            return;
+        }
+        auto &link = slot_it->second;
+        if (link.prev_.prev_txn_ != txn_id) {
+            return;
+        }
+        if (!link.in_progress_) {
+            return;
+        }
+        // commited
+        link.in_progress_ = false;
+        link.ts_ = commit_ts;
+        link.is_deleted_ = is_delete;
+    }
+}
+
+//--------------------------------------------------------------------------
+// ClearVersionLink  — remove version link entry
+//--------------------------------------------------------------------------
+void TransactionManager::ClearVersionLink(int fd, const Rid &rid) {
+    UpdateVersionLink(fd, rid, std::nullopt);
+}
+
+//--------------------------------------------------------------------------
+// Cleanup & Garbage Collection
+//--------------------------------------------------------------------------
+
+//--------------------------------------------------------------------------
+// RemoveSsiEdgesForTxnLocked  — scrub all rw-edges for a txn
+//--------------------------------------------------------------------------
+
+void TransactionManager::RemoveSsiEdgesForTxnLocked(txn_id_t txn_id) {
+    ForEachTransactionLocked([&](Transaction *other) {
+        if (other == nullptr || other->get_transaction_id() == txn_id) {
+            return;
+        }
+        other->RemoveRwDependencyIn(txn_id);
+        other->RemoveRwDependencyOut(txn_id);
+    });
+}
+
+//--------------------------------------------------------------------------
+// CleanupTransaction  — revert version links and clear SSI state
+//--------------------------------------------------------------------------
+
+void TransactionManager::CleanupTransaction(Transaction *txn) {
+    if (txn == nullptr) {
+        return;
+    }
+    for (auto *write_record : *txn->get_write_set()) {
+        const auto &tab_name = write_record->GetTableName();
+        auto fh_it = sm_manager_->fhs_.find(tab_name);
+        if (fh_it == sm_manager_->fhs_.end()) {
+            continue;
+        }
+        auto link = GetVersionLink(fh_it->second->GetFd(), write_record->GetRid());
+        if (link.has_value() && link->prev_.prev_txn_ == txn->get_transaction_id()) {
+            auto undo_log = txn->GetUndoLog(link->prev_.prev_log_idx_);
+            std::optional<VersionUndoLink> restored = std::nullopt;
+            if (undo_log.ts_ != make_txn_write_ts(txn) && undo_log.ts_ != 0) {
+                restored = VersionUndoLink{undo_log.prev_version_, false, undo_log.ts_, undo_log.is_deleted_};
+            }
+            UpdateVersionLink(fh_it->second->GetFd(), write_record->GetRid(), restored);
+        }
+    }
+    {
+        std::shared_lock<std::shared_mutex> lock(txn_map_mutex_);
+        RemoveSsiEdgesForTxnLocked(txn->get_transaction_id());
+    }
+    txn->ClearSsiState();
+}
+
+//--------------------------------------------------------------------------
+// GetWatermark  — return oldest active snapshot timestamp
+//--------------------------------------------------------------------------
+
+timestamp_t TransactionManager::GetWatermark() {
+    std::lock_guard<std::mutex> lock(watermark_mutex_);
+    return running_txns_.GetWatermark();
+}
+
+//--------------------------------------------------------------------------
+// GarbageCollection  — reclaim version info and physical space
+//--------------------------------------------------------------------------
+void TransactionManager::GarbageCollection() {
+    std::vector<GcDeleteRecord> deleted_records;
+    std::vector<std::unique_ptr<Transaction>> released_txns;
+
+    // Phase 1+2: check watermark AND clean up under watermark_mutex_.
+    // Holding watermark_mutex_ across version link deletion prevents a new
+    // transaction from starting between the "no active readers" check and
+    // the GC reclamation — otherwise a concurrent BEGIN could create a
+    // snapshot that needs versions we would have already freed.
+    {
+        std::lock_guard<std::mutex> wm_lock(watermark_mutex_);
+        if (!running_txns_.current_reads_.empty()) {
+            return;
+        }
+
+        std::unique_lock<std::shared_mutex> table_lock(version_info_mutex_);
+        for (auto page_it = version_info_.begin(); page_it != version_info_.end();) {
+            auto page_info = page_it->second;
+            {
+                std::unique_lock<std::shared_mutex> page_lock(page_info->mutex_);
+                for (auto slot_it = page_info->prev_version_.begin(); slot_it != page_info->prev_version_.end();) {
+                    const auto &version = slot_it->second;
+                    if (version.in_progress_) {
+                        ++slot_it;
+                        continue;
+                    }
+                    Rid rid{page_it->first.page_no, static_cast<int>(slot_it->first)};
+                    if (version.is_deleted_) {
+                        deleted_records.push_back(GcDeleteRecord{page_it->first.fd, rid});
+                    }
+                    slot_it = page_info->prev_version_.erase(slot_it);
+                }
+            }
+            if (page_info->prev_version_.empty()) {
+                page_it = version_info_.erase(page_it);
+            } else {
+                ++page_it;
+            }
+        }
+    }
+
+    // Phase 3: release retained transactions (needs exclusive access to txn_map)
+    {
+        std::unique_lock<std::shared_mutex> txn_lock(txn_map_mutex_);
+        std::vector<txn_id_t> retained_ids;
+        for (auto &[txn_id, entry] : txn_map) {
+            if (entry.retained) {
+                retained_ids.push_back(txn_id);
+            }
+        }
+        for (txn_id_t txn_id : retained_ids) {
+            RemoveSsiEdgesForTxnLocked(txn_id);
+            auto it = txn_map.find(txn_id);
+            if (it != txn_map.end()) {
+                auto *t = it->second.Get();
+                if (t != nullptr) {
+                    delete_write_set(t);
+                }
+            }
+            RemoveTransactionLocked(txn_id, &released_txns);
+        }
+    }
+
+    for (const auto &entry : deleted_records) {
+        auto *fh = find_file_handle_by_fd(sm_manager_, entry.fd);
+        if (fh == nullptr) {
+            continue;
+        }
+        try {
+            fh->delete_record(entry.rid, nullptr);
+        } catch (const RecordNotFoundError &) {
+        }
+    }
 }

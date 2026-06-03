@@ -35,16 +35,35 @@ class SeqScanExecutor : public AbstractExecutor {
         rid_ = Rid{-1, -1};
     }
 
+    auto fetch_visible_record(const Rid &rid) -> std::unique_ptr<RmRecord> {
+        if (!is_mvcc_active(context_) && context_ != nullptr && context_->lock_mgr_ != nullptr) {
+            context_->lock_mgr_->lock_shared_on_record(context_->txn_, rid, fh_->GetFd());
+        }
+        try {
+            return fh_->get_record(rid, context_);
+        } catch (const RecordNotFoundError &) {
+            return nullptr;
+        }
+    }
+
     // add filter conds
     void seek_to_next_valid() {
-        if (!seek_to_next_valid_tuple(scan_.get(), rid_, conds_, cols_, [&](const Rid &rid) {
-                if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
-                    context_->lock_mgr_->lock_shared_on_record(context_->txn_, rid, fh_->GetFd());
-                }
-                return fh_->get_record(rid, context_);
-            })) {
+        if (scan_ == nullptr || scan_->is_end()) {
             set_end();
+            return;
         }
+
+        while (!scan_->is_end()) {
+            rid_ = scan_->rid();
+            auto record = fetch_visible_record(rid_);
+            if (record != nullptr && evaluate_conditions(conds_, *record, cols_)) {
+                // 登记点读
+                track_ssi_record_read(context_, tab_name_, conds_, rid_, *record);
+                return;
+            }
+            scan_->next();
+        }
+        set_end();
     }
 
    public:
@@ -71,6 +90,8 @@ class SeqScanExecutor : public AbstractExecutor {
     }
 
     void restartTupleImpl() override {
+        // 登记已读范围
+        track_ssi_predicate_read(context_, tab_name_, conds_);
         if (empty_result_) {
             scan_.reset();
             set_end();
@@ -94,7 +115,7 @@ class SeqScanExecutor : public AbstractExecutor {
         if (is_end()) {
             return nullptr;
         }
-        return fh_->get_record(rid_, context_);
+        return fetch_visible_record(rid_);
     }
 
     Rid &rid() override { return rid_; }

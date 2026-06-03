@@ -47,6 +47,7 @@ class IndexScanExecutor : public AbstractExecutor {
     TabMeta tab_;                               // 表的元数据
     std::vector<Condition> index_lookup_conds_; // 索引查找条件
     std::vector<Condition> residual_conds_;     // 索引扫描后的剩余过滤条件
+    std::vector<Condition> all_conds_;
     RmFileHandle *fh_;                          // 表的数据文件句柄
     std::vector<ColMeta> cols_;                 // 需要读取的字段
     size_t len_;                                // 选取出来的一条记录的长度
@@ -109,6 +110,34 @@ class IndexScanExecutor : public AbstractExecutor {
         return record;
     }
 
+    auto project_visible_record(const RmRecord &heap_record) const -> std::unique_ptr<RmRecord> {
+        if (!use_covering_index_) {
+            return std::make_unique<RmRecord>(heap_record);
+        }
+        auto record = std::make_unique<RmRecord>(len_);
+        for (const auto &col : cols_) {
+            const auto &heap_col = find_col_meta(tab_.cols, TabCol{col.tab_name, col.name});
+            memcpy(record->data + col.offset, heap_record.data + heap_col.offset, col.len);
+        }
+        return record;
+    }
+
+    auto fetch_visible_heap_record(const Rid &rid) -> std::unique_ptr<RmRecord> {
+        if (!is_mvcc_active(context_) && context_ != nullptr && context_->lock_mgr_ != nullptr) {
+            context_->lock_mgr_->lock_shared_on_record(context_->txn_, rid, fh_->GetFd());
+        }
+        try {
+            // TODO： add index mvcc visibility and remove this part
+            return fh_->get_record(rid, context_);
+        } catch (const RecordNotFoundError &) {
+            return nullptr;
+        }
+    }
+
+    void track_ssi_record_read(const Rid &rid, const RmRecord &record) {
+        ::track_ssi_record_read(context_, tab_name_, all_conds_, rid, record);
+    }
+
     auto seek_to_next_covered_tuple() -> bool {
         if (scan_ == nullptr || scan_->is_end()) {
             rid_ = Rid{-1, -1};
@@ -117,14 +146,9 @@ class IndexScanExecutor : public AbstractExecutor {
 
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
-            if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
-                context_->lock_mgr_->lock_shared_on_record(context_->txn_, rid_, fh_->GetFd());
-            }
-            if (residual_conds_.empty()) {
-                return true;
-            }
-            auto record = make_record_from_index_key();
-            if (evaluate_conditions(residual_conds_, *record, cols_)) {
+            auto heap_record = fetch_visible_heap_record(rid_);
+            if (heap_record != nullptr && evaluate_conditions(all_conds_, *heap_record, tab_.cols)) {
+                track_ssi_record_read(rid_, *heap_record);
                 return true;
             }
             scan_->next();
@@ -141,14 +165,21 @@ class IndexScanExecutor : public AbstractExecutor {
             }
             return;
         }
-        if (!seek_to_next_valid_tuple(scan_.get(), rid_, residual_conds_, cols_, [&](const Rid &rid) {
-                if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
-                    context_->lock_mgr_->lock_shared_on_record(context_->txn_, rid, fh_->GetFd());
-                }
-                return fh_->get_record(rid, context_);
-            })) {
+        if (scan_ == nullptr || scan_->is_end()) {
             set_end();
+            return;
         }
+
+        while (!scan_->is_end()) {
+            rid_ = scan_->rid();
+            auto heap_record = fetch_visible_heap_record(rid_);
+            if (heap_record != nullptr && evaluate_conditions(all_conds_, *heap_record, tab_.cols)) {
+                track_ssi_record_read(rid_, *heap_record);
+                return;
+            }
+            scan_->next();
+        }
+        set_end();
     }
 
     static void fill_extreme_value(const ColMeta &col, char *dest, bool use_max) {
@@ -368,6 +399,8 @@ class IndexScanExecutor : public AbstractExecutor {
 
         normalize_conds(index_lookup_conds_, tab_name_);
         normalize_conds(residual_conds_, tab_name_);
+        all_conds_ = index_lookup_conds_;
+        all_conds_.insert(all_conds_.end(), residual_conds_.begin(), residual_conds_.end());
         prepare_lookup_values();
         if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
             context_->lock_mgr_->lock_IS_on_table(context_->txn_, fh_->GetFd());
@@ -380,6 +413,8 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void restartTupleImpl() override {
+        track_ssi_predicate_read(context_, tab_name_, all_conds_);
+
         auto ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_);
         auto *ih = sm_manager_->ihs_.at(ix_name).get();
 
@@ -425,9 +460,13 @@ class IndexScanExecutor : public AbstractExecutor {
             return nullptr;
         }
         if (use_covering_index_) {
-            return make_record_from_index_key();
+            auto heap_record = fetch_visible_heap_record(rid_);
+            if (heap_record == nullptr) {
+                return nullptr;
+            }
+            return project_visible_record(*heap_record);
         }
-        return fh_->get_record(rid_, context_);
+        return fetch_visible_heap_record(rid_);
     }
 
     Rid &rid() override { return rid_; }

@@ -27,6 +27,10 @@ See the Mulan PSL v2 for more details. */
 
 class UpdateExecutor : public AbstractExecutor {
    private:
+    static auto same_rid(const Rid &lhs, const Rid &rhs) -> bool {
+        return lhs.page_no == rhs.page_no && lhs.slot_no == rhs.slot_no;
+    }
+
     TabMeta tab_;
     RmFileHandle *fh_;
     std::unique_ptr<AbstractExecutor> scan_executor_;
@@ -90,8 +94,32 @@ class UpdateExecutor : public AbstractExecutor {
         return key;
     }
 
+    // 过滤掉已经被物理删除的无效索引： mvcc中会出现索引残留指向一物理删除记录的条目
+    // TODO: 应该下沉到索引层删去此处
+    void cleanup_invisible_unique_hits(IxIndexHandle *ih, const char *key, std::vector<Rid> &result,
+                                       const Rid *self_rid, const char *self_old_key, int key_len) {
+        auto it = result.begin();
+        while (it != result.end()) {
+            bool same_row_same_key = self_rid != nullptr && self_old_key != nullptr &&
+                                     it->page_no == self_rid->page_no && it->slot_no == self_rid->slot_no &&
+                                     memcmp(self_old_key, key, key_len) == 0;
+            if (same_row_same_key) {
+                ++it;
+                continue;
+            }
+            try {
+                fh_->get_record(*it, context_); 
+                ++it;
+            } catch (const RecordNotFoundError &) {
+                ih->delete_entry(key, *it, context_->txn_);
+                it = result.erase(it);
+            }
+        }
+    }
+
     /**
      * @brief Validate a unique index before any old key is removed for the row.
+     * TODO: 应该下沉到索引层删去此处
      */
     void precheck_unique_for_row(const PreparedIndexState &state, size_t index_pos, const Rid &rid,
                                  const RmRecord &old_rec, const RmRecord &new_rec) {
@@ -107,9 +135,10 @@ class UpdateExecutor : public AbstractExecutor {
         }
 
         auto old_key = build_index_key(index, old_rec);
+        cleanup_invisible_unique_hits(state.index_handles[index_pos], new_key.get(), result, &rid, old_key.get(),
+                                      index.col_tot_len);
         for (auto &hit : result) {
-            if (hit.page_no == rid.page_no && hit.slot_no == rid.slot_no &&
-                memcmp(old_key.get(), new_key.get(), index.col_tot_len) == 0) {
+            if (same_rid(hit, rid)) {
                 continue;
             }
             throw UniqueViolationError(tab_name_, index.col_names());
@@ -130,6 +159,9 @@ class UpdateExecutor : public AbstractExecutor {
         if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
             context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd());
         }
+        bool use_mvcc = is_mvcc_active(context_);
+        check_write_conflict(context_, fh_->GetFd(), rid);
+        track_ssi_write(context_, tab_name_, rid, &old_rec, &new_rec);
         lsn_t op_lsn = INVALID_LSN;
         if (context_ != nullptr && context_->txn_ != nullptr && context_->log_mgr_ != nullptr) {
             lsn_t prev_lsn = context_->txn_->get_prev_lsn();
@@ -139,18 +171,23 @@ class UpdateExecutor : public AbstractExecutor {
             context_->txn_->set_prev_lsn(op_lsn);
             context_->txn_->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab_name_, rid, old_rec, prev_lsn));
         }
-        for (size_t i = 0; i < tab_.indexes.size(); ++i) {
-            auto old_key = build_index_key(tab_.indexes[i], old_rec);
-            state.index_handles[i]->delete_entry(old_key.get(), rid, context_->txn_);
+        if (context_ != nullptr && context_->txn_mgr_ != nullptr && context_->txn_ != nullptr) {
+            context_->txn_mgr_->PrepareUpdate(fh_->GetFd(), rid, old_rec, context_->txn_);
         }
-
         fh_->update_record(rid, new_rec.data, context_);
         if (op_lsn != INVALID_LSN) {
             fh_->set_page_lsn(rid, op_lsn);
         }
 
         for (size_t i = 0; i < tab_.indexes.size(); ++i) {
+            auto old_key = build_index_key(tab_.indexes[i], old_rec);
             auto new_key = build_index_key(tab_.indexes[i], new_rec);
+            if (use_mvcc && memcmp(old_key.get(), new_key.get(), tab_.indexes[i].col_tot_len) == 0) {
+                continue;
+            }
+            if (!use_mvcc) {
+                state.index_handles[i]->delete_entry(old_key.get(), rid, context_->txn_);
+            }
             state.index_handles[i]->insert_entry(new_key.get(), rid, context_->txn_);
         }
     }
@@ -174,6 +211,7 @@ class UpdateExecutor : public AbstractExecutor {
 
     /**
      * @brief Preserve buffered unique-check semantics for index-scan children.
+     * TODO: 应该下沉到索引层删去此处
      */
     void precheck_unique_for_batch(const PreparedIndexState &state, const std::vector<Rid> &rids,
                                    const std::vector<std::unique_ptr<RmRecord>> &old_records,
@@ -182,7 +220,7 @@ class UpdateExecutor : public AbstractExecutor {
             return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(rid.page_no)) << 32) |
                    static_cast<std::uint32_t>(rid.slot_no);
         };
-        
+
         std::unordered_map<std::uint64_t, size_t> row_by_rid;
         row_by_rid.reserve(rids.size());
         for (size_t row = 0; row < rids.size(); ++row) {
@@ -221,10 +259,11 @@ class UpdateExecutor : public AbstractExecutor {
                     continue;
                 }
 
+                cleanup_invisible_unique_hits(state.index_handles[i], new_key_bytes[row].data(), result, &rids[row],
+                                              old_key_bytes[row].data(), index.col_tot_len);
+
                 for (auto &hit : result) {
-                    // step 3.1: check if the hit is the same as the current row, allowing same RID if it's the same row
-                    if (hit.page_no == rids[row].page_no && hit.slot_no == rids[row].slot_no &&
-                        old_key_bytes[row] == new_key_bytes[row]) {
+                    if (same_rid(hit, rids[row])) {
                         continue;
                     }
                     // step 3.2: check if the hit is a duplicate of a different row

@@ -61,7 +61,7 @@ void SetTransaction(txn_id_t *txn_id, Context *context) {
     context->txn_ = (*txn_id == INVALID_TXN_ID) ? nullptr : txn_manager->get_transaction(*txn_id);
     if(context->txn_ == nullptr || context->txn_->get_state() == TransactionState::COMMITTED ||
         context->txn_->get_state() == TransactionState::ABORTED) {
-        context->txn_ = txn_manager->begin(nullptr, context->log_mgr_);
+        context->txn_ = txn_manager->begin(nullptr, context->log_mgr_, context->isolation_level_);
         *txn_id = context->txn_->get_transaction_id();
         context->txn_->set_txn_mode(false);
     }
@@ -80,6 +80,9 @@ void *client_handler(void *sock_fd) {
     int offset = 0;
     // 记录客户端当前正在执行的事务ID
     txn_id_t txn_id = INVALID_TXN_ID;
+
+    // Session isolation level used by newly started transactions.
+    IsolationLevel session_isolation_level_ = IsolationLevel::SERIALIZABLE;
 
     // 初始化可重入解析器扫描器
     yyscan_t yyscanner;
@@ -106,7 +109,7 @@ void *client_handler(void *sock_fd) {
             std::cout << "Client read error!" << std::endl;
             break;
         }
-        
+
         printf("i_recvBytes: %d \n ", i_recvBytes);
 
         if (strcmp(data_recv, "exit") == 0) {
@@ -125,6 +128,8 @@ void *client_handler(void *sock_fd) {
 
         // 开启事务，初始化系统所需的上下文信息（包括事务对象指针、锁管理器指针、日志管理器指针、存放结果的buffer、记录结果长度的变量）
         auto context = std::make_unique<Context>(lock_manager.get(), log_manager.get(), nullptr, data_send.get(), &offset);
+        context->isolation_level_ = session_isolation_level_;
+        context->txn_mgr_ = txn_manager.get();
         SetTransaction(&txn_id, context.get());
 
         // 用于判断是否已经调用了yy_delete_buffer来删除buf
@@ -145,6 +150,8 @@ void *client_handler(void *sock_fd) {
                     std::shared_ptr<PortalStmt> portalStmt = portal->start(plan, context.get());
                     portal->run(portalStmt, ql_manager.get(), &txn_id, context.get());
                     portal->drop();
+                    // Sync back session isolation level in case SET TRANSACTION changed it
+                    session_isolation_level_ = context->isolation_level_;
                 } catch (TransactionAbortException &e) {
                     has_error = true;
                     // 事务需要回滚，需要把abort信息返回给客户端并写入output.txt文件中
@@ -155,6 +162,7 @@ void *client_handler(void *sock_fd) {
 
                     // 回滚事务
                     txn_manager->abort(context->txn_, log_manager.get());
+                    context->txn_ = nullptr;
                     txn_id = INVALID_TXN_ID;
                     std::cout << e.GetInfo() << std::endl;
 
@@ -200,9 +208,11 @@ void *client_handler(void *sock_fd) {
         {
             if (has_error) {
                 txn_manager->abort(context->txn_, log_manager.get());
+                context->txn_ = nullptr;
                 txn_id = INVALID_TXN_ID;
             } else {
                 txn_manager->commit(context->txn_, context->log_mgr_);
+                context->txn_ = nullptr;
                 txn_id = INVALID_TXN_ID;
             }
         }
@@ -265,7 +275,7 @@ void start_server() {
             std::cout << "Accept error!" << std::endl;
             continue;  // ignore current socket ,continue while loop.
         }
-        
+
         // 和客户端建立连接，并开启一个线程负责处理客户端请求
         if (pthread_create(&thread_id, nullptr, &client_handler, (void *)(&sockfd)) != 0) {
             std::cout << "Create thread fail!" << std::endl;
@@ -319,7 +329,7 @@ int main(int argc, char **argv) {
         recovery->redo();
         recovery->undo();
         log_manager->sync_global_lsn_with_disk();
-        
+
         // 开启服务端，开始接受客户端连接
         start_server();
     } catch (RMDBError &e) {

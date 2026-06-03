@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include <optional>
 #include <functional>
 #include <shared_mutex>
+#include <memory>
 
 #include "transaction.h"
 #include "watermark.h"
@@ -23,18 +24,35 @@ See the Mulan PSL v2 for more details. */
 #include "system/sm_manager.h"
 #include "common/exception.h"
 
-/* 系统采用的并发控制算法，当前题目中要求两阶段封锁并发控制算法 */
-enum class ConcurrencyMode { TWO_PHASE_LOCKING = 0, BASIC_TO, MVCC };
-
-/// 版本链中的第一个撤销链接，将表堆元组链接到撤销日志。
-/// VersionChain
+/// 版本链头节点：将堆元组与其第一条 undo log 相连。
+///
+/// 状态机：
+///   in_progress_ == true
+///     该版本由一个未提交事务持有。ts_ = make_txn_write_ts(txn)（临时写时间戳，
+///     值 >= TXN_START_ID，不可与 commit_ts 比较）。
+///     仅 Prepare{Insert,Update,Delete} 写入此状态。
+///
+///   in_progress_ == false
+///     该版本已提交。ts_ 为实际 commit_ts（>= 最近 watermark）。
+///     仅 commit / CleanupTransaction（abort 回滚时）写入此状态。
+///
+///   is_deleted_ == true
+///     堆元组在此版本时刻已被逻辑删除，对 ts_ 之后开始的事务不可见。
+///     GC 负责在所有活跃事务都能看到此版本后物理删除该 slot。
+///
+/// 不变量：
+///   in_progress_ 从 true 翻转为 false 只发生在 commit 路径；
+///   abort 路径通过 CleanupTransaction 直接将 VersionUndoLink 恢复到
+///   上一个已提交状态（或清除），不经过 in_progress_=false 的中间态。
 struct VersionUndoLink {
-    /** 版本链中的下一个版本。 */
     UndoLink prev_;
-    bool in_progress_{false};
+    bool in_progress_{false};   // true = 未提交；ts_ 为临时写时间戳
+    timestamp_t ts_{INVALID_TS}; // 未提交时为 make_txn_write_ts 值，提交后为 commit_ts
+    bool is_deleted_{false};    // 此版本是否为逻辑删除
 
     friend auto operator==(const VersionUndoLink &a, const VersionUndoLink &b) {
-        return a.prev_ == b.prev_ && a.in_progress_ == b.in_progress_;
+        return a.prev_ == b.prev_ && a.in_progress_ == b.in_progress_ && a.ts_ == b.ts_ &&
+               a.is_deleted_ == b.is_deleted_;
     }
 
     friend auto operator!=(const VersionUndoLink &a, const VersionUndoLink &b) { return !(a == b); }
@@ -49,41 +67,45 @@ struct VersionUndoLink {
 
 class TransactionManager: public NonCopyable {
 public:
-    explicit TransactionManager(LockManager *lock_manager, SmManager *sm_manager,
-                             ConcurrencyMode concurrency_mode = ConcurrencyMode::TWO_PHASE_LOCKING) {
+    explicit TransactionManager(LockManager *lock_manager, SmManager *sm_manager) {
         sm_manager_ = sm_manager;
         lock_manager_ = lock_manager;
-        concurrency_mode_ = concurrency_mode;
     }
-    
-    ~TransactionManager() = default;
 
-    Transaction* begin(Transaction* txn, LogManager* log_manager);
+    ~TransactionManager();
+
+    Transaction* begin(Transaction* txn, LogManager* log_manager,
+                       IsolationLevel isolation_level = IsolationLevel::SERIALIZABLE);
 
     void commit(Transaction* txn, LogManager* log_manager);
 
     void abort(Transaction* txn, LogManager* log_manager);
 
-    ConcurrencyMode get_concurrency_mode() { return concurrency_mode_; }
-
-    void set_concurrency_mode(ConcurrencyMode concurrency_mode) { concurrency_mode_ = concurrency_mode; }
-
     LockManager* get_lock_manager() { return lock_manager_; }
+
+    static bool IsMvccActive(Transaction *txn) {
+        return txn != nullptr && (txn->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION ||
+                                  txn->get_isolation_level() == IsolationLevel::SERIALIZABLE);
+    }
+
+    static bool IsSerializableActive(Transaction *txn) {
+        return txn != nullptr && txn->get_isolation_level() == IsolationLevel::SERIALIZABLE &&
+               txn->get_state() != TransactionState::ABORTED;
+    }
 
     /**
      * @description: 获取事务ID为txn_id的事务对象
      * @return {Transaction*} 事务对象的指针
      * @param {txn_id_t} txn_id 事务ID
-     */    
+     */
     Transaction* get_transaction(txn_id_t txn_id) {
         if(txn_id == INVALID_TXN_ID) return nullptr;
-        
-        std::unique_lock<std::mutex> lock(latch_);
-        auto it = TransactionManager::txn_map.find(txn_id);
-        if (it == TransactionManager::txn_map.end()) {
+
+        std::shared_lock<std::shared_mutex> lock(txn_map_mutex_);
+        auto *res = GetTransactionLocked(txn_id);
+        if (res == nullptr) {
             return nullptr;
         }
-        auto *res = it->second;
         lock.unlock();
         assert(res != nullptr);
         assert(res->get_thread_id() == std::this_thread::get_id());
@@ -91,29 +113,7 @@ public:
         return res;
     }
 
-    static std::unordered_map<txn_id_t, Transaction *> txn_map;     // 全局事务表，存放事务ID与事务对象的映射关系
-    std::shared_mutex txn_map_mutex_;
     /** ------------------------以下函数仅可能在MVCC当中使用------------------------------------------*/
-
-    /**
-    * @brief 更新一个撤销链接，该链接将表堆元组与第一个撤销日志连接起来。
-    * 在更新之前，将调用 `check` 函数以确保有效性。
-    */
-    bool UpdateUndoLink(Rid rid, std::optional<UndoLink> prev_link,
-                        std::function<bool(std::optional<UndoLink>)> &&check = nullptr);
-
-    /**
-     * @brief 更新一个撤销链接，该链接将表堆元组与第一个撤销日志连接起来。
-     * 在更新之前，将调用 `check` 函数以确保有效性。
-     */
-    bool UpdateVersionLink(Rid rid, std::optional<VersionUndoLink> prev_version,
-                           std::function<bool(std::optional<VersionUndoLink>)> &&check = nullptr);
-
-    /** @brief 获取表堆元组的第一个撤销日志。 */
-    std::optional<UndoLink> GetUndoLink(Rid rid);
-
-    /** @brief 获取表堆元组的第一个撤销日志。*/
-    std::optional<VersionUndoLink> GetVersionLink(Rid rid);
 
     /** @brief 访问事务撤销日志缓冲区并获取撤销日志。如果事务不存在，返回 nullopt。
      * 如果索引超出范围仍然会抛出异常。 */
@@ -126,9 +126,41 @@ public:
     /** @brief 获取系统中的最低读时间戳。 */
     timestamp_t GetWatermark();
 
+    auto GetVisibleRecord(int fd, const Rid &rid, const RmRecord &base_record, Transaction *txn)
+        -> std::unique_ptr<RmRecord>;
+
+    void PrepareInsert(int fd, const Rid &rid, const RmRecord &new_record, Transaction *txn);
+
+    void PrepareUpdate(int fd, const Rid &rid, const RmRecord &old_record, Transaction *txn);
+
+    void PrepareDelete(int fd, const Rid &rid, const RmRecord &old_record, Transaction *txn);
+
+    /**
+     * @brief Atomically transition a version link from in_progress to committed.
+     *
+     * Reads the current version link, verifies that the owning transaction matches
+     * `txn_id`, and updates the link to the committed state — all under the page
+     * mutex.  This avoids a TOCTOU race between a separate GetVersionLink /
+     * UpdateVersionLink pair.
+     */
+    void CommitVersionLink(int fd, const Rid &rid, txn_id_t txn_id, timestamp_t commit_ts, bool is_delete);
+
+    void CheckWriteConflict(int fd, const Rid &rid, Transaction *txn);
+
+    void TrackSsiPredicateRead(const std::string &table_name, const std::vector<Condition> &conditions,
+                               Transaction *txn);
+
+    void TrackSsiRecordRead(const std::string &table_name, const std::vector<Condition> &conditions, const Rid &rid,
+                            const RmRecord &record, Transaction *txn);
+
+    void TrackSsiWrite(const std::string &table_name, const Rid &rid, const RmRecord *old_record,
+                       const RmRecord *new_record, Transaction *txn);
+
+    void ClearVersionLink(int fd, const Rid &rid);
+
     /** @brief 垃圾回收。仅在所有事务都未访问时调用。 */
     void GarbageCollection();
-
+    
     struct PageVersionInfo {
         std::shared_mutex mutex_;
         /** 存储所有槽的先前版本信息。注意：不要使用 `[x]` 来访问它，因为
@@ -140,17 +172,80 @@ public:
     /** 保护版本信息 */
     std::shared_mutex version_info_mutex_;
     /** 存储表堆中每个元组的先前版本。 */
-    std::unordered_map<page_id_t, std::shared_ptr<PageVersionInfo>> version_info_;
+    struct VersionPageKey {
+        int fd;
+        page_id_t page_no;
+
+        bool operator==(const VersionPageKey &other) const {
+            return fd == other.fd && page_no == other.page_no;
+        }
+    };
+
+    struct VersionPageKeyHash {
+        size_t operator()(const VersionPageKey &key) const {
+            auto lhs = static_cast<uint64_t>(static_cast<uint32_t>(key.fd));
+            auto rhs = static_cast<uint64_t>(static_cast<uint32_t>(key.page_no));
+            return std::hash<uint64_t>()((lhs << 32) | rhs);
+        }
+    };
+
+    std::unordered_map<VersionPageKey, std::shared_ptr<PageVersionInfo>, VersionPageKeyHash> version_info_;
+
+    bool UpdateVersionLink(int fd, Rid rid, std::optional<VersionUndoLink> prev_version,
+                           std::function<bool(std::optional<VersionUndoLink>)> &&check = nullptr);
+
+    std::optional<VersionUndoLink> GetVersionLink(int fd, Rid rid);
+
+    void CleanupTransaction(Transaction *txn);
 
 
 private:
-    ConcurrencyMode concurrency_mode_;      // 事务使用的并发控制算法，目前只需要考虑2PL
     std::atomic<txn_id_t> next_txn_id_{0};  // 用于分发事务ID
     std::atomic<timestamp_t> next_timestamp_{0};    // 用于分发事务时间戳
-    std::mutex latch_;  // 用于txn_map的并发
+    std::shared_mutex txn_map_mutex_;  // 保护 txn_map 的并发访问
+    std::mutex watermark_mutex_;       // 保护 running_txns_ 的并发访问
     SmManager *sm_manager_;
     LockManager *lock_manager_;
 
     std::atomic<timestamp_t> last_commit_ts_{0};    // 最后提交的时间戳,仅用于MVCC
     Watermark running_txns_{0};             // 存储所有正在运行事务的读取时间戳，以便于垃圾回收，仅用于MVCC
+    /**
+     * 事务条目，存储事务的所有权和保留状态。
+     */
+    struct TxnEntry {
+        std::unique_ptr<Transaction> txn;   // 事务所有权
+        bool retained = false;              // 事务是否被保留，用于垃圾回收
+
+        Transaction *Get() const { return txn.get(); }
+    };
+    // 存储所有事务的映射，键为事务ID，值为事务条目
+    std::unordered_map<txn_id_t, TxnEntry> txn_map;
+    
+    void RemoveSsiEdgesForTxnLocked(txn_id_t txn_id);
+
+    Transaction *GetTransactionLocked(txn_id_t txn_id);
+
+    void RegisterTransactionLocked(std::unique_ptr<Transaction> txn);
+
+    void SetTransactionRetainedLocked(txn_id_t txn_id, bool retained);
+
+    void RemoveTransactionLocked(txn_id_t txn_id, std::vector<std::unique_ptr<Transaction>> *released_txns = nullptr);
+
+    template <typename Callback>
+    void ForEachTransactionLocked(Callback &&callback) {
+        for (auto &[_, entry] : txn_map) {
+            auto *other = entry.Get();
+            if (other != nullptr) {
+                callback(other);
+            }
+        }
+    }
+
+    // Builds the undo log for a write operation, inheriting the undo chain from the
+    // current version link when the same transaction already owns the slot.
+    UndoLog BuildUndoLogForWrite(int fd, const Rid &rid, const RmRecord &base_record, Transaction *txn);
+
+    bool AddRwDependency(Transaction *from, Transaction *to, Transaction *current, const std::string &reason);
+
+    bool HasDangerousStructure(Transaction *from, Transaction *to);
 };
