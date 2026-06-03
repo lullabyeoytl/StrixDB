@@ -27,7 +27,7 @@ See the Mulan PSL v2 for more details. */
 enum class TransactionState { DEFAULT, GROWING, SHRINKING, COMMITTED, ABORTED };
 
 /* 系统的隔离级别，当前赛题中为可串行化隔离级别 */
-enum class IsolationLevel { READ_UNCOMMITTED, REPEATABLE_READ, READ_COMMITTED, SERIALIZABLE };
+enum class IsolationLevel { READ_UNCOMMITTED, REPEATABLE_READ, READ_COMMITTED, SNAPSHOT_ISOLATION, SERIALIZABLE };
 
 /* 事务写操作类型，包括插入、删除、更新三种操作 */
 enum class WType { INSERT_TUPLE = 0, DELETE_TUPLE, UPDATE_TUPLE};
@@ -128,7 +128,8 @@ struct std::hash<LockDataId> {
 };
 
 /* 事务回滚原因 */
-enum class AbortReason { LOCK_ON_SHIRINKING = 0, UPGRADE_CONFLICT, DEADLOCK_PREVENTION };
+enum class AbortReason { LOCK_ON_SHIRINKING = 0, UPGRADE_CONFLICT, DEADLOCK_PREVENTION, WRITE_CONFLICT,
+                         SERIALIZATION_CONFLICT };
 
 /* 事务回滚异常，在rmdb.cpp中进行处理 */
 class TransactionAbortException : public std::exception {
@@ -155,6 +156,14 @@ class TransactionAbortException : public std::exception {
 
             case AbortReason::DEADLOCK_PREVENTION: {
                 return "Transaction " + std::to_string(txn_id_) + " aborted for deadlock prevention\n";
+            } break;
+
+            case AbortReason::WRITE_CONFLICT: {
+                return "Transaction " + std::to_string(txn_id_) + " aborted for write conflict\n";
+            } break;
+
+            case AbortReason::SERIALIZATION_CONFLICT: {
+                return "Transaction " + std::to_string(txn_id_) + " aborted for serialization conflict\n";
             } break;
 
             default: {

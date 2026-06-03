@@ -14,7 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include "transaction/concurrency/lock_manager.h"
 #include "recovery/log_manager.h"
 
-// class TransactionManager;
+class TransactionManager;
 
 // used for data_send
 static int const_offset = -1;
@@ -24,14 +24,16 @@ static int const_offset = -1;
  */
 class Context {
 public:
-    Context (LockManager *lock_mgr, LogManager *log_mgr, 
+    Context (LockManager *lock_mgr, LogManager *log_mgr,
             Transaction *txn, char *data_send = nullptr, int *offset = &const_offset)
         : lock_mgr_(lock_mgr), log_mgr_(log_mgr), txn_(txn),
           data_send_(data_send), offset_(offset) {
             ellipsis_ = false;
+            isolation_level_ = IsolationLevel::SERIALIZABLE;
+            txn_mgr_ = nullptr;
           }
 
-    // TransactionManager *txn_mgr_;
+    TransactionManager *txn_mgr_;
     LockManager *lock_mgr_;
     LogManager *log_mgr_;
     Transaction *txn_;
@@ -39,4 +41,6 @@ public:
     int *offset_;
     // @brief Marks whether formatted output has exceeded the client buffer.
     bool ellipsis_;
+    // @brief Session isolation level for the next explicit transaction.
+    IsolationLevel isolation_level_;
 };
