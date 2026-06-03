@@ -62,6 +62,7 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 {new_line} { /* ignore new line */ }
     /* keywords */
 "SHOW" { return SHOW; }
+"SNAPSHOT" { return SNAPSHOT; }
 "BEGIN" { return TXN_BEGIN; }
 "COMMIT" { return TXN_COMMIT; }
 "ABORT" { return TXN_ABORT; }
@@ -69,10 +70,12 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "TABLES" { return TABLES; }
 "CREATE" { return CREATE; }
 "TABLE" { return TABLE; }
+"TRANSACTION" { return TRANSACTION; }
 "DROP" { return DROP; }
 "DESC" { return DESC; }
 "INSERT" { return INSERT; }
 "INTO" { return INTO; }
+"ISOLATION" { return ISOLATION; }
 "VALUES" { return VALUES; }
 "DELETE" { return DELETE; }
 "FROM" { return FROM; }
@@ -80,6 +83,7 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "UPDATE" { return UPDATE; }
 "SET" { return SET; }
 "SELECT" { return SELECT; }
+"SERIALIZABLE" { return SERIALIZABLE; }
 "INT" { return INT; }
 "CHAR" { return CHAR; }
 "FLOAT" { return FLOAT; }
@@ -89,6 +93,7 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "ON" { return ON; }
 "SEMI" { return SEMI; }
 "JOIN" {return JOIN;}
+"LEVEL" { return LEVEL; }
 "EXIT" { return EXIT; }
 "HELP" { return HELP; }
 "ORDER" { return ORDER; }

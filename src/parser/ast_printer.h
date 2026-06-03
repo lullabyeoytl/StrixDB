@@ -83,6 +83,13 @@ private:
         return m.at(dir);
     }
 
+    static std::string isolation_level2str(IsolationLevel level) {
+        static std::map<IsolationLevel, std::string> m{
+                {IsolationLevel::SNAPSHOT_ISOLATION, "SNAPSHOT_ISOLATION"},
+                {IsolationLevel::SERIALIZABLE,       "SERIALIZABLE"},
+        };
+        return m.at(level);
+    }
 
     template<typename T>
     static void print_node_list(std::vector<T> nodes, int offset) {
@@ -218,6 +225,9 @@ private:
         } else if (auto x = std::dynamic_pointer_cast<ExplainAnalyzeStmt>(node)) {
             std::cout << "EXPLAIN_ANALYZE\n";
             print_node(x->statement, offset);
+        } else if (auto x = std::dynamic_pointer_cast<SetIsolationLevelStmt>(node)) {
+            std::cout << "SET_ISOLATION_LEVEL\n";
+            print_val(isolation_level2str(x->level_), offset);
         } else if (auto x = std::dynamic_pointer_cast<TxnBegin>(node)) {
             std::cout << "BEGIN\n";
         } else if (auto x = std::dynamic_pointer_cast<TxnCommit>(node)) {

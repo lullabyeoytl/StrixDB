@@ -158,7 +158,7 @@ void QlManager::run_mutli_query(std::shared_ptr<Plan> plan, Context *context){
             }
             default:
                 throw InternalError("Unexpected field type");
-                break;  
+                break;
         }
     }
 }
@@ -190,34 +190,39 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
             }
             case T_Transaction_begin:
             {
+                // Apply the session-configured isolation level before any real work.
+                context->txn_->set_isolation_level(context->isolation_level_);
                 // 显示开启一个事务
                 context->txn_->set_txn_mode(true);
                 break;
-            }  
+            }
             case T_Transaction_commit:
             {
                 context->txn_ = txn_mgr_->get_transaction(*txn_id);
                 txn_mgr_->commit(context->txn_, context->log_mgr_);
+                context->txn_ = nullptr;
                 *txn_id = INVALID_TXN_ID;
                 break;
-            }    
+            }
             case T_Transaction_rollback:
             {
                 context->txn_ = txn_mgr_->get_transaction(*txn_id);
                 txn_mgr_->abort(context->txn_, context->log_mgr_);
+                context->txn_ = nullptr;
                 *txn_id = INVALID_TXN_ID;
                 break;
-            }    
+            }
             case T_Transaction_abort:
             {
                 context->txn_ = txn_mgr_->get_transaction(*txn_id);
                 txn_mgr_->abort(context->txn_, context->log_mgr_);
+                context->txn_ = nullptr;
                 *txn_id = INVALID_TXN_ID;
                 break;
-            }     
+            }
             default:
                 throw InternalError("Unexpected field type");
-                break;                        
+                break;
         }
 
     } else if(auto x = std::dynamic_pointer_cast<SetKnobPlan>(plan)) {
@@ -240,6 +245,8 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
             break;
         }
         }
+    } else if(auto x = std::dynamic_pointer_cast<SetIsolationLevelPlan>(plan)) {
+        context->isolation_level_ = x->level_;
     }
 }
 
@@ -276,7 +283,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
 
     // Print records
     size_t num_rec = 0;
-    
+
     // 执行query_plan
    auto value_to_string = [](const Value &value) {
         if (value.type == TYPE_INT) {

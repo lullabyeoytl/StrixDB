@@ -10,8 +10,35 @@ See the Mulan PSL v2 for more details. */
 #undef NDEBUG
 
 #include <cassert>
+#include <memory>
+#include <vector>
 
 #include "parser.h"
+
+namespace {
+
+auto parse_sql(const std::string &sql, yyscan_t yyscanner) -> std::shared_ptr<ast::TreeNode> {
+    std::shared_ptr<ast::TreeNode> parse_tree;
+    YY_BUFFER_STATE buf = yy_scan_string(sql.c_str(), yyscanner);
+    int result = yyparse(&parse_tree, yyscanner);
+    yy_delete_buffer(buf, yyscanner);
+    if (result != 0) {
+        return nullptr;
+    }
+    return parse_tree;
+}
+
+void assert_parse_ok(const std::string &sql, yyscan_t yyscanner) {
+    auto parse_tree = parse_sql(sql, yyscanner);
+    assert(parse_tree != nullptr);
+}
+
+void assert_parse_rejected(const std::string &sql, yyscan_t yyscanner) {
+    auto parse_tree = parse_sql(sql, yyscanner);
+    assert(parse_tree == nullptr);
+}
+
+}  // namespace
 
 int main() {
     std::vector<std::string> sqls = {
@@ -21,10 +48,7 @@ int main() {
         "drop table tb;",
         "create index tb(a);",
         "create index tb(a, b, c);",
-        "create unique index tb(a);",
-        "create unique index tb(a, b);",
-        "create table tb (a int unique, b float);",
-        "create table tb (a int, b int, unique(a, b));",
+        "create table tb (a int, b float);",
         "drop index tb(a, b, c);",
         "drop index tb(b);",
         "insert into tb values (1, 3.14, 'pi');",
@@ -33,11 +57,13 @@ int main() {
         "select * from tb;",
         "select * from tb where x <> 2 and y >= 3. and z <= '123' and b < tb.a;",
         "select x.a, y.b from x, y where x.a = y.b and c = d;",
-        "select x.a, y.b from x join y where x.a = y.b and c = d;",
+        "select x.a, y.b from x join y on x.a = y.b and c = d;",
         "select count(*), sum(a), avg(b), min(c), max(c) from tb;",
         "select count(*) as cnt, sum(a) as total from tb;",
         "select a, count(*) from tb group by a;",
         "select a, count(*) from tb group by a having count(*) > 1 and a = 2 order by a asc, c desc;",
+        "set transaction isolation level snapshot isolation;",
+        "set transaction isolation level serializable;",
         "exit;",
         "help;",
         "",
@@ -46,17 +72,21 @@ int main() {
     yylex_init(&yyscanner);
     for (auto &sql : sqls) {
         std::cout << sql << std::endl;
-        std::shared_ptr<ast::TreeNode> parse_tree;
-        YY_BUFFER_STATE buf = yy_scan_string(sql.c_str(), yyscanner);
-        assert(yyparse(&parse_tree, yyscanner) == 0);
+        auto parse_tree = parse_sql(sql, yyscanner);
         if (parse_tree != nullptr) {
             ast::TreePrinter::print(parse_tree);
-            yy_delete_buffer(buf, yyscanner);
             std::cout << std::endl;
         } else {
             std::cout << "exit/EOF" << std::endl;
         }
     }
+    assert_parse_ok("set transaction isolation level snapshot isolation;", yyscanner);
+    assert_parse_ok("set transaction isolation level serializable;", yyscanner);
+    assert_parse_rejected("create unique index tb(a);", yyscanner);
+    assert_parse_rejected("create table tb (a int unique, b float);", yyscanner);
+    assert_parse_rejected("create table tb (a int, b int, unique(a, b));", yyscanner);
+    assert_parse_rejected("set transaction isolation level unknown;", yyscanner);
+    assert_parse_rejected("set isolation level snapshot;", yyscanner);
     yylex_destroy(yyscanner);
     return 0;
 }

@@ -34,6 +34,7 @@ typedef enum PlanTag{
     T_CreateIndex,
     T_DropIndex,
     T_SetKnob,
+    T_SetIsolationLevel,
     T_Insert,
     T_Update,
     T_Delete,
@@ -71,7 +72,7 @@ public:
 class ScanPlan : public Plan
 {
     public:
-        ScanPlan(SmManager *sm_manager, std::string tab_name, std::vector<Condition> all_conds,
+        ScanPlan(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds,
                  bool empty_result = false)
         {
             Plan::tag = T_SeqScan;
@@ -79,7 +80,7 @@ class ScanPlan : public Plan
             TabMeta &tab = sm_manager->db_.get_table(tab_name_);
             cols_ = tab.cols;
             len_ = cols_.back().offset + cols_.back().len;
-            all_conds_ = std::move(all_conds);
+            residual_conds_ = std::move(conds);
             empty_result_ = empty_result;
         }
 
@@ -107,12 +108,17 @@ class ScanPlan : public Plan
         std::vector<ColMeta> cols_;
         std::vector<Condition> access_conds_;   // 索引访问条件
         std::vector<Condition> residual_conds_;
-        std::vector<Condition> all_conds_;
         size_t len_;
         std::vector<std::string> index_col_names_;
         std::optional<IndexMeta> index_meta_;
         bool empty_result_ = false;
         bool use_covering_index_ = false;
+
+        std::vector<Condition> all_conds() const {
+            auto result = access_conds_;
+            result.insert(result.end(), residual_conds_.begin(), residual_conds_.end());
+            return result;
+        }
 
         void enable_covering_index(std::vector<ColMeta> covered_cols)
         {
@@ -344,13 +350,13 @@ class DDLPlan : public Plan
             tab_name_ = std::move(tab_name);
             cols_ = std::move(cols);
             tab_col_names_ = std::move(col_names);
-            index_specs_ = std::move(index_specs);
+            index_specs_ = std::move(index_specs);
         }
         ~DDLPlan(){}
         std::string tab_name_;
         std::vector<std::string> tab_col_names_;
         std::vector<ColDef> cols_;
-        std::vector<IndexSpec> index_specs_;
+        std::vector<IndexSpec> index_specs_;
 };
 
 // help; show tables; desc tables; begin; abort; commit; rollback语句对应的plan
@@ -377,6 +383,16 @@ class SetKnobPlan : public Plan
         }
     ast::SetKnobType set_knob_type_;
     bool bool_value_;
+};
+
+// Set Transaction Isolation Level Plan
+class SetIsolationLevelPlan : public Plan
+{
+    public:
+        explicit SetIsolationLevelPlan(IsolationLevel level) : level_(level) {
+            Plan::tag = T_SetIsolationLevel;
+        }
+    IsolationLevel level_;
 };
 
 class plannerInfo{

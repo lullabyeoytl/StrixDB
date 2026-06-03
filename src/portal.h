@@ -218,6 +218,9 @@ class Portal
         } else if(auto x = std::dynamic_pointer_cast<SetKnobPlan>(plan)) {
             return std::make_shared<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<TabCol>(), std::vector<std::string>(),
                                                 std::unique_ptr<AbstractExecutor>(), plan);
+        } else if(auto x = std::dynamic_pointer_cast<SetIsolationLevelPlan>(plan)) {
+            return std::make_shared<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<TabCol>(), std::vector<std::string>(),
+                                                std::unique_ptr<AbstractExecutor>(), plan);
         } else if (auto x = std::dynamic_pointer_cast<DDLPlan>(plan)) {
             return std::make_shared<PortalStmt>(PORTAL_MULTI_QUERY, std::vector<TabCol>(), std::vector<std::string>(),
                                                 std::unique_ptr<AbstractExecutor>(), plan);
@@ -355,7 +358,7 @@ class Portal
             return executor;
         } else if(auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
             if(x->tag == T_SeqScan) {
-                auto executor = std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->all_conds_,
+                auto executor = std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->all_conds(),
                                                                   x->empty_result_, context);
                 executor->set_explain_info("Scan", "table=" + x->tab_name_ +
                                                        ", type=SeqScan");

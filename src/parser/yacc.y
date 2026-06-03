@@ -42,6 +42,7 @@ void append_join_clause(std::vector<std::shared_ptr<JoinExpr>> &join_exprs,
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY LIMIT OFFSET AS
 WHERE UPDATE SET SELECT INT CHAR FLOAT DATETIME INDEX AND ON SEMI JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE ENABLE_HASHJOIN
 %token COUNT SUM AVG MIN MAX GROUP HAVING EXPLAIN ANALYZE
+%token TRANSACTION ISOLATION LEVEL SNAPSHOT SERIALIZABLE
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
 
@@ -165,7 +166,15 @@ setStmt:
         SET set_knob_type '=' VALUE_BOOL
     {
         $$ = std::make_shared<SetStmt>($2, $4);
-    }
+    }
+    |   SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION
+    {
+        $$ = std::make_shared<SetIsolationLevelStmt>(IsolationLevel::SNAPSHOT_ISOLATION);
+    }
+    |   SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
+    {
+        $$ = std::make_shared<SetIsolationLevelStmt>(IsolationLevel::SERIALIZABLE);
+    }
     ;
 
 ddl:
