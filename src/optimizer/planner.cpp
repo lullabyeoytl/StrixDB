@@ -907,7 +907,7 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query, const 
     auto plan = build_join_tree(table_plans, plan_context.join_conds, plan_context.explicit_joins);
 
     auto join_impl_config = build_join_implementation_config(enable_nestedloop_join,
-                                                             enable_nestedloop_join,
+                                                             enable_index_nestedloop_join,
                                                              enable_sortmerge_join,
                                                              this->enable_hash_join);
     validate_join_executor_config(join_impl_config);

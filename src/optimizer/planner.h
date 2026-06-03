@@ -64,8 +64,9 @@ class Planner {
     SmManager *sm_manager_;
 
     bool enable_nestedloop_join = true;
-    bool enable_sortmerge_join = true;
-    bool enable_hash_join = true;
+    bool enable_index_nestedloop_join = true;
+    bool enable_sortmerge_join = false;
+    bool enable_hash_join = false;
 
    public:
     Planner(SmManager *sm_manager) : sm_manager_(sm_manager) {}
