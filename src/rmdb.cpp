@@ -322,6 +322,7 @@ int main(int argc, char **argv) {
         }
         // Open database
         sm_manager->open_db(db_name);
+        sm_manager->set_txn_mgr(txn_manager.get());
         buffer_pool_manager->set_log_manager(log_manager.get());
 
         // recovery database

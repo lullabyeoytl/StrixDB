@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <utility>
 
 #include "common/common.h"
 #include "index/ix.h"
@@ -109,16 +110,16 @@ void release_locks(Transaction *txn, LockManager *lock_manager) {
 // File handle, index, and CLR helpers
 //--------------------------------------------------------------------------
 
-auto find_file_handle_by_fd(SmManager *sm_manager, int fd) -> RmFileHandle * {
+auto find_table_by_fd(SmManager *sm_manager, int fd) -> std::pair<std::string, RmFileHandle *> {
     if (sm_manager == nullptr) {
-        return nullptr;
+        return {std::string(), nullptr};
     }
-    for (auto &[_, fh] : sm_manager->fhs_) {
+    for (auto &[tab_name, fh] : sm_manager->fhs_) {
         if (fh != nullptr && fh->GetFd() == fd) {
-            return fh.get();
+            return {tab_name, fh.get()};
         }
     }
-    return nullptr;
+    return {std::string(), nullptr};
 }
 
 /**
@@ -127,6 +128,25 @@ auto find_file_handle_by_fd(SmManager *sm_manager, int fd) -> RmFileHandle * {
 struct GcDeleteRecord {
     int fd;
     Rid rid;
+};
+
+/**
+ * Represents a version record for garbage collection, used to clean up version links after transactions commit or abort.
+ */
+struct GcVersionRecord {
+    int fd;
+    Rid rid;
+    VersionUndoLink version;
+};
+
+/**
+ * Represents a stale index record for garbage collection.
+ */
+struct GcStaleIndexRecord {
+    int fd;
+    Rid rid;
+    RmRecord record;
+    bool row_deleted;
 };
 
 enum class IndexEntryOp { INSERT, DELETE };
@@ -213,7 +233,6 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
     // 1. 创建新事务（忽略传入的 txn 参数，始终由 Manager 管理所有权）
     // 2. 把开始事务加入到全局事务表中
     // 3. 返回当前事务指针
-    std::unique_lock<std::shared_mutex> txn_lock(txn_map_mutex_);
     auto owned = std::make_unique<Transaction>(next_txn_id_++, isolation_level);
     txn = owned.get();
     txn->set_state(TransactionState::GROWING);
@@ -225,8 +244,10 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
         // 注册到水线追踪器
         running_txns_.AddTxn(start_ts);
     }
-    RegisterTransactionLocked(std::move(owned));
-    txn_lock.unlock();
+    {
+        std::unique_lock<std::shared_mutex> txn_lock(txn_map_mutex_);
+        RegisterTransactionLocked(std::move(owned));
+    }
 
     if (log_manager != nullptr) {
         BeginLogRecord log_record(txn->get_transaction_id());
@@ -277,13 +298,13 @@ void TransactionManager::commit(Transaction *txn, LogManager *log_manager) {
     txn->set_state(TransactionState::SHRINKING);
     std::vector<std::unique_ptr<Transaction>> released_txns;
 
-    // Phase 1: assign commit_ts (atomic, no global lock needed)
+    // Commit timestamp publication precedes version-link finalization.
     commit_ts = next_timestamp_.fetch_add(1, std::memory_order_acq_rel) + 1;
     txn->set_commit_ts(commit_ts);
     txn->set_state(TransactionState::COMMITTED);
     last_commit_ts_.store(commit_ts, std::memory_order_release);
 
-    // Phase 2: commit version links (uses per-page mutexes, no global lock)
+    // Version links are finalized per tuple without holding the transaction map lock.
     if (IsMvccActive(txn) && sm_manager_ != nullptr) {
         // for all write records set version link head to committed
         for (auto *write_record : *txn->get_write_set()) {
@@ -298,14 +319,14 @@ void TransactionManager::commit(Transaction *txn, LogManager *log_manager) {
         }
     }
 
-    // Phase 3: update watermark
+    // Reader watermark removal happens after committed versions are visible.
     {
         std::lock_guard<std::mutex> wm_lock(watermark_mutex_);
         running_txns_.UpdateCommitTs(commit_ts);
         running_txns_.RemoveTxn(txn->get_start_ts());
     }
 
-    // Phase 4: update txn_map
+    // Retained transactions keep undo logs and SSI edges until garbage collection.
     {
         std::unique_lock<std::shared_mutex> txn_lock(txn_map_mutex_);
         if (retain_txn) {
@@ -344,6 +365,23 @@ void delete_changed_mvcc_index_entries(SmManager *sm_manager, const std::string 
         auto ih = sm_manager->get_ih(tab_name, index.cols);
         auto key = std::make_unique<char[]>(index.col_tot_len);
         index.build_key(key.get(), current_record.data);
+        ih->delete_entry(key.get(), rid, txn);
+    }
+}
+
+/**
+ * Deletes stale MVCC index entries for a record that has been updated or deleted, used during transaction abort to clean up index entries that are no longer visible.
+ */
+void delete_stale_mvcc_index_entries(SmManager *sm_manager, const std::string &tab_name, const TabMeta &tab,
+                                     const RmRecord &stale_record, const RmRecord &current_record, const Rid &rid,
+                                     Transaction *txn) {
+    for (auto &index : tab.indexes) {
+        if (index_key_equal(index, stale_record, current_record)) {
+            continue;
+        }
+        auto ih = sm_manager->get_ih(tab_name, index.cols);
+        auto key = std::make_unique<char[]>(index.col_tot_len);
+        index.build_key(key.get(), stale_record.data);
         ih->delete_entry(key.get(), rid, txn);
     }
 }
@@ -1034,19 +1072,17 @@ timestamp_t TransactionManager::GetWatermark() {
 //--------------------------------------------------------------------------
 void TransactionManager::GarbageCollection() {
     std::vector<GcDeleteRecord> deleted_records;
+    std::vector<GcVersionRecord> reclaimed_versions;
     std::vector<std::unique_ptr<Transaction>> released_txns;
 
-    // Phase 1+2: check watermark AND clean up under watermark_mutex_.
-    // Holding watermark_mutex_ across version link deletion prevents a new
-    // transaction from starting between the "no active readers" check and
-    // the GC reclamation — otherwise a concurrent BEGIN could create a
-    // snapshot that needs versions we would have already freed.
-    {
-        std::lock_guard<std::mutex> wm_lock(watermark_mutex_);
-        if (!running_txns_.current_reads_.empty()) {
-            return;
-        }
+    // Version and index reclamation requires an empty active-reader set.
+    std::lock_guard<std::mutex> wm_lock(watermark_mutex_);
+    if (!running_txns_.current_reads_.empty()) {
+        return;
+    }
 
+    // Committed version heads are detached under version-info locks.
+    {
         std::unique_lock<std::shared_mutex> table_lock(version_info_mutex_);
         for (auto page_it = version_info_.begin(); page_it != version_info_.end();) {
             auto page_info = page_it->second;
@@ -1059,9 +1095,7 @@ void TransactionManager::GarbageCollection() {
                         continue;
                     }
                     Rid rid{page_it->first.page_no, static_cast<int>(slot_it->first)};
-                    if (version.is_deleted_) {
-                        deleted_records.push_back(GcDeleteRecord{page_it->first.fd, rid});
-                    }
+                    reclaimed_versions.push_back(GcVersionRecord{page_it->first.fd, rid, version});
                     slot_it = page_info->prev_version_.erase(slot_it);
                 }
             }
@@ -1073,9 +1107,76 @@ void TransactionManager::GarbageCollection() {
         }
     }
 
-    // Phase 3: release retained transactions (needs exclusive access to txn_map)
+    // Undo records identify obsolete index keys that no active snapshot can require.
+    std::vector<GcStaleIndexRecord> stale_index_records;
+    for (const auto &entry : reclaimed_versions) {
+        auto [tab_name, fh] = find_table_by_fd(sm_manager_, entry.fd);
+        if (fh == nullptr) {
+            continue;
+        }
+
+        std::unique_ptr<RmRecord> current_record;
+        try {
+            current_record = fh->get_record_no_mvcc(entry.rid);
+        } catch (const RecordNotFoundError &) {
+        }
+
+        if (entry.version.is_deleted_) {
+            deleted_records.push_back(GcDeleteRecord{entry.fd, entry.rid});
+            if (current_record != nullptr) {
+                stale_index_records.push_back(
+                    GcStaleIndexRecord{entry.fd, entry.rid, *current_record, true});
+            }
+        }
+
+        UndoLink undo_link = entry.version.prev_;
+        while (undo_link.IsValid()) {
+            auto undo_log = GetUndoLogOptional(undo_link);
+            if (!undo_log.has_value()) {
+                break;
+            }
+            if (!undo_log->is_deleted_ && undo_log->old_record_ != nullptr && current_record != nullptr) {
+                stale_index_records.push_back(
+                    GcStaleIndexRecord{entry.fd, entry.rid, *undo_log->old_record_, false});
+            }
+            undo_link = undo_log->prev_version_;
+        }
+    }
+
+    // Obsolete index entries are removed before any heap slot is physically freed.
+    for (const auto &entry : stale_index_records) {
+        auto [tab_name, fh] = find_table_by_fd(sm_manager_, entry.fd);
+        if (fh == nullptr) {
+            continue;
+        }
+        try {
+            auto &tab = sm_manager_->db_.get_table(tab_name);
+            if (entry.row_deleted) {
+                apply_index_op(sm_manager_, tab_name, tab, entry.record, entry.rid, nullptr, IndexEntryOp::DELETE);
+                continue;
+            }
+            auto current_record = fh->get_record_no_mvcc(entry.rid);
+            delete_stale_mvcc_index_entries(sm_manager_, tab_name, tab, entry.record, *current_record,
+                                            entry.rid, nullptr);
+        } catch (const RecordNotFoundError &) {
+        }
+    }
+
+    // Logical deletes become physical deletes only after index cleanup.
+    for (const auto &entry : deleted_records) {
+        auto [_, fh] = find_table_by_fd(sm_manager_, entry.fd);
+        if (fh == nullptr) {
+            continue;
+        }
+        try {
+            fh->delete_record(entry.rid, nullptr);
+        } catch (const RecordNotFoundError &) {
+        }
+    }
+
+    // Retained transactions can be released once their undo chains are unreachable.
     {
-        std::unique_lock<std::shared_mutex> txn_lock(txn_map_mutex_);
+        std::unique_lock<std::shared_mutex> txn_write_lock(txn_map_mutex_);
         std::vector<txn_id_t> retained_ids;
         for (auto &[txn_id, entry] : txn_map) {
             if (entry.retained) {
@@ -1092,17 +1193,6 @@ void TransactionManager::GarbageCollection() {
                 }
             }
             RemoveTransactionLocked(txn_id, &released_txns);
-        }
-    }
-
-    for (const auto &entry : deleted_records) {
-        auto *fh = find_file_handle_by_fd(sm_manager_, entry.fd);
-        if (fh == nullptr) {
-            continue;
-        }
-        try {
-            fh->delete_record(entry.rid, nullptr);
-        } catch (const RecordNotFoundError &) {
         }
     }
 }

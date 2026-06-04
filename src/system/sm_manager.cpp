@@ -44,6 +44,36 @@ auto format_show_index_record(const std::string &tab_name, const IndexMeta &inde
 
 }  // namespace
 
+void SmManager::set_txn_mgr(TransactionManager *txn_mgr) {
+    txn_mgr_ = txn_mgr;
+    for (auto &entry : db_.tabs_) {
+        auto fh_it = fhs_.find(entry.first);
+        if (fh_it == fhs_.end()) {
+            continue;
+        }
+        int table_fd = fh_it->second->GetFd();
+        for (auto &index : entry.second.indexes) {
+            std::string ix_name = ix_manager_->get_index_name(entry.first, index.cols);
+            auto ih_it = ihs_.find(ix_name);
+            if (ih_it != ihs_.end()) {
+                ih_it->second->set_table_fd(table_fd);
+                ih_it->second->set_table_handle(fh_it->second.get());
+                ih_it->second->set_index_cols(index.cols);
+                ih_it->second->set_txn_mgr(txn_mgr_);
+            }
+        }
+    }
+}
+
+std::string SmManager::fd_to_table_name(int fd) const {
+    for (const auto &entry : fhs_) {
+        if (entry.second != nullptr && entry.second->GetFd() == fd) {
+            return entry.first;
+        }
+    }
+    return {};
+}
+
 /**
  * @description: 判断是否为一个文件夹
  * @return {bool} 返回是否为一个文件夹
@@ -135,10 +165,15 @@ void SmManager::open_db(const std::string& db_name) {
         // Open all index files for this table
         for (auto &index : entry.second.indexes) {
             std::string ix_name = ix_manager_->get_index_name(entry.first, index.cols);
-            ihs_.emplace(ix_name, ix_manager_->open_index(entry.first, index.cols));
+            auto ih = ix_manager_->open_index(entry.first, index.cols);
+            ih->set_table_fd(fhs_.at(entry.first)->GetFd());
+            ih->set_table_handle(fhs_.at(entry.first).get());
+            ih->set_index_cols(index.cols);
+            ih->set_txn_mgr(txn_mgr_);
+            ihs_.emplace(ix_name, std::move(ih));
         }
     }
-}   
+}
 
 /**
  * @description: 把数据库相关的元数据刷入磁盘中
@@ -321,6 +356,10 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
 
     std::string ix_name = ix_manager_->get_index_name(tab_name, index_cols);
     auto ih = ix_manager_->open_index(tab_name, index_cols);
+    ih->set_table_fd(fhs_.at(tab_name)->GetFd());
+    ih->set_table_handle(fhs_.at(tab_name).get());
+    ih->set_index_cols(index_cols);
+    ih->set_txn_mgr(context != nullptr && context->txn_mgr_ != nullptr ? context->txn_mgr_ : txn_mgr_);
 
     IndexMeta index_meta;
     index_meta.tab_name = tab_name;

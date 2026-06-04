@@ -10,11 +10,33 @@ See the Mulan PSL v2 for more details. */
 
 #include "ix_index_handle.h"
 
+#include <algorithm>
+
 #include "ix_scan.h"
+#include "record/rm_file_handle.h"
+#include "transaction/transaction_manager.h"
 
 namespace {
 constexpr int IX_SPLIT_PUBLISH_RETRY_LIMIT = 128;
 constexpr int IX_PARENT_RELOCATION_RETRY_LIMIT = 32;
+
+auto same_rid(const Rid &lhs, const Rid &rhs) -> bool {
+    return lhs.page_no == rhs.page_no && lhs.slot_no == rhs.slot_no;
+}
+
+auto build_key_from_record(const std::vector<ColMeta> &cols, const RmRecord &record) -> std::vector<char> {
+    int total_len = 0;
+    for (const auto &col : cols) {
+        total_len += col.len;
+    }
+    std::vector<char> key(total_len);
+    int offset = 0;
+    for (const auto &col : cols) {
+        memcpy(key.data() + offset, record.data + col.offset, col.len);
+        offset += col.len;
+    }
+    return key;
+}
 }
 
 /**
@@ -214,6 +236,31 @@ IxIndexHandle::~IxIndexHandle() {
     delete file_hdr_;
 }
 
+IndexVisibility IxIndexHandle::check_entry_visibility(const Rid &rid, Transaction *transaction) const {
+    if (txn_mgr_ == nullptr || transaction == nullptr || table_fd_ < 0 ||
+        !TransactionManager::IsMvccActive(transaction)) {
+        return IndexVisibility::VISIBLE;
+    }
+
+    auto link = txn_mgr_->GetVersionLink(table_fd_, rid);
+    if (!link.has_value()) {
+        return IndexVisibility::VISIBLE;
+    }
+
+    if (link->in_progress_) {
+        if (link->prev_.prev_txn_ == transaction->get_transaction_id()) {
+            return link->is_deleted_ ? IndexVisibility::INVISIBLE : IndexVisibility::VISIBLE;
+        }
+        return IndexVisibility::NEED_HEAP_CHECK;
+    }
+
+    if (link->ts_ != INVALID_TS && link->ts_ <= transaction->get_start_ts()) {
+        return link->is_deleted_ ? IndexVisibility::INVISIBLE : IndexVisibility::VISIBLE;
+    }
+
+    return IndexVisibility::NEED_HEAP_CHECK;
+}
+
 /**
  * @brief 用于查找指定键所在的叶子结点
  * @param key 要查找的目标key值
@@ -267,12 +314,97 @@ bool IxIndexHandle::get_value(const char *key, std::vector<Rid> *result, Transac
     upper_bound.has_bound = true;
     upper_bound.key.assign(key, key + file_hdr_->col_tot_len_);
     upper_bound.inclusive = true;
-    IxScan scan(this, start, std::move(upper_bound), buffer_pool_manager_);
+    IxScan scan(this, start, std::move(upper_bound), buffer_pool_manager_, transaction);
     while (!scan.is_end()) {
         result->push_back(scan.rid());
         scan.next();
     }
     return !result->empty();
+}
+
+bool IxIndexHandle::is_ignored_unique_hit(const Rid &hit, const Rid *self_rid,
+                                          const std::vector<Rid> *ignored_rids) const {
+    if (self_rid != nullptr && same_rid(hit, *self_rid)) {
+        return true;
+    }
+    if (ignored_rids == nullptr) {
+        return false;
+    }
+    return std::any_of(ignored_rids->begin(), ignored_rids->end(),
+                       [&](const Rid &ignored) { return same_rid(hit, ignored); });
+}
+
+void IxIndexHandle::validate_unique_hit(const char *key, const Rid &hit, IndexVisibility visibility,
+                                        Transaction *transaction, const Rid *self_rid,
+                                        const std::vector<Rid> *ignored_rids) const {
+    if (is_ignored_unique_hit(hit, self_rid, ignored_rids)) {
+        return;
+    }
+
+    if (visibility == IndexVisibility::INVISIBLE) {
+        return;
+    }
+
+    if (visibility == IndexVisibility::NEED_HEAP_CHECK) {
+        if (!TransactionManager::IsMvccActive(transaction) || txn_mgr_ == nullptr || table_handle_ == nullptr ||
+            index_cols_.empty()) {
+            throw UniqueKeyViolationError();
+        }
+        auto link = txn_mgr_->GetVersionLink(table_fd_, hit);
+        if (link.has_value() && link->in_progress_ && link->prev_.prev_txn_ != transaction->get_transaction_id()) {
+            throw TransactionAbortException(transaction->get_transaction_id(), AbortReason::WRITE_CONFLICT);
+        }
+        try {
+            Context probe(nullptr, nullptr, transaction);
+            probe.txn_mgr_ = txn_mgr_;
+            auto record = table_handle_->get_record(hit, &probe);
+            auto current_key = build_key_from_record(index_cols_, *record);
+            if (ix_compare(current_key.data(), key, file_hdr_->col_types_, file_hdr_->col_lens_) != 0) {
+                return;
+            }
+        } catch (const RecordNotFoundError &) {
+            return;
+        }
+    }
+
+    throw UniqueKeyViolationError();
+}
+
+void IxIndexHandle::validate_unique_key_in_latched_leaf(const char *key, const IxNodeHandle *leaf,
+                                                        Transaction *transaction, const Rid *self_rid,
+                                                        const std::vector<Rid> *ignored_rids) const {
+    if (!file_hdr_->unique_) {
+        return;
+    }
+
+    for (int pos = leaf->lower_bound(key);
+         pos < leaf->get_size() && ix_compare(leaf->get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_) == 0;
+         ++pos) {
+        const Rid hit = *leaf->get_rid(pos);
+        validate_unique_hit(key, hit, check_entry_visibility(hit, transaction), transaction, self_rid, ignored_rids);
+    }
+}
+
+bool IxIndexHandle::validate_unique_key(const char *key, Transaction *transaction, const Rid *self_rid,
+                                        const std::vector<Rid> *ignored_rids) {
+    if (!file_hdr_->unique_) {
+        return true;
+    }
+
+    Iid start = lower_bound(key);
+    ScanUpperBound upper_bound;
+    upper_bound.has_bound = true;
+    upper_bound.key.assign(key, key + file_hdr_->col_tot_len_);
+    upper_bound.inclusive = true;
+    IxScan scan(this, start, std::move(upper_bound), buffer_pool_manager_, transaction);
+
+    while (!scan.is_end()) {
+        Rid hit = scan.rid();
+        validate_unique_hit(key, hit, scan.current_visibility(), transaction, self_rid, ignored_rids);
+        scan.next();
+    }
+
+    return true;
 }
 
 /**
@@ -397,8 +529,14 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle *old_node, const char *key, 
  * @param transaction 事务指针
  * @return page_id_t 插入到的叶结点的page_no
  */
-page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transaction *transaction) {
+page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transaction *transaction,
+                                      const std::vector<Rid> *ignored_rids) {
     auto access_guard = guard_access();
+    std::unique_lock<std::mutex> unique_insert_guard(unique_insert_latch_, std::defer_lock);
+    if (file_hdr_->unique_) {
+        unique_insert_guard.lock();
+        validate_unique_key(key, transaction, &value, ignored_rids);
+    }
     std::unique_ptr<IxNodeHandle> leaf;
     int split_publish_waits = 0;
     while (true) {
@@ -422,12 +560,11 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
         break;
     }
 
-    if (file_hdr_->unique_) {
-        Rid *found = nullptr;
-        if (leaf->leaf_lookup(key, &found)) {
-            unlatch_and_unpin_exclusive(leaf, false);
-            throw UniqueKeyViolationError();
-        }
+    try {
+        validate_unique_key_in_latched_leaf(key, leaf.get(), transaction, &value, ignored_rids);
+    } catch (...) {
+        unlatch_and_unpin_exclusive(leaf, false);
+        throw;
     }
 
     bool first_key_may_change =

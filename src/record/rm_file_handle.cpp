@@ -43,6 +43,19 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
     return record;
 }
 
+std::unique_ptr<RmRecord> RmFileHandle::get_record_no_mvcc(const Rid &rid) const {
+    std::lock_guard<std::mutex> guard(file_latch_);
+    RmPageHandle page_handle = fetch_page_handle(rid.page_no);
+    if (!Bitmap::is_set(page_handle.bitmap, rid.slot_no)) {
+        buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
+        throw RecordNotFoundError(rid.page_no, rid.slot_no);
+    }
+    auto record = std::make_unique<RmRecord>(file_hdr_.record_size);
+    memcpy(record->data, page_handle.get_slot(rid.slot_no), file_hdr_.record_size);
+    buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
+    return record;
+}
+
 Rid RmFileHandle::next_insert_rid() {
     std::lock_guard<std::mutex> guard(file_latch_);
 

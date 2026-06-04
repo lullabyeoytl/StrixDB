@@ -20,6 +20,10 @@ See the Mulan PSL v2 for more details. */
 #include "ix_defs.h"
 #include "transaction/transaction.h"
 #include "common/noncopyable.h"
+#include "system/sm_meta.h"
+
+class TransactionManager;
+class RmFileHandle;
 
 enum class Operation { FIND = 0, INSERT, DELETE };  // 三种操作：查找、插入、删除
 enum class LatchMode { SHARED, EXCLUSIVE };
@@ -247,16 +251,40 @@ class IxIndexHandle : public NonCopyable {
    DiskManager *disk_manager_;
    BufferPoolManager *buffer_pool_manager_;
    int fd_;                                    // 存储B+树的文件
+   int table_fd_ = -1;
+   RmFileHandle *table_handle_ = nullptr;
+   std::vector<ColMeta> index_cols_;
+   TransactionManager *txn_mgr_ = nullptr;
    IxFileHdr* file_hdr_;                       // 存了root_page，但其初始化为2（第0页存FILE_HDR_PAGE，第1页存LEAF_HEADER_PAGE）
    mutable std::mutex file_hdr_latch_;
    mutable std::mutex create_node_latch_;
    mutable std::mutex cleanup_latch_;
+   mutable std::mutex unique_insert_latch_;
    page_id_t cleanup_epoch_ = 0;
    mutable std::atomic<int> active_accessors_{0};
 
    public:
     IxIndexHandle(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager, int fd);
     ~IxIndexHandle();
+
+    void set_table_fd(int table_fd) { table_fd_ = table_fd; }
+
+    int get_table_fd() const { return table_fd_; }
+
+    void set_table_handle(RmFileHandle *table_handle) { table_handle_ = table_handle; }
+
+    void set_index_cols(std::vector<ColMeta> cols) { index_cols_ = std::move(cols); }
+
+    int get_index_fd() const { return fd_; }
+
+    void set_txn_mgr(TransactionManager *txn_mgr) { txn_mgr_ = txn_mgr; }
+
+    TransactionManager *get_txn_mgr() const { return txn_mgr_; }
+
+    IndexVisibility check_entry_visibility(const Rid &rid, Transaction *transaction) const;
+
+    bool validate_unique_key(const char *key, Transaction *transaction, const Rid *self_rid = nullptr,
+                             const std::vector<Rid> *ignored_rids = nullptr);
 
     // for search
     bool get_value(const char *key, std::vector<Rid> *result, Transaction *transaction);
@@ -265,7 +293,8 @@ class IxIndexHandle : public NonCopyable {
                                                  bool find_first = false);
 
     // for insert
-    page_id_t insert_entry(const char *key, const Rid &value, Transaction *transaction);
+    page_id_t insert_entry(const char *key, const Rid &value, Transaction *transaction,
+                           const std::vector<Rid> *ignored_rids = nullptr);
 
     std::unique_ptr<IxNodeHandle> split(IxNodeHandle *node);
 
@@ -413,6 +442,15 @@ class IxIndexHandle : public NonCopyable {
     void recycle_node_page(IxNodeHandle *node);
 
     void maintain_child(IxNodeHandle *node, int child_idx);
+
+    bool is_ignored_unique_hit(const Rid &hit, const Rid *self_rid, const std::vector<Rid> *ignored_rids) const;
+
+    void validate_unique_hit(const char *key, const Rid &hit, IndexVisibility visibility, Transaction *transaction,
+                             const Rid *self_rid, const std::vector<Rid> *ignored_rids) const;
+
+    void validate_unique_key_in_latched_leaf(const char *key, const IxNodeHandle *leaf, Transaction *transaction,
+                                             const Rid *self_rid,
+                                             const std::vector<Rid> *ignored_rids) const;
 
     // Walk backward from `start` to the first leaf whose last key is < `key`
     std::unique_ptr<IxNodeHandle> backtrack_leaf(std::unique_ptr<IxNodeHandle> start, const char *key,

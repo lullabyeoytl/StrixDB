@@ -35,6 +35,12 @@ enum class IxPageRecycleState : int {
     REUSABLE = 3,
 };
 
+enum class IndexVisibility {
+    VISIBLE,
+    INVISIBLE,
+    NEED_HEAP_CHECK,
+};
+
 class IxPageHdr {
 public:
     page_id_t next_free_page_no;    // free-list chain pointer, IX_NO_PAGE when end

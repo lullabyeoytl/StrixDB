@@ -86,6 +86,8 @@ class RmFileHandle: public NonCopyable {
 
     std::unique_ptr<RmRecord> get_record(const Rid &rid, Context *context) const;
 
+    std::unique_ptr<RmRecord> get_record_no_mvcc(const Rid &rid) const;
+
     Rid next_insert_rid();
 
     void release_reserved_rid(const Rid &rid);

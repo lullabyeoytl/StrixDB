@@ -24,23 +24,6 @@ class InsertExecutor : public AbstractExecutor {
     Rid rid_;                       // 插入的位置，在 Next() 中通过 next_insert_rid() 赋值后再写入记录
     SmManager *sm_manager_;
 
-    // TODO: 需要完成索引上的事务可见判断和索引mvcc信息，删去此处
-    void precheck_unique_index(IndexMeta &index, IxIndexHandle *ih, const char *key) {
-        std::vector<Rid> result;
-        if (!ih->get_value(key, &result, context_->txn_)) {
-            return;
-        }
-
-        for (const auto &hit : result) {
-            try {
-                fh_->get_record(hit, context_);
-                throw UniqueViolationError(tab_name_, index.col_names());
-            } catch (const RecordNotFoundError &) {
-                ih->delete_entry(key, hit, context_->txn_);
-            }
-        }
-    }
-
    public:
     InsertExecutor(SmManager *sm_manager, const std::string &tab_name, std::vector<Value> values, Context *context) {
         sm_manager_ = sm_manager;
@@ -85,7 +68,6 @@ class InsertExecutor : public AbstractExecutor {
                 auto ih = sm_manager_->get_ih(tab_name_, index.cols);
                 auto key = std::make_unique<char[]>(index.col_tot_len);
                 index.build_key(key.get(), rec.data);
-                precheck_unique_index(index, ih, key.get());
                 try {
                     ih->insert_entry(key.get(), rid_, context_->txn_);
                 } catch (const UniqueKeyViolationError &) {

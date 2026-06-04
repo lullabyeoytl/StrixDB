@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include "common/context.h"
 
 class Context;
+class TransactionManager;
 
 // SM-layer column definition. Does NOT carry a `unique` flag — uniqueness is
 // represented separately via IndexSpec / DDLPlan::index_specs_. The parser layer
@@ -39,6 +40,7 @@ class SmManager {
     BufferPoolManager* buffer_pool_manager_;
     RmManager* rm_manager_;
     IxManager* ix_manager_;
+    TransactionManager *txn_mgr_ = nullptr;
 
    public:
     SmManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, RmManager* rm_manager,
@@ -55,6 +57,10 @@ class SmManager {
     RmManager* get_rm_manager() { return rm_manager_; }  
 
     IxManager* get_ix_manager() { return ix_manager_; }
+
+    void set_txn_mgr(TransactionManager *txn_mgr);
+
+    std::string fd_to_table_name(int fd) const;
 
     IxIndexHandle *get_ih(const std::string &tab_name, const std::vector<ColMeta> &cols) {
         return ihs_.at(ix_manager_->get_index_name(tab_name, cols)).get();

@@ -10,8 +10,9 @@ See the Mulan PSL v2 for more details. */
 
 #include "ix_scan.h"
 
-IxScan::IxScan(const IxIndexHandle *ih, const Iid &lower, ScanUpperBound upper_bound, BufferPoolManager *bpm)
-    : ih_(ih), iid_(lower), upper_bound_(std::move(upper_bound)), bpm_(bpm) {
+IxScan::IxScan(const IxIndexHandle *ih, const Iid &lower, ScanUpperBound upper_bound, BufferPoolManager *bpm,
+               Transaction *txn)
+    : ih_(ih), iid_(lower), upper_bound_(std::move(upper_bound)), bpm_(bpm), txn_(txn) {
     ih_->active_accessors_.fetch_add(1);
     if (iid_.page_no == INVALID_PAGE_ID) {
         is_end_ = true;
@@ -67,6 +68,9 @@ bool IxScan::exceeds_upper_bound() const {
     return upper_bound_.inclusive ? (cmp > 0) : (cmp >= 0);
 }
 
+/**
+ * @description: IxScan类的核心方法，用于将扫描器移动到下一个有效记录的位置。该方法会跳过被标记为删除的节点以及不可见的记录，直到找到一个满足条件的记录或者扫描结束。
+ */
 void IxScan::advance_to_valid_record() {
     while (current_node_) {
         assert(current_node_->is_leaf_page());
@@ -96,6 +100,12 @@ void IxScan::advance_to_valid_record() {
             iid_ = Iid{INVALID_PAGE_ID, -1};
             is_end_ = true;
             return;
+        }
+
+        current_visibility_ = ih_->check_entry_visibility(*current_node_->get_rid(iid_.slot_no), txn_);
+        if (current_visibility_ == IndexVisibility::INVISIBLE) {
+            iid_.slot_no++;
+            continue;
         }
 
         is_end_ = false;

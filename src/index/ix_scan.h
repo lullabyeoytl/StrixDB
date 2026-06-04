@@ -25,9 +25,12 @@ class IxScan : public RecScan {
     std::unique_ptr<IxNodeHandle> current_node_;
     BufferPoolManager *bpm_;
     bool is_end_ = false;
+    Transaction *txn_ = nullptr;
+    IndexVisibility current_visibility_ = IndexVisibility::VISIBLE;
 
    public:
-    IxScan(const IxIndexHandle *ih, const Iid &lower, ScanUpperBound upper_bound, BufferPoolManager *bpm);
+    IxScan(const IxIndexHandle *ih, const Iid &lower, ScanUpperBound upper_bound, BufferPoolManager *bpm,
+           Transaction *txn = nullptr);
 
     ~IxScan() override;
 
@@ -40,6 +43,8 @@ class IxScan : public RecScan {
     const char *key() const;
 
     const Iid &iid() const { return iid_; }
+
+    IndexVisibility current_visibility() const { return current_visibility_; }
 
    private:
     void release_current();

@@ -56,14 +56,17 @@ class IndexScanExecutor : public AbstractExecutor {
     IndexMeta index_meta_;                      // index scan涉及到的索引元数据
     bool use_covering_index_ = false;
     std::vector<int> covered_key_offsets_;
+    std::vector<ColMeta> index_eval_cols_;
 
     Rid rid_;
     std::unique_ptr<RecScan> scan_;
+    std::unique_ptr<RmRecord> current_heap_record_;
 
     SmManager *sm_manager_;
 
     void set_end() {
         rid_ = Rid{-1, -1};
+        current_heap_record_.reset();
     }
 
     auto current_index_scan() const -> const IxScan * {
@@ -110,6 +113,14 @@ class IndexScanExecutor : public AbstractExecutor {
         return record;
     }
 
+    auto make_eval_record_from_index_key() const -> std::unique_ptr<RmRecord> {
+        const auto *ix_scan = current_index_scan();
+        const char *key = ix_scan->key();
+        auto record = std::make_unique<RmRecord>(index_meta_.col_tot_len);
+        memcpy(record->data, key, index_meta_.col_tot_len);
+        return record;
+    }
+
     auto project_visible_record(const RmRecord &heap_record) const -> std::unique_ptr<RmRecord> {
         if (!use_covering_index_) {
             return std::make_unique<RmRecord>(heap_record);
@@ -127,7 +138,6 @@ class IndexScanExecutor : public AbstractExecutor {
             context_->lock_mgr_->lock_shared_on_record(context_->txn_, rid, fh_->GetFd());
         }
         try {
-            // TODO： add index mvcc visibility and remove this part
             return fh_->get_record(rid, context_);
         } catch (const RecordNotFoundError &) {
             return nullptr;
@@ -146,10 +156,22 @@ class IndexScanExecutor : public AbstractExecutor {
 
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
-            auto heap_record = fetch_visible_heap_record(rid_);
-            if (heap_record != nullptr && evaluate_conditions(all_conds_, *heap_record, tab_.cols)) {
-                track_ssi_record_read(rid_, *heap_record);
-                return true;
+            auto *ix_scan = current_index_scan();
+            if (ix_scan->current_visibility() == IndexVisibility::VISIBLE) {
+                auto key_record = make_record_from_index_key();
+                auto eval_record = make_eval_record_from_index_key();
+                if (evaluate_conditions(residual_conds_, *eval_record, index_eval_cols_)) {
+                    track_ssi_record_read(rid_, *key_record);
+                    current_heap_record_.reset();
+                    return true;
+                }
+            } else {
+                auto heap_record = fetch_visible_heap_record(rid_);
+                if (heap_record != nullptr && evaluate_conditions(all_conds_, *heap_record, tab_.cols)) {
+                    track_ssi_record_read(rid_, *heap_record);
+                    current_heap_record_ = std::move(heap_record);
+                    return true;
+                }
             }
             scan_->next();
         }
@@ -175,6 +197,7 @@ class IndexScanExecutor : public AbstractExecutor {
             auto heap_record = fetch_visible_heap_record(rid_);
             if (heap_record != nullptr && evaluate_conditions(all_conds_, *heap_record, tab_.cols)) {
                 track_ssi_record_read(rid_, *heap_record);
+                current_heap_record_ = std::move(heap_record);
                 return;
             }
             scan_->next();
@@ -395,6 +418,13 @@ class IndexScanExecutor : public AbstractExecutor {
             cols_ = std::move(covered_cols);
             len_ = cols_.empty() ? 0 : cols_.back().offset + cols_.back().len;
             build_covered_key_offsets();
+            int eval_offset = 0;
+            index_eval_cols_.clear();
+            for (auto col : index_meta_.cols) {
+                col.offset = eval_offset;
+                eval_offset += col.len;
+                index_eval_cols_.push_back(std::move(col));
+            }
         }
 
         normalize_conds(index_lookup_conds_, tab_name_);
@@ -442,7 +472,8 @@ class IndexScanExecutor : public AbstractExecutor {
 
         }
 
-        scan_ = std::make_unique<IxScan>(ih, lower, std::move(upper_bound), sm_manager_->get_bpm());
+        scan_ = std::make_unique<IxScan>(ih, lower, std::move(upper_bound), sm_manager_->get_bpm(),
+                                         context_ == nullptr ? nullptr : context_->txn_);
         seek_to_next_valid();
     }
 
@@ -460,11 +491,17 @@ class IndexScanExecutor : public AbstractExecutor {
             return nullptr;
         }
         if (use_covering_index_) {
-            auto heap_record = fetch_visible_heap_record(rid_);
-            if (heap_record == nullptr) {
-                return nullptr;
+            auto *ix_scan = current_index_scan();
+            if (ix_scan->current_visibility() == IndexVisibility::VISIBLE) {
+                return make_record_from_index_key();
             }
+            auto heap_record = current_heap_record_ != nullptr ? std::move(current_heap_record_)
+                                                               : fetch_visible_heap_record(rid_);
+            if (heap_record == nullptr) return nullptr;
             return project_visible_record(*heap_record);
+        }
+        if (current_heap_record_ != nullptr) {
+            return std::move(current_heap_record_);
         }
         return fetch_visible_heap_record(rid_);
     }
