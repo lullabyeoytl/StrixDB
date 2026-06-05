@@ -42,6 +42,40 @@ auto format_show_index_record(const std::string &tab_name, const IndexMeta &inde
     return "| " + tab_name + " | " + format_index_unique(index.unique) + " | " + format_index_columns(index) + " |";
 }
 
+/**
+ * @brief: help class to flush all open files
+ */
+class StorageFlushService {
+   public:
+    explicit StorageFlushService(BufferPoolManager *buffer_pool_manager)
+        : buffer_pool_manager_(buffer_pool_manager) {}
+
+    bool Flush(const SmManager::StorageFiles &files) {
+        for (auto *fh : files.record_files) {
+            if (fh == nullptr) {
+                continue;
+            }
+            fh->flush_file_header();
+            if (!buffer_pool_manager_->flush_all_pages(fh->GetFd())) {
+                return false;
+            }
+        }
+        for (auto *ih : files.index_files) {
+            if (ih == nullptr) {
+                continue;
+            }
+            ih->flush_file_header();
+            if (!buffer_pool_manager_->flush_all_pages(ih->get_index_fd())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+   private:
+    BufferPoolManager *buffer_pool_manager_;
+};
+
 }  // namespace
 
 void SmManager::set_txn_mgr(TransactionManager *txn_mgr) {
@@ -72,6 +106,19 @@ std::string SmManager::fd_to_table_name(int fd) const {
         }
     }
     return {};
+}
+
+SmManager::StorageFiles SmManager::list_storage_files() const {
+    StorageFiles files;
+    files.record_files.reserve(fhs_.size());
+    for (const auto &entry : fhs_) {
+        files.record_files.push_back(entry.second.get());
+    }
+    files.index_files.reserve(ihs_.size());
+    for (const auto &entry : ihs_) {
+        files.index_files.push_back(entry.second.get());
+    }
+    return files;
 }
 
 /**
@@ -182,6 +229,15 @@ void SmManager::flush_meta() {
     // 默认清空文件
     std::ofstream ofs(DB_META_NAME);
     ofs << db_;
+}
+
+/**
+ * @description: flush all open files
+ */
+bool SmManager::flush_storage() {
+    flush_meta();
+    StorageFlushService flush_service(buffer_pool_manager_);
+    return flush_service.Flush(list_storage_files());
 }
 
 /**

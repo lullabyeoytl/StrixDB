@@ -450,7 +450,7 @@ bool BufferPoolManager::delete_page(PageId page_id) {
  * @description: 将buffer_pool中的所有页写回到磁盘
  * @param {int} fd 文件句柄
  */
- void BufferPoolManager::flush_all_pages(int fd) {
+ bool BufferPoolManager::flush_all_pages(int fd) {
       std::vector<PageId> pages_to_flush;
       std::string file_name = disk_manager_->get_file_name(fd);
       {
@@ -463,6 +463,9 @@ bool BufferPoolManager::delete_page(PageId page_id) {
           }
       }
       for (auto &page_id : pages_to_flush) {
-          flush_page(page_id);
+          if (!flush_page(page_id)) {
+              return false;
+          }
       }
+      return true;
   }

@@ -57,6 +57,7 @@ using timestamp_t = int64_t;  // timestamp type, used for transaction concurrenc
 
 // log file
 static const std::string LOG_FILE_NAME = "db.log";
+static const std::string DB_RESTART_NAME = "db.restart";
 
 // replacer
 static const std::string REPLACER_TYPE = "LRU";

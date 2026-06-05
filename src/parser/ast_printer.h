@@ -236,6 +236,8 @@ private:
             std::cout << "ABORT\n";
         } else if (auto x = std::dynamic_pointer_cast<TxnRollback>(node)) {
             std::cout << "ROLLBACK\n";
+        } else if (auto x = std::dynamic_pointer_cast<StaticCheckpoint>(node)) {
+            std::cout << "STATIC_CHECKPOINT\n";
         } else {
             assert(0);
         }

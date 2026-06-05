@@ -277,6 +277,13 @@ class IxIndexHandle : public NonCopyable {
 
     int get_index_fd() const { return fd_; }
 
+    void flush_file_header() const {
+        std::lock_guard<std::mutex> guard(file_hdr_latch_);
+        std::vector<char> data(file_hdr_->tot_len_);
+        file_hdr_->serialize(data.data());
+        disk_manager_->write_page(fd_, IX_FILE_HDR_PAGE, data.data(), file_hdr_->tot_len_);
+    }
+
     void set_txn_mgr(TransactionManager *txn_mgr) { txn_mgr_ = txn_mgr; }
 
     TransactionManager *get_txn_mgr() const { return txn_mgr_; }

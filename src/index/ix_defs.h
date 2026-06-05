@@ -35,10 +35,10 @@ enum class IxPageRecycleState : int {
     REUSABLE = 3,
 };
 
-enum class IndexVisibility {
-    VISIBLE,
-    INVISIBLE,
-    NEED_HEAP_CHECK,
+struct IndexVisibility {
+    bool matches_snapshot = true;   // 当前索引项是否直接匹配本事务快照
+    bool check_write_conflict = false;  // 若命中的是其他未提交事务的写入， 是否升级为谢谢冲突
+    bool allow_stale_index_entry = false;   //若这个索引想可能陈旧，是否允许继续回表合适，而不是立刻认定为整整命中
 };
 
 class IxPageHdr {

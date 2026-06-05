@@ -111,7 +111,7 @@ class BufferPoolManager: public NonCopyable {
 
     bool delete_page(PageId page_id);
 
-    void flush_all_pages(int fd);
+    bool flush_all_pages(int fd);
 
    private:
     bool find_victim_page(frame_id_t* frame_id);

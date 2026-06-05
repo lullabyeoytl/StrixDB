@@ -14,11 +14,26 @@ See the Mulan PSL v2 for more details. */
 #include <iostream>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
+#include "errors.h"
 #include "log_defs.h"
 #include "common/config.h"
 #include "common/noncopyable.h"
 #include "record/rm_defs.h"
+
+
+struct LogAppendResult {
+    lsn_t lsn = INVALID_LSN;
+    int offset = -1;
+
+    bool IsValid() const { return lsn != INVALID_LSN && offset >= 0; }
+};
+
+struct RestartRecord {
+    lsn_t checkpoint_lsn = INVALID_LSN;
+    int checkpoint_offset = -1;
+};
 
 /* 日志记录对应操作的类型 */
 enum LogType: int {
@@ -34,7 +49,8 @@ enum LogType: int {
     // CLR 永不undo， 需要redo
     CLR_INSERT,
     CLR_DELETE,
-    CLR_UPDATE
+    CLR_UPDATE,
+    CHECKPOINT
 };
 static std::string LogTypeStr[] = {
     "UPDATE",
@@ -45,7 +61,8 @@ static std::string LogTypeStr[] = {
     "ABORT",
     "CLR_INSERT",
     "CLR_DELETE",
-    "CLR_UPDATE"
+    "CLR_UPDATE",
+    "CHECKPOINT"
 };
 
 class LogRecord: public NonCopyable {
@@ -174,6 +191,87 @@ public:
     void format_print() override {
         printf("abort record\n");
         LogRecord::format_print();
+    }
+};
+
+/**
+ * @brief: checkpoint 日志记录
+ */
+class CheckpointLogRecord : public LogRecord {
+public:
+    // single entry in the active-transaction list
+    struct ActiveTxnEntry {
+        txn_id_t txn_id;
+        lsn_t last_lsn; // most recent lsn written by txn
+
+        friend auto operator==(const ActiveTxnEntry &lhs, const ActiveTxnEntry &rhs) {
+            return lhs.txn_id == rhs.txn_id && lhs.last_lsn == rhs.last_lsn;
+        }
+    };
+
+    CheckpointLogRecord() : LogRecord(LogType::CHECKPOINT) {}
+
+    explicit CheckpointLogRecord(std::vector<std::pair<txn_id_t, lsn_t>> active_txns)
+        : CheckpointLogRecord() {
+        active_txns_.reserve(active_txns.size());
+        for (const auto &[txn_id, last_lsn] : active_txns) {
+            active_txns_.push_back(ActiveTxnEntry{txn_id, last_lsn});
+        }
+        log_tot_len_ += sizeof(uint32_t) + active_txns_payload_size(active_txns_.size());
+    }
+
+    void serialize(char *dest) const override {
+        LogRecord::serialize(dest);
+        int offset = OFFSET_LOG_DATA;
+        uint32_t active_count = static_cast<uint32_t>(active_txns_.size());
+        memcpy(dest + offset, &active_count, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        for (const auto &entry : active_txns_) {
+            memcpy(dest + offset, &entry.txn_id, sizeof(txn_id_t));
+            offset += sizeof(txn_id_t);
+            memcpy(dest + offset, &entry.last_lsn, sizeof(lsn_t));
+            offset += sizeof(lsn_t);
+        }
+    }
+
+    void deserialize(const char *src) override {
+        LogRecord::deserialize(src);
+        active_txns_.clear();
+        if (log_tot_len_ < LOG_HEADER_SIZE + sizeof(uint32_t)) {
+            throw InternalError("checkpoint record is truncated");
+        }
+
+        uint32_t active_count = 0;
+        memcpy(&active_count, src + OFFSET_LOG_DATA, sizeof(active_count));
+        const uint32_t payload_bytes = log_tot_len_ - LOG_HEADER_SIZE - sizeof(uint32_t);
+        if (payload_bytes != active_txns_payload_size(active_count)) {
+            throw InternalError("checkpoint record active transaction payload length mismatch");
+        }
+
+        int offset = OFFSET_LOG_DATA + sizeof(uint32_t);
+        active_txns_.reserve(active_count);
+        for (uint32_t i = 0; i < active_count; ++i) {
+            txn_id_t txn_id = 0;
+            memcpy(&txn_id, src + offset, sizeof(txn_id));
+            offset += sizeof(txn_id_t);
+            lsn_t last_lsn = 0;
+            memcpy(&last_lsn, src + offset, sizeof(last_lsn));
+            offset += sizeof(lsn_t);
+            active_txns_.push_back(ActiveTxnEntry{txn_id, last_lsn});
+        }
+    }
+
+    void format_print() override {
+        printf("checkpoint record\n");
+        LogRecord::format_print();
+        printf("active_txn_count: %zu\n", active_txns_.size());
+    }
+
+    std::vector<ActiveTxnEntry> active_txns_;
+
+private:
+    static auto active_txns_payload_size(size_t active_count) -> uint32_t {
+        return static_cast<uint32_t>(active_count * (sizeof(txn_id_t) + sizeof(lsn_t)));
     }
 };
 
@@ -370,6 +468,7 @@ public:
     explicit LogManager(DiskManager* disk_manager);
 
     lsn_t add_log_to_buffer(LogRecord* log_record);
+    LogAppendResult add_log_to_buffer_with_result(LogRecord *log_record);
     void flush_log_to_disk();
     void flush_log_to_lsn(lsn_t target_lsn);
     lsn_t sync_global_lsn_with_disk();

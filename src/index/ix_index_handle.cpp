@@ -239,26 +239,26 @@ IxIndexHandle::~IxIndexHandle() {
 IndexVisibility IxIndexHandle::check_entry_visibility(const Rid &rid, Transaction *transaction) const {
     if (txn_mgr_ == nullptr || transaction == nullptr || table_fd_ < 0 ||
         !TransactionManager::IsMvccActive(transaction)) {
-        return IndexVisibility::VISIBLE;
+        return {};
     }
-
+    // no version link info -> visiable
     auto link = txn_mgr_->GetVersionLink(table_fd_, rid);
     if (!link.has_value()) {
-        return IndexVisibility::VISIBLE;
+        return {};
     }
-
+    
     if (link->in_progress_) {
         if (link->prev_.prev_txn_ == transaction->get_transaction_id()) {
-            return link->is_deleted_ ? IndexVisibility::INVISIBLE : IndexVisibility::VISIBLE;
+            return IndexVisibility{!link->is_deleted_, false, true};
         }
-        return IndexVisibility::NEED_HEAP_CHECK;
+        return IndexVisibility{true, true, true};
     }
-
+    // has committed
     if (link->ts_ != INVALID_TS && link->ts_ <= transaction->get_start_ts()) {
-        return link->is_deleted_ ? IndexVisibility::INVISIBLE : IndexVisibility::VISIBLE;
+        return IndexVisibility{!link->is_deleted_, false, true};
     }
 
-    return IndexVisibility::NEED_HEAP_CHECK;
+    return IndexVisibility{true, false, true};
 }
 
 /**
@@ -341,30 +341,36 @@ void IxIndexHandle::validate_unique_hit(const char *key, const Rid &hit, IndexVi
         return;
     }
 
-    if (visibility == IndexVisibility::INVISIBLE) {
+    if (!visibility.matches_snapshot) {
         return;
     }
 
-    if (visibility == IndexVisibility::NEED_HEAP_CHECK) {
-        if (!TransactionManager::IsMvccActive(transaction) || txn_mgr_ == nullptr || table_handle_ == nullptr ||
-            index_cols_.empty()) {
-            throw UniqueKeyViolationError();
-        }
+    if (!TransactionManager::IsMvccActive(transaction) || txn_mgr_ == nullptr || table_handle_ == nullptr ||
+        index_cols_.empty()) {
+        throw UniqueKeyViolationError();
+    }
+
+    if (visibility.check_write_conflict) {
         auto link = txn_mgr_->GetVersionLink(table_fd_, hit);
         if (link.has_value() && link->in_progress_ && link->prev_.prev_txn_ != transaction->get_transaction_id()) {
             throw TransactionAbortException(transaction->get_transaction_id(), AbortReason::WRITE_CONFLICT);
         }
-        try {
-            Context probe(nullptr, nullptr, transaction);
-            probe.txn_mgr_ = txn_mgr_;
-            auto record = table_handle_->get_record(hit, &probe);
-            auto current_key = build_key_from_record(index_cols_, *record);
-            if (ix_compare(current_key.data(), key, file_hdr_->col_types_, file_hdr_->col_lens_) != 0) {
-                return;
-            }
-        } catch (const RecordNotFoundError &) {
+    }
+
+    if (!visibility.allow_stale_index_entry) {
+        throw UniqueKeyViolationError();
+    }
+
+    try {
+        Context probe(nullptr, nullptr, transaction);
+        probe.txn_mgr_ = txn_mgr_;
+        auto record = table_handle_->get_record(hit, &probe);
+        auto current_key = build_key_from_record(index_cols_, *record);
+        if (ix_compare(current_key.data(), key, file_hdr_->col_types_, file_hdr_->col_lens_) != 0) {
             return;
         }
+    } catch (const RecordNotFoundError &) {
+        return;
     }
 
     throw UniqueKeyViolationError();

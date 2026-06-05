@@ -41,6 +41,9 @@ class InsertExecutor : public AbstractExecutor {
     };
 
     std::unique_ptr<RmRecord> NextImpl() override {
+        auto write_guard = context_ != nullptr && context_->txn_mgr_ != nullptr
+                               ? context_->txn_mgr_->write_txn_guard()
+                               : TransactionManager::WriteTxnGuard(nullptr);
         // Make record buffer
         RmRecord rec(fh_->get_file_hdr().record_size);
         for (size_t i = 0; i < values_.size(); i++) {

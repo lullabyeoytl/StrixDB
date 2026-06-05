@@ -64,6 +64,7 @@ int main() {
         "select a, count(*) from tb group by a having count(*) > 1 and a = 2 order by a asc, c desc;",
         "set transaction isolation level snapshot isolation;",
         "set transaction isolation level serializable;",
+        "create static_checkpoint;",
         "exit;",
         "help;",
         "",
@@ -82,6 +83,8 @@ int main() {
     }
     assert_parse_ok("set transaction isolation level snapshot isolation;", yyscanner);
     assert_parse_ok("set transaction isolation level serializable;", yyscanner);
+    assert_parse_ok("create static_checkpoint;", yyscanner);
+    assert_parse_rejected("create static_checkoint;", yyscanner);
     assert_parse_rejected("create unique index tb(a);", yyscanner);
     assert_parse_rejected("create table tb (a int unique, b float);", yyscanner);
     assert_parse_rejected("create table tb (a int, b int, unique(a, b));", yyscanner);

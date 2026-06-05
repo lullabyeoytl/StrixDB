@@ -9,9 +9,29 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include <cstring>
+#include <fstream>
 #include "log_manager.h"
 
-lsn_t next_lsn_from_disk(DiskManager *disk_manager) {
+namespace {
+
+bool read_restart_record(RestartRecord &record) {
+    std::ifstream restart(DB_RESTART_NAME, std::ios::binary);
+    if (!restart.is_open()) {
+        return false;
+    }
+
+    restart.read(reinterpret_cast<char *>(&record.checkpoint_lsn), sizeof(record.checkpoint_lsn));
+    if (restart.gcount() != static_cast<std::streamsize>(sizeof(record.checkpoint_lsn))) {
+        return false;
+    }
+    restart.read(reinterpret_cast<char *>(&record.checkpoint_offset), sizeof(record.checkpoint_offset));
+    if (restart.gcount() != 0 && restart.gcount() != static_cast<std::streamsize>(sizeof(record.checkpoint_offset))) {
+        return false;
+    }
+    return record.checkpoint_lsn != INVALID_LSN;
+}
+
+lsn_t next_lsn_from_disk(DiskManager *disk_manager, int start_offset) {
     int log_size = disk_manager->get_file_size(LOG_FILE_NAME);
     if (log_size <= 0) {
         return 0;
@@ -19,7 +39,7 @@ lsn_t next_lsn_from_disk(DiskManager *disk_manager) {
 
     char header_buffer[LOG_HEADER_SIZE];
     lsn_t max_lsn = INVALID_LSN;
-    int offset = 0;
+    int offset = start_offset;
     while (offset < log_size) {
         int bytes = disk_manager->read_log(header_buffer, LOG_HEADER_SIZE, offset);
         if (bytes < LOG_HEADER_SIZE) {
@@ -35,6 +55,46 @@ lsn_t next_lsn_from_disk(DiskManager *disk_manager) {
     }
     return max_lsn + 1;
 }
+
+lsn_t next_lsn_from_checkpoint_tail(DiskManager *disk_manager) {
+    RestartRecord restart_record;
+    if (!read_restart_record(restart_record) || restart_record.checkpoint_offset < 0) {
+        return INVALID_LSN;
+    }
+
+    int log_size = disk_manager->get_file_size(LOG_FILE_NAME);
+    if (restart_record.checkpoint_offset >= log_size) {
+        return INVALID_LSN;
+    }
+
+    char header_buffer[LOG_HEADER_SIZE];
+    int bytes = disk_manager->read_log(header_buffer, LOG_HEADER_SIZE, restart_record.checkpoint_offset);
+    if (bytes < LOG_HEADER_SIZE) {
+        return INVALID_LSN;
+    }
+
+    LogRecord checkpoint_header;
+    checkpoint_header.deserialize(header_buffer);
+    if (checkpoint_header.log_type_ != LogType::CHECKPOINT ||
+        checkpoint_header.lsn_ != restart_record.checkpoint_lsn ||
+        checkpoint_header.log_tot_len_ == 0 ||
+        restart_record.checkpoint_offset + static_cast<int>(checkpoint_header.log_tot_len_) > log_size) {
+        return INVALID_LSN;
+    }
+
+    lsn_t tail_next_lsn = next_lsn_from_disk(disk_manager, restart_record.checkpoint_offset);
+    return std::max(tail_next_lsn, restart_record.checkpoint_lsn + 1);
+}
+
+lsn_t next_lsn_from_disk(DiskManager *disk_manager) {
+    lsn_t checkpoint_tail_next_lsn = next_lsn_from_checkpoint_tail(disk_manager);
+    if (checkpoint_tail_next_lsn != INVALID_LSN) {
+        return checkpoint_tail_next_lsn;
+    }
+    return next_lsn_from_disk(disk_manager, 0);
+}
+
+}  // namespace
 
 LogManager::LogManager(DiskManager* disk_manager)
     : written_lsn_(INVALID_LSN), persist_lsn_(INVALID_LSN), disk_manager_(disk_manager) {
@@ -58,21 +118,28 @@ lsn_t LogManager::sync_global_lsn_with_disk() {
  * @return {lsn_t} 返回该日志的日志记录号
  */
 lsn_t LogManager::add_log_to_buffer(LogRecord* log_record) {
+    return add_log_to_buffer_with_result(log_record).lsn;
+}
+
+LogAppendResult LogManager::add_log_to_buffer_with_result(LogRecord *log_record) {
     std::lock_guard<std::mutex> lock(latch_);
     if (log_record == nullptr) {
-        return INVALID_LSN;
+        return {};
     }
     // 拒绝单条超过缓冲区大小的日志记录，防止溢出
     if (log_record->log_tot_len_ > LOG_BUFFER_SIZE) {
-        return INVALID_LSN;
+        return {};
     }
     if (log_buffer_.is_full(log_record->log_tot_len_)) {
         flush_buffer_to_disk();
     }
+    LogAppendResult result;
+    result.offset = disk_manager_->get_file_size(LOG_FILE_NAME) + log_buffer_.offset_;
     log_record->lsn_ = global_lsn_++;
+    result.lsn = log_record->lsn_;
     log_record->serialize(log_buffer_.buffer_ + log_buffer_.offset_);
     log_buffer_.offset_ += static_cast<int>(log_record->log_tot_len_);
-    return log_record->lsn_;
+    return result;
 }
 
 void LogManager::flush_buffer_to_disk() {

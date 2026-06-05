@@ -91,10 +91,10 @@ class PageLatch {
    private:
     std::shared_mutex latch_;
 
-#ifndef NDEBUG
+    // Keep these members present in every build so Page has one layout even
+    // when different translation units disagree about NDEBUG.
     std::mutex debug_latch_;
     std::atomic_bool exclusive_locked_ = false;
     std::thread::id exclusive_owner_{};
     std::unordered_map<std::thread::id, size_t> shared_holders_;
-#endif
 };

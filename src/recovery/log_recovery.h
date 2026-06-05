@@ -12,10 +12,20 @@ See the Mulan PSL v2 for more details. */
 
 #include <map>
 #include <unordered_map>
-#include <unordered_set>
 #include "log_manager.h"
 #include "storage/disk_manager.h"
 #include "system/sm_manager.h"
+
+enum class RecoveredTxnState {
+    RUNNING,
+    COMMITTED,
+    ABORTED,
+};
+
+struct RecoveredTxnEntry {
+    RecoveredTxnState state = RecoveredTxnState::RUNNING;
+    lsn_t last_lsn = INVALID_LSN;
+};
 
 class RecoveryManager {
 public:
@@ -33,7 +43,7 @@ private:
     DiskManager* disk_manager_;                                     // 用来读写文件
     BufferPoolManager* buffer_pool_manager_;                        // 对页面进行读写
     SmManager* sm_manager_;                                         // 访问数据库元数据
-    std::unordered_set<txn_id_t> winner_set_;                       // transaction committed, only for analyze now      
-    std::unordered_set<txn_id_t> loser_set_;                        // transaction not finished
-    std::unordered_map<txn_id_t, lsn_t> last_lsn_;                  // last lsn of the transaction
+    std::unordered_map<txn_id_t, RecoveredTxnEntry> txn_table_;     // 事务恢复表
+    int scan_start_offset_ = 0;                                     // checkpoint之后扫描起点
+    int checkpoint_record_offset_ = -1;                             // checkpoint记录在WAL的位置 
 };

@@ -84,6 +84,7 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "SET" { return SET; }
 "SELECT" { return SELECT; }
 "SERIALIZABLE" { return SERIALIZABLE; }
+"STATIC_CHECKPOINT" { return STATIC_CHECKPOINT; }
 "INT" { return INT; }
 "CHAR" { return CHAR; }
 "FLOAT" { return FLOAT; }

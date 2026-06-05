@@ -98,6 +98,9 @@ class UpdateExecutor : public AbstractExecutor {
      */
     void apply_row_update(const PreparedIndexState &state, const Rid &rid, const RmRecord &old_rec,
                           const RmRecord &new_rec, const std::vector<std::vector<Rid>> *ignored_rids_by_index) {
+        auto write_guard = context_ != nullptr && context_->txn_mgr_ != nullptr
+                               ? context_->txn_mgr_->write_txn_guard()
+                               : TransactionManager::WriteTxnGuard(nullptr);
         if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
             context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd());
         }

@@ -16,6 +16,8 @@ See the Mulan PSL v2 for more details. */
 #include <functional>
 #include <shared_mutex>
 #include <memory>
+#include <utility>
+#include <vector>
 
 #include "transaction.h"
 #include "watermark.h"
@@ -80,6 +82,8 @@ public:
     void commit(Transaction* txn, LogManager* log_manager);
 
     void abort(Transaction* txn, LogManager* log_manager);
+
+    lsn_t create_static_checkpoint(LogManager *log_manager);
 
     LockManager* get_lock_manager() { return lock_manager_; }
 
@@ -160,6 +164,22 @@ public:
 
     /** @brief 垃圾回收。仅在所有事务都未访问时调用。 */
     void GarbageCollection();
+
+    class WriteTxnGuard {
+       public:
+        explicit WriteTxnGuard(TransactionManager *txn_mgr) {
+            if (txn_mgr != nullptr) {
+                checkpoint_guard_ = std::shared_lock<std::shared_mutex>(txn_mgr->checkpoint_mutex_);
+            }
+        }
+
+       private:
+        std::shared_lock<std::shared_mutex> checkpoint_guard_;
+    };
+
+    WriteTxnGuard write_txn_guard() {
+        return WriteTxnGuard(this);
+    }
     
     struct PageVersionInfo {
         std::shared_mutex mutex_;
@@ -202,6 +222,7 @@ public:
 private:
     std::atomic<txn_id_t> next_txn_id_{0};  // 用于分发事务ID
     std::atomic<timestamp_t> next_timestamp_{0};    // 用于分发事务时间戳
+    std::shared_mutex checkpoint_mutex_;
     std::shared_mutex txn_map_mutex_;  // 保护 txn_map 的并发访问
     std::mutex watermark_mutex_;       // 保护 running_txns_ 的并发访问
     SmManager *sm_manager_;

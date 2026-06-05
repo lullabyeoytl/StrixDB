@@ -43,6 +43,11 @@ class SmManager {
     TransactionManager *txn_mgr_ = nullptr;
 
    public:
+    struct StorageFiles {
+        std::vector<RmFileHandle *> record_files;
+        std::vector<IxIndexHandle *> index_files;
+    };
+
     SmManager(DiskManager* disk_manager, BufferPoolManager* buffer_pool_manager, RmManager* rm_manager,
               IxManager* ix_manager)
         : disk_manager_(disk_manager),
@@ -62,6 +67,8 @@ class SmManager {
 
     std::string fd_to_table_name(int fd) const;
 
+    StorageFiles list_storage_files() const;
+
     IxIndexHandle *get_ih(const std::string &tab_name, const std::vector<ColMeta> &cols) {
         return ihs_.at(ix_manager_->get_index_name(tab_name, cols)).get();
     }
@@ -75,6 +82,8 @@ class SmManager {
     void open_db(const std::string& db_name);
 
     void close_db();
+
+    bool flush_storage();
 
     void flush_meta();
 

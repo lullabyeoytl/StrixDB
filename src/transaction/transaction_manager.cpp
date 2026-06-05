@@ -10,7 +10,11 @@ See the Mulan PSL v2 for more details. */
 
 #include "transaction_manager.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -23,6 +27,74 @@ See the Mulan PSL v2 for more details. */
 
 
 namespace {
+void close_fd_or_throw(int fd) {
+    if (close(fd) < 0) {
+        throw UnixError();
+    }
+}
+
+void sync_fd_or_throw(int fd) {
+    while (fdatasync(fd) < 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        throw UnixError();
+    }
+}
+
+void sync_current_directory() {
+    int dir_fd = open(".", O_RDONLY | O_DIRECTORY);
+    if (dir_fd < 0) {
+        throw UnixError();
+    }
+    try {
+        sync_fd_or_throw(dir_fd);
+        close_fd_or_throw(dir_fd);
+    } catch (...) {
+        close(dir_fd);
+        throw;
+    }
+}
+
+void write_restart_file(const RestartRecord &record) {
+    const std::string temp_path = DB_RESTART_NAME + ".tmp";
+    int fd = open(temp_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        throw UnixError();
+    }
+
+    const char *data = reinterpret_cast<const char *>(&record);
+    try {
+        int written = 0;
+        while (written < static_cast<int>(sizeof(record))) {
+            ssize_t bytes = write(fd, data + written, sizeof(record) - written);
+            if (bytes < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                throw UnixError();
+            }
+            if (bytes == 0) {
+                throw UnixError();
+            }
+            written += static_cast<int>(bytes);
+        }
+
+        sync_fd_or_throw(fd);
+        close_fd_or_throw(fd);
+    } catch (...) {
+        close(fd);
+        unlink(temp_path.c_str());
+        throw;
+    }
+
+    if (rename(temp_path.c_str(), DB_RESTART_NAME.c_str()) < 0) {
+        unlink(temp_path.c_str());
+        throw UnixError();
+    }
+    sync_current_directory();
+}
+
 //--------------------------------------------------------------------------
 // Timestamp / transaction ID utilities
 //--------------------------------------------------------------------------
@@ -230,6 +302,7 @@ void TransactionManager::RemoveTransactionLocked(txn_id_t txn_id,
  */
 Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manager,
                                        IsolationLevel isolation_level) {
+    auto write_guard = write_txn_guard();
     // 1. 创建新事务（忽略传入的 txn 参数，始终由 Manager 管理所有权）
     // 2. 把开始事务加入到全局事务表中
     // 3. 返回当前事务指针
@@ -270,6 +343,7 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
  * @param {LogManager*} log_manager 日志管理器指针
  */
 void TransactionManager::commit(Transaction *txn, LogManager *log_manager) {
+    auto write_guard = write_txn_guard();
     // 1. 如果存在未提交的写操作，提交所有的写操作
     // 2. 释放所有锁
     // 3. 释放事务相关资源，eg.锁集
@@ -396,6 +470,7 @@ void delete_stale_mvcc_index_entries(SmManager *sm_manager, const std::string &t
  * @param {LogManager} *log_manager 日志管理器指针
  */
 void TransactionManager::abort(Transaction *txn, LogManager *log_manager) {
+    auto write_guard = write_txn_guard();
     // 1. 回滚所有写操作
     // 2. 释放所有锁
     // 3. 清空事务相关资源，eg.锁集
@@ -501,6 +576,47 @@ void TransactionManager::abort(Transaction *txn, LogManager *log_manager) {
         RemoveTransactionLocked(txn_id, &released_txns);
     }
     GarbageCollection();
+}
+
+lsn_t TransactionManager::create_static_checkpoint(LogManager *log_manager) {
+    std::unique_lock<std::shared_mutex> checkpoint_lock(checkpoint_mutex_);
+    if (log_manager == nullptr || sm_manager_ == nullptr) {
+        return INVALID_LSN;
+    }
+
+    //  step1: scan all txn which not finished
+    std::vector<std::pair<txn_id_t, lsn_t>> active_txns;
+    {
+        std::shared_lock<std::shared_mutex> txn_lock(txn_map_mutex_);
+        active_txns.reserve(txn_map.size());
+        for (auto &[txn_id, entry] : txn_map) {
+            Transaction *txn = entry.Get();
+            if (txn == nullptr) {
+                continue;
+            }
+            TransactionState state = txn->get_state();
+            if (state == TransactionState::COMMITTED || state == TransactionState::ABORTED) {
+                continue;
+            }
+            active_txns.emplace_back(txn_id, txn->get_prev_lsn());
+        }
+    }
+
+    // step 2: record checkpoint
+    CheckpointLogRecord checkpoint(active_txns);
+    LogAppendResult checkpoint_append = log_manager->add_log_to_buffer_with_result(&checkpoint);
+    if (!checkpoint_append.IsValid()) {
+        throw InternalError("checkpoint log record is too large");
+    }
+    log_manager->flush_log_to_disk();
+
+    if (!sm_manager_->flush_storage()) {
+        throw InternalError("checkpoint storage flush failed");
+    }
+
+    write_restart_file(RestartRecord{checkpoint_append.lsn, checkpoint_append.offset});
+
+    return checkpoint_append.lsn;
 }
 
 //--------------------------------------------------------------------------
