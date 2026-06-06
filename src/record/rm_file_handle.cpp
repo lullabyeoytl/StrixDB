@@ -34,6 +34,7 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
         buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
     }
     if (context != nullptr && context->txn_mgr_ != nullptr && context->txn_ != nullptr) {
+        context->txn_mgr_->TrackReadTable(fd_, context->txn_);
         auto visible = context->txn_mgr_->GetVisibleRecord(fd_, rid, *record, context->txn_);
         if (visible == nullptr) {
             throw RecordNotFoundError(rid.page_no, rid.slot_no);

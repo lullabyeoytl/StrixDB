@@ -170,6 +170,16 @@ class Transaction: public NonCopyable {
 
     inline timestamp_t get_commit_ts() const { return commit_ts_; }
 
+    inline void AddReadTableFd(int fd) {
+        std::scoped_lock<std::mutex> lck(latch_);
+        read_table_fds_.insert(fd);
+    }
+
+    inline std::set<int> GetReadTableFds() const {
+        std::scoped_lock<std::mutex> lck(latch_);
+        return read_table_fds_;
+    }
+
     /** 修改现有的撤销日志 */
     inline auto ModifyUndoLog(int log_idx, UndoLog new_log) {
         std::scoped_lock<std::mutex> lck(latch_);
@@ -226,7 +236,6 @@ class Transaction: public NonCopyable {
         std::scoped_lock<std::mutex> lck(latch_);
         return write_set_records_;
       }
-      
     inline bool AddRwDependencyIn(txn_id_t other_txn, std::string reason) {
         std::scoped_lock<std::mutex> lck(latch_);
         return in_edges_[other_txn].insert(SsiDependencyEdge{other_txn, std::move(reason)}).second;
@@ -288,6 +297,7 @@ class Transaction: public NonCopyable {
   * 其他撤销日志/表堆将存储 (txn_id, index) 对，因此只能向此vector中追加内容或就地更新内容，而不能删除任何内容。
   */
   std::vector<UndoLog> undo_logs_;
+  std::set<int> read_table_fds_;
   std::set<SsiRecordRead> record_read_set_;
   std::vector<SsiPredicateRead> predicate_read_set_;
   std::vector<SsiWriteRecord> write_set_records_;

@@ -15,9 +15,12 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <thread>
+#include <unordered_set>
 #include <utility>
 
 #include "common/common.h"
@@ -154,6 +157,37 @@ auto ssi_write_matches_conditions(const TabMeta &tab, const SsiWriteRecord &writ
     return write.has_new_record_ && evaluate_conditions(conditions, write.new_record_, tab.cols);
 }
 
+//--------------------------------------------------------------------------
+// GC helper functions
+//--------------------------------------------------------------------------
+
+auto gc_version_safe_to_reclaim(const VersionUndoLink &version, timestamp_t watermark,
+                                bool has_active_readers) -> bool {
+    if (version.in_progress_) {
+        return false;
+    }
+    if (version.ts_ == INVALID_TS) {
+        return false;
+    }
+    if (!has_active_readers) {
+        return true;
+    }
+    return version.ts_ < watermark;
+}
+
+void collect_referenced_txns_from_chain(const VersionUndoLink &version, std::unordered_set<txn_id_t> *referenced_txns,
+                                        TransactionManager *txn_manager) {
+    UndoLink undo_link = version.prev_;
+    while (undo_link.IsValid()) {
+        referenced_txns->insert(undo_link.prev_txn_);
+        auto undo_log = txn_manager->GetUndoLogOptional(undo_link);
+        if (!undo_log.has_value()) {
+            break;
+        }
+        undo_link = undo_log->prev_version_;
+    }
+}
+
 }  // namespace
 
 //--------------------------------------------------------------------------
@@ -182,7 +216,7 @@ void release_locks(Transaction *txn, LockManager *lock_manager) {
 // File handle, index, and CLR helpers
 //--------------------------------------------------------------------------
 
-auto find_table_by_fd(SmManager *sm_manager, int fd) -> std::pair<std::string, RmFileHandle *> {
+auto find_table_by_fd_unlocked(SmManager *sm_manager, int fd) -> std::pair<std::string, RmFileHandle *> {
     if (sm_manager == nullptr) {
         return {std::string(), nullptr};
     }
@@ -255,6 +289,82 @@ void append_txn_clr(Transaction *txn, LogManager *log_manager, ClrRecord &clr, L
 //--------------------------------------------------------------------------
 
 TransactionManager::~TransactionManager() {
+    StopGarbageCollectionWorker();
+}
+
+void TransactionManager::StartGarbageCollectionWorker() {
+    gc_worker_ = std::thread(&TransactionManager::GarbageCollectionWorkerLoop, this);
+}
+
+void TransactionManager::StopGarbageCollectionWorker() {
+    {
+        std::lock_guard<std::mutex> lock(gc_worker_mutex_);
+        gc_worker_stop_ = true;
+    }
+    gc_worker_cv_.notify_all();
+    if (gc_worker_.joinable()) {
+        gc_worker_.join();
+    }
+}
+
+bool TransactionManager::IsGarbageCollectionWorkerStopped() {
+    std::lock_guard<std::mutex> lock(gc_worker_mutex_);
+    return gc_worker_stop_ && !gc_worker_.joinable();
+}
+
+TransactionManager::GarbageCollectionStats TransactionManager::GetGarbageCollectionStats() {
+    GarbageCollectionStats stats;
+    stats.requests = gc_counters_.requests.load(std::memory_order_acquire);
+    stats.attempts = gc_counters_.attempts.load(std::memory_order_acquire);
+    stats.worker_wakeups = gc_counters_.worker_wakeups.load(std::memory_order_acquire);
+    stats.reclaimed_versions = gc_counters_.reclaimed_versions.load(std::memory_order_acquire);
+    stats.stale_index_deletes = gc_counters_.stale_index_deletes.load(std::memory_order_acquire);
+    stats.physical_deletes = gc_counters_.physical_deletes.load(std::memory_order_acquire);
+    stats.retained_txn_releases = gc_counters_.retained_txn_releases.load(std::memory_order_acquire);
+    stats.throttle_waits = gc_counters_.throttle_waits.load(std::memory_order_acquire);
+    stats.worker_exits = gc_counters_.worker_exits.load(std::memory_order_acquire);
+    {
+        std::lock_guard<std::mutex> lock(gc_worker_mutex_);
+        stats.pending_requests = gc_counters_.pending_requests;
+    }
+    return stats;
+}
+
+// just request, add to pending count and wake up worker if needed
+void TransactionManager::RequestGarbageCollection() {
+    gc_counters_.requests.fetch_add(1, std::memory_order_acq_rel);
+    bool notify_worker = false;
+    {
+        std::lock_guard<std::mutex> lock(gc_worker_mutex_);
+        ++gc_counters_.pending_requests;
+        notify_worker = gc_counters_.pending_requests >= kGarbageCollectionRequestThreshold;
+    }
+    if (notify_worker) {
+        gc_worker_cv_.notify_one();
+    }
+}
+
+void TransactionManager::GarbageCollectionWorkerLoop() {
+    std::unique_lock<std::mutex> lock(gc_worker_mutex_);
+    while (!gc_worker_stop_) {
+        if (gc_counters_.pending_requests == 0) {
+            gc_worker_cv_.wait_for(lock, std::chrono::milliseconds(kGarbageCollectionWorkerIntervalMs), [&] {
+                return gc_worker_stop_ || gc_counters_.pending_requests >= kGarbageCollectionRequestThreshold;
+            });
+        }
+        if (gc_worker_stop_) {
+            break;
+        }
+        if (gc_counters_.pending_requests == 0) {
+            continue;
+        }
+        gc_counters_.pending_requests = 0;
+        gc_counters_.worker_wakeups.fetch_add(1, std::memory_order_acq_rel);
+        lock.unlock();
+        RunGarbageCollection(true);
+        lock.lock();
+    }
+    gc_counters_.worker_exits.fetch_add(1, std::memory_order_acq_rel);
 }
 
 Transaction *TransactionManager::GetTransactionLocked(txn_id_t txn_id) {
@@ -310,11 +420,10 @@ Transaction * TransactionManager::begin(Transaction* txn, LogManager* log_manage
     txn = owned.get();
     txn->set_state(TransactionState::GROWING);
     txn->set_isolation_level(isolation_level);
-    timestamp_t start_ts = last_commit_ts_.load(std::memory_order_acquire);
-    txn->set_start_ts(start_ts);
     {
         std::lock_guard<std::mutex> wm_lock(watermark_mutex_);
-        // 注册到水线追踪器
+        timestamp_t start_ts = last_commit_ts_.load(std::memory_order_acquire);
+        txn->set_start_ts(start_ts);
         running_txns_.AddTxn(start_ts);
     }
     {
@@ -383,12 +492,14 @@ void TransactionManager::commit(Transaction *txn, LogManager *log_manager) {
         // for all write records set version link head to committed
         for (auto *write_record : *txn->get_write_set()) {
             const auto &tab_name = write_record->GetTableName();
+            auto metadata_lock = sm_manager_->LockMetadataShared();
             auto fh_it = sm_manager_->fhs_.find(tab_name);
             if (fh_it == sm_manager_->fhs_.end()) {
                 continue;
             }
-            CommitVersionLink(fh_it->second->GetFd(), write_record->GetRid(),
-                              txn_id, commit_ts,
+            int table_fd = fh_it->second->GetFd();
+            metadata_lock.unlock();
+            CommitVersionLink(table_fd, write_record->GetRid(), txn_id, commit_ts,
                               write_record->GetWriteType() == WType::DELETE_TUPLE);
         }
     }
@@ -414,7 +525,7 @@ void TransactionManager::commit(Transaction *txn, LogManager *log_manager) {
     if (!retain_txn) {
         delete_write_set(txn);
     }
-    GarbageCollection();
+    RequestGarbageCollection();
 }
 
 //--------------------------------------------------------------------------
@@ -492,6 +603,7 @@ void TransactionManager::abort(Transaction *txn, LogManager *log_manager) {
         WriteRecord *write_record = *it;
         try {
             const std::string &tab_name = write_record->GetTableName();
+            auto metadata_lock = sm_manager_->LockMetadataShared();
             auto fh_it = sm_manager_->fhs_.find(tab_name);
             if (fh_it == sm_manager_->fhs_.end()) {
                 continue;
@@ -575,7 +687,7 @@ void TransactionManager::abort(Transaction *txn, LogManager *log_manager) {
         std::unique_lock<std::shared_mutex> txn_lock(txn_map_mutex_);
         RemoveTransactionLocked(txn_id, &released_txns);
     }
-    GarbageCollection();
+    RequestGarbageCollection();
 }
 
 lsn_t TransactionManager::create_static_checkpoint(LogManager *log_manager) {
@@ -798,6 +910,13 @@ void TransactionManager::CheckWriteConflict(int fd, const Rid &rid, Transaction 
     }
 }
 
+void TransactionManager::TrackReadTable(int fd, Transaction *txn) {
+    if (!IsMvccActive(txn)) {
+        return;
+    }
+    txn->AddReadTableFd(fd);
+}
+
 //--------------------------------------------------------------------------
 // Serializable Snapshot Isolation (SSI) — Conflict Detection
 //--------------------------------------------------------------------------
@@ -812,7 +931,11 @@ void TransactionManager::TrackSsiPredicateRead(const std::string &table_name,
     }
     txn->AddPredicateRead(table_name, conditions);
 
-    TabMeta &tab = sm_manager_->db_.get_table(table_name);
+    TabMeta tab;
+    {
+        auto metadata_lock = sm_manager_->LockMetadataShared();
+        tab = sm_manager_->db_.get_table(table_name);
+    }
     {
         std::shared_lock<std::shared_mutex> lock(txn_map_mutex_);
         ForEachTransactionLocked([&](Transaction *writer) {
@@ -843,7 +966,11 @@ void TransactionManager::TrackSsiRecordRead(const std::string &table_name, const
     }
     
     txn->AddRecordRead(table_name, rid);
-    TabMeta &tab = sm_manager_->db_.get_table(table_name);
+    TabMeta tab;
+    {
+        auto metadata_lock = sm_manager_->LockMetadataShared();
+        tab = sm_manager_->db_.get_table(table_name);
+    }
 
     {
         std::shared_lock<std::shared_mutex> lock(txn_map_mutex_);
@@ -886,7 +1013,11 @@ void TransactionManager::TrackSsiWrite(const std::string &table_name, const Rid 
     }
     txn->AddSsiWriteSetRecord(table_name, rid, *stored_old, *stored_new, old_record != nullptr, new_record != nullptr);
 
-    TabMeta &tab = sm_manager_->db_.get_table(table_name);
+    TabMeta tab;
+    {
+        auto metadata_lock = sm_manager_->LockMetadataShared();
+        tab = sm_manager_->db_.get_table(table_name);
+    }
     {
         std::shared_lock<std::shared_mutex> lock(txn_map_mutex_);
         ForEachTransactionLocked([&](Transaction *reader) {
@@ -1153,18 +1284,21 @@ void TransactionManager::CleanupTransaction(Transaction *txn) {
     }
     for (auto *write_record : *txn->get_write_set()) {
         const auto &tab_name = write_record->GetTableName();
+        auto metadata_lock = sm_manager_->LockMetadataShared();
         auto fh_it = sm_manager_->fhs_.find(tab_name);
         if (fh_it == sm_manager_->fhs_.end()) {
             continue;
         }
-        auto link = GetVersionLink(fh_it->second->GetFd(), write_record->GetRid());
+        int table_fd = fh_it->second->GetFd();
+        metadata_lock.unlock();
+        auto link = GetVersionLink(table_fd, write_record->GetRid());
         if (link.has_value() && link->prev_.prev_txn_ == txn->get_transaction_id()) {
             auto undo_log = txn->GetUndoLog(link->prev_.prev_log_idx_);
             std::optional<VersionUndoLink> restored = std::nullopt;
             if (undo_log.ts_ != make_txn_write_ts(txn) && undo_log.ts_ != 0) {
                 restored = VersionUndoLink{undo_log.prev_version_, false, undo_log.ts_, undo_log.is_deleted_};
             }
-            UpdateVersionLink(fh_it->second->GetFd(), write_record->GetRid(), restored);
+            UpdateVersionLink(table_fd, write_record->GetRid(), restored);
         }
     }
     {
@@ -1187,18 +1321,29 @@ timestamp_t TransactionManager::GetWatermark() {
 // GarbageCollection  — reclaim version info and physical space
 //--------------------------------------------------------------------------
 void TransactionManager::GarbageCollection() {
+    RunGarbageCollection(false);
+}
+
+void TransactionManager::RunGarbageCollection(bool apply_throttle) {
     std::vector<GcDeleteRecord> deleted_records;
     std::vector<GcVersionRecord> reclaimed_versions;
     std::vector<std::unique_ptr<Transaction>> released_txns;
+    gc_counters_.attempts.fetch_add(1, std::memory_order_acq_rel);
 
-    // Version and index reclamation requires an empty active-reader set.
-    std::lock_guard<std::mutex> wm_lock(watermark_mutex_);
-    if (!running_txns_.current_reads_.empty()) {
-        return;
-    }
+    timestamp_t watermark = INVALID_TS;
+    bool has_active_readers = false;
+    auto refresh_reader_snapshot = [&] {
+        watermark = running_txns_.GetWatermark();
+        has_active_readers = !running_txns_.current_reads_.empty();
+    };
 
     // Committed version heads are detached under version-info locks.
     {
+        std::lock_guard<std::mutex> wm_lock(watermark_mutex_);
+        refresh_reader_snapshot();
+        if (watermark == INVALID_TS) {
+            return;
+        }
         std::unique_lock<std::shared_mutex> table_lock(version_info_mutex_);
         for (auto page_it = version_info_.begin(); page_it != version_info_.end();) {
             auto page_info = page_it->second;
@@ -1206,7 +1351,7 @@ void TransactionManager::GarbageCollection() {
                 std::unique_lock<std::shared_mutex> page_lock(page_info->mutex_);
                 for (auto slot_it = page_info->prev_version_.begin(); slot_it != page_info->prev_version_.end();) {
                     const auto &version = slot_it->second;
-                    if (version.in_progress_) {
+                    if (!gc_version_safe_to_reclaim(version, watermark, has_active_readers)) {
                         ++slot_it;
                         continue;
                     }
@@ -1222,19 +1367,41 @@ void TransactionManager::GarbageCollection() {
             }
         }
     }
+    gc_counters_.reclaimed_versions.fetch_add(reclaimed_versions.size(), std::memory_order_acq_rel);
+
+    uint64_t work_budget = 0;
+    auto maybe_throttle = [&] {
+        if (!apply_throttle || kGarbageCollectionWorkBudget == 0 || work_budget < kGarbageCollectionWorkBudget) {
+            return;
+        }
+        work_budget = 0;
+        gc_counters_.throttle_waits.fetch_add(1, std::memory_order_acq_rel);
+        std::this_thread::sleep_for(std::chrono::milliseconds(kGarbageCollectionThrottleMs));
+    };
+
+    for (size_t i = 0; i < reclaimed_versions.size(); ++i) {
+        ++work_budget;
+        maybe_throttle();
+    }
 
     // Undo records identify obsolete index keys that no active snapshot can require.
     std::vector<GcStaleIndexRecord> stale_index_records;
     for (const auto &entry : reclaimed_versions) {
-        auto [tab_name, fh] = find_table_by_fd(sm_manager_, entry.fd);
-        if (fh == nullptr) {
-            continue;
-        }
-
         std::unique_ptr<RmRecord> current_record;
-        try {
-            current_record = fh->get_record_no_mvcc(entry.rid);
-        } catch (const RecordNotFoundError &) {
+        {
+            if (sm_manager_ == nullptr) {
+                continue;
+            }
+            auto metadata_lock = sm_manager_->LockMetadataShared();
+            auto [tab_name, fh] = find_table_by_fd_unlocked(sm_manager_, entry.fd);
+            if (fh == nullptr) {
+                continue;
+            }
+
+            try {
+                current_record = fh->get_record_no_mvcc(entry.rid);
+            } catch (const RecordNotFoundError &) {
+            }
         }
 
         if (entry.version.is_deleted_) {
@@ -1261,7 +1428,11 @@ void TransactionManager::GarbageCollection() {
 
     // Obsolete index entries are removed before any heap slot is physically freed.
     for (const auto &entry : stale_index_records) {
-        auto [tab_name, fh] = find_table_by_fd(sm_manager_, entry.fd);
+        if (sm_manager_ == nullptr) {
+            continue;
+        }
+        auto metadata_lock = sm_manager_->LockMetadataShared();
+        auto [tab_name, fh] = find_table_by_fd_unlocked(sm_manager_, entry.fd);
         if (fh == nullptr) {
             continue;
         }
@@ -1269,33 +1440,63 @@ void TransactionManager::GarbageCollection() {
             auto &tab = sm_manager_->db_.get_table(tab_name);
             if (entry.row_deleted) {
                 apply_index_op(sm_manager_, tab_name, tab, entry.record, entry.rid, nullptr, IndexEntryOp::DELETE);
+                gc_counters_.stale_index_deletes.fetch_add(1, std::memory_order_acq_rel);
+                ++work_budget;
+                maybe_throttle();
                 continue;
             }
             auto current_record = fh->get_record_no_mvcc(entry.rid);
             delete_stale_mvcc_index_entries(sm_manager_, tab_name, tab, entry.record, *current_record,
                                             entry.rid, nullptr);
+            gc_counters_.stale_index_deletes.fetch_add(1, std::memory_order_acq_rel);
+            ++work_budget;
+            maybe_throttle();
         } catch (const RecordNotFoundError &) {
         }
     }
 
     // Logical deletes become physical deletes only after index cleanup.
     for (const auto &entry : deleted_records) {
-        auto [_, fh] = find_table_by_fd(sm_manager_, entry.fd);
+        if (sm_manager_ == nullptr) {
+            continue;
+        }
+        auto metadata_lock = sm_manager_->LockMetadataShared();
+        auto [_, fh] = find_table_by_fd_unlocked(sm_manager_, entry.fd);
         if (fh == nullptr) {
             continue;
         }
         try {
             fh->delete_record(entry.rid, nullptr);
+            gc_counters_.physical_deletes.fetch_add(1, std::memory_order_acq_rel);
+            ++work_budget;
+            maybe_throttle();
         } catch (const RecordNotFoundError &) {
         }
     }
 
     // Retained transactions can be released once their undo chains are unreachable.
+    std::vector<VersionUndoLink> remaining_versions;
+    std::unordered_set<txn_id_t> referenced_txns;
+    {
+        std::shared_lock<std::shared_mutex> table_lock(version_info_mutex_);
+        for (const auto &[_, page_info] : version_info_) {
+            std::shared_lock<std::shared_mutex> page_lock(page_info->mutex_);
+            for (const auto &[_, version] : page_info->prev_version_) {
+                remaining_versions.push_back(version);
+            }
+        }
+    }
+    for (const auto &version : remaining_versions) {
+        collect_referenced_txns_from_chain(version, &referenced_txns, this);
+    }
     {
         std::unique_lock<std::shared_mutex> txn_write_lock(txn_map_mutex_);
         std::vector<txn_id_t> retained_ids;
         for (auto &[txn_id, entry] : txn_map) {
-            if (entry.retained) {
+            auto *txn = entry.Get();
+            bool active = txn != nullptr && txn->get_state() != TransactionState::COMMITTED &&
+                          txn->get_state() != TransactionState::ABORTED;
+            if (entry.retained && !active && referenced_txns.find(txn_id) == referenced_txns.end()) {
                 retained_ids.push_back(txn_id);
             }
         }
@@ -1309,6 +1510,7 @@ void TransactionManager::GarbageCollection() {
                 }
             }
             RemoveTransactionLocked(txn_id, &released_txns);
+            gc_counters_.retained_txn_releases.fetch_add(1, std::memory_order_acq_rel);
         }
     }
 }

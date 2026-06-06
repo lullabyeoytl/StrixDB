@@ -10,6 +10,9 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <mutex>
+#include <shared_mutex>
+
 #include "index/ix.h"
 #include "record/rm_file_handle.h"
 #include "sm_defs.h"
@@ -64,6 +67,15 @@ class SmManager {
     IxManager* get_ix_manager() { return ix_manager_; }
 
     void set_txn_mgr(TransactionManager *txn_mgr);
+    
+    // shared/exclusive locks for metadata operations including db_ and fhs_/ihs_ maps
+    std::shared_lock<std::shared_mutex> LockMetadataShared() const {
+        return std::shared_lock<std::shared_mutex>(metadata_mutex_);
+    }
+
+    std::unique_lock<std::shared_mutex> LockMetadataExclusive() {
+        return std::unique_lock<std::shared_mutex>(metadata_mutex_);
+    }
 
     std::string fd_to_table_name(int fd) const;
 
@@ -102,4 +114,13 @@ class SmManager {
     void drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context);
 
     void drop_index(const std::string& tab_name, const std::vector<ColMeta>& col_names, Context* context);
+
+   private:
+    mutable std::shared_mutex metadata_mutex_;
+
+    StorageFiles list_storage_files_unlocked() const;
+
+    void flush_meta_unlocked();
+
+    void drop_index_unlocked(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context);
 };

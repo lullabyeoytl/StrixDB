@@ -11,11 +11,15 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <atomic>
-#include <unordered_map>
-#include <optional>
+#include <condition_variable>
+#include <cstdint>
 #include <functional>
-#include <shared_mutex>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <shared_mutex>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -72,6 +76,7 @@ public:
     explicit TransactionManager(LockManager *lock_manager, SmManager *sm_manager) {
         sm_manager_ = sm_manager;
         lock_manager_ = lock_manager;
+        StartGarbageCollectionWorker();
     }
 
     ~TransactionManager();
@@ -151,6 +156,8 @@ public:
 
     void CheckWriteConflict(int fd, const Rid &rid, Transaction *txn);
 
+    void TrackReadTable(int fd, Transaction *txn);
+
     void TrackSsiPredicateRead(const std::string &table_name, const std::vector<Condition> &conditions,
                                Transaction *txn);
 
@@ -162,7 +169,42 @@ public:
 
     void ClearVersionLink(int fd, const Rid &rid);
 
-    /** @brief 垃圾回收。仅在所有事务都未访问时调用。 */
+    struct GarbageCollectionStats {
+        uint64_t requests{0};
+        uint64_t attempts{0};
+        uint64_t worker_wakeups{0};
+        uint64_t reclaimed_versions{0};
+        uint64_t stale_index_deletes{0};
+        uint64_t physical_deletes{0};
+        uint64_t retained_txn_releases{0};
+        uint64_t throttle_waits{0};
+        uint64_t worker_exits{0};
+        uint64_t pending_requests{0};
+    };
+
+    struct GarbageCollectionCounters {
+        std::atomic<uint64_t> requests{0};
+        std::atomic<uint64_t> attempts{0};
+        std::atomic<uint64_t> worker_wakeups{0};
+        std::atomic<uint64_t> reclaimed_versions{0};
+        std::atomic<uint64_t> stale_index_deletes{0};
+        std::atomic<uint64_t> physical_deletes{0};
+        std::atomic<uint64_t> retained_txn_releases{0};
+        std::atomic<uint64_t> throttle_waits{0};
+        std::atomic<uint64_t> worker_exits{0};
+        // pending_requests is protected by gc_worker_mutex_, not atomic.
+        uint64_t pending_requests{0};
+    };
+
+    GarbageCollectionStats GetGarbageCollectionStats();
+
+    void RequestGarbageCollection();
+
+    void StopGarbageCollectionWorker();
+
+    bool IsGarbageCollectionWorkerStopped();
+
+    /** @brief Execute one garbage collection pass. */
     void GarbageCollection();
 
     class WriteTxnGuard {
@@ -222,6 +264,9 @@ public:
 private:
     std::atomic<txn_id_t> next_txn_id_{0};  // 用于分发事务ID
     std::atomic<timestamp_t> next_timestamp_{0};    // 用于分发事务时间戳
+    // Lock order: checkpoint_mutex_ -> watermark_mutex_ -> txn_map_mutex_ ->
+    // version_info_mutex_ -> PageVersionInfo::mutex_ -> SmManager metadata lock.
+    // A GC worker must release gc_worker_mutex_ before calling RunGarbageCollection.
     std::shared_mutex checkpoint_mutex_;
     std::shared_mutex txn_map_mutex_;  // 保护 txn_map 的并发访问
     std::mutex watermark_mutex_;       // 保护 running_txns_ 的并发访问
@@ -230,6 +275,14 @@ private:
 
     std::atomic<timestamp_t> last_commit_ts_{0};    // 最后提交的时间戳,仅用于MVCC
     Watermark running_txns_{0};             // 存储所有正在运行事务的读取时间戳，以便于垃圾回收，仅用于MVCC
+
+    // Protects worker state only. It is never held with GC data-structure locks.
+    std::mutex gc_worker_mutex_;
+    std::condition_variable gc_worker_cv_;
+    std::thread gc_worker_;
+    bool gc_worker_stop_{false};
+    GarbageCollectionCounters gc_counters_;
+
     /**
      * 事务条目，存储事务的所有权和保留状态。
      */
@@ -265,6 +318,12 @@ private:
     // Builds the undo log for a write operation, inheriting the undo chain from the
     // current version link when the same transaction already owns the slot.
     UndoLog BuildUndoLogForWrite(int fd, const Rid &rid, const RmRecord &base_record, Transaction *txn);
+
+    void StartGarbageCollectionWorker();
+
+    void GarbageCollectionWorkerLoop();
+
+    void RunGarbageCollection(bool apply_throttle);
 
     bool AddRwDependency(Transaction *from, Transaction *to, Transaction *current, const std::string &reason);
 

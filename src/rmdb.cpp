@@ -195,11 +195,6 @@ void *client_handler(void *sock_fd) {
         if(finish_analyze == false) {
             yy_delete_buffer(buf, yyscanner);
         }
-        // future TODO: 格式化 sql_handler.result, 传给客户端
-        // send result with fixed format, use protobuf in the future
-        if (write(fd, data_send.get(), offset + 1) == -1) {
-            break;
-        }
         // 如果是单条语句，需要按照一个完整的事务来执行，所以执行完当前语句后，自动提交事务
         // 如果执行过程中发生了错误，则回滚事务以保证数据一致性
         if(context->txn_ != nullptr && context->txn_->get_txn_mode() == false &&
@@ -215,6 +210,11 @@ void *client_handler(void *sock_fd) {
                 context->txn_ = nullptr;
                 txn_id = INVALID_TXN_ID;
             }
+        }
+        // future TODO: 格式化 sql_handler.result, 传给客户端
+        // send result with fixed format, use protobuf in the future
+        if (write(fd, data_send.get(), offset + 1) == -1) {
+            break;
         }
     }
 
@@ -289,6 +289,8 @@ void start_server() {
     int ret = shutdown(sockfd_server, SHUT_WR);  // shut down the all or part of a full-duplex connection.
     if(ret == -1) { printf("%s\n", strerror(errno)); }
 //    assert(ret != -1);
+    // GC thread
+    txn_manager->StopGarbageCollectionWorker();
     sm_manager->close_db();
     std::cout << " DB has been closed.\n";
     std::cout << "Server shuts down." << std::endl;

@@ -241,6 +241,7 @@ IndexVisibility IxIndexHandle::check_entry_visibility(const Rid &rid, Transactio
         !TransactionManager::IsMvccActive(transaction)) {
         return {};
     }
+    txn_mgr_->TrackReadTable(table_fd_, transaction);
     // no version link info -> visiable
     auto link = txn_mgr_->GetVersionLink(table_fd_, rid);
     if (!link.has_value()) {

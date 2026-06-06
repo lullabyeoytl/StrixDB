@@ -19,6 +19,7 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "record/rm.h"
 #include "record_printer.h"
+#include "transaction/transaction_manager.h"
 
 namespace {
 
@@ -79,6 +80,7 @@ class StorageFlushService {
 }  // namespace
 
 void SmManager::set_txn_mgr(TransactionManager *txn_mgr) {
+    auto metadata_lock = LockMetadataExclusive();
     txn_mgr_ = txn_mgr;
     for (auto &entry : db_.tabs_) {
         auto fh_it = fhs_.find(entry.first);
@@ -100,6 +102,7 @@ void SmManager::set_txn_mgr(TransactionManager *txn_mgr) {
 }
 
 std::string SmManager::fd_to_table_name(int fd) const {
+    auto metadata_lock = LockMetadataShared();
     for (const auto &entry : fhs_) {
         if (entry.second != nullptr && entry.second->GetFd() == fd) {
             return entry.first;
@@ -109,6 +112,11 @@ std::string SmManager::fd_to_table_name(int fd) const {
 }
 
 SmManager::StorageFiles SmManager::list_storage_files() const {
+    auto metadata_lock = LockMetadataShared();
+    return list_storage_files_unlocked();
+}
+
+SmManager::StorageFiles SmManager::list_storage_files_unlocked() const {
     StorageFiles files;
     files.record_files.reserve(fhs_.size());
     for (const auto &entry : fhs_) {
@@ -187,6 +195,7 @@ void SmManager::drop_db(const std::string& db_name) {
  * @param {string&} db_name 数据库名称，与文件夹同名
  */
 void SmManager::open_db(const std::string& db_name) {
+    auto metadata_lock = LockMetadataExclusive();
     if (!is_dir(db_name)) {
         throw DatabaseNotFoundError(db_name);
     }
@@ -226,6 +235,11 @@ void SmManager::open_db(const std::string& db_name) {
  * @description: 把数据库相关的元数据刷入磁盘中
  */
 void SmManager::flush_meta() {
+    auto metadata_lock = LockMetadataShared();
+    flush_meta_unlocked();
+}
+
+void SmManager::flush_meta_unlocked() {
     // 默认清空文件
     std::ofstream ofs(DB_META_NAME);
     ofs << db_;
@@ -235,16 +249,21 @@ void SmManager::flush_meta() {
  * @description: flush all open files
  */
 bool SmManager::flush_storage() {
-    flush_meta();
+    auto metadata_lock = LockMetadataShared();
+    flush_meta_unlocked();
     StorageFlushService flush_service(buffer_pool_manager_);
-    return flush_service.Flush(list_storage_files());
+    return flush_service.Flush(list_storage_files_unlocked());
 }
 
 /**
  * @description: 关闭数据库并把数据落盘
  */
 void SmManager::close_db() {
-    flush_meta();
+    auto metadata_lock = LockMetadataExclusive();
+    if (txn_mgr_ != nullptr && !txn_mgr_->IsGarbageCollectionWorkerStopped()) {
+        throw InternalError("garbage collection worker must stop before close_db");
+    }
+    flush_meta_unlocked();
     for (auto &entry : fhs_) {
         rm_manager_->close_file(entry.second.get());
     }
@@ -264,6 +283,7 @@ void SmManager::close_db() {
  * @param {Context*} context 
  */
 void SmManager::show_tables(Context* context) {
+    auto metadata_lock = LockMetadataShared();
     std::fstream outfile;
     outfile.open("output.txt", std::ios::out | std::ios::app);
     outfile << "| Tables |\n";
@@ -281,6 +301,7 @@ void SmManager::show_tables(Context* context) {
 }
 
 void SmManager::show_index(const std::string& tab_name, Context* context) {
+    auto metadata_lock = LockMetadataShared();
     if (!db_.is_table(tab_name)) {
         throw TableNotFoundError(tab_name);
     }
@@ -309,6 +330,7 @@ void SmManager::show_index(const std::string& tab_name, Context* context) {
  * @param {Context*} context 
  */
 void SmManager::desc_table(const std::string& tab_name, Context* context) {
+    auto metadata_lock = LockMetadataShared();
     TabMeta &tab = db_.get_table(tab_name);
 
     std::vector<std::string> captions = {"Field", "Type", "Index"};
@@ -333,6 +355,7 @@ void SmManager::desc_table(const std::string& tab_name, Context* context) {
  * @param {Context*} context 
  */
 void SmManager::create_table(const std::string& tab_name, const std::vector<ColDef>& col_defs, Context* context) {
+    auto metadata_lock = LockMetadataExclusive();
     if (db_.is_table(tab_name)) {
         throw TableExistsError(tab_name);
     }
@@ -355,7 +378,7 @@ void SmManager::create_table(const std::string& tab_name, const std::vector<ColD
     rm_manager_->create_file(tab_name, record_size);
     db_.tabs_[tab_name] = tab;
     fhs_.emplace(tab_name, rm_manager_->open_file(tab_name));
-    flush_meta();
+    flush_meta_unlocked();
 }
 
 /**
@@ -364,12 +387,18 @@ void SmManager::create_table(const std::string& tab_name, const std::vector<ColD
  * @param {Context*} context
  */
 void SmManager::drop_table(const std::string& tab_name, Context* context) {
+    auto metadata_lock = LockMetadataExclusive();
     TabMeta &tab = db_.get_table(tab_name);
 
     // Drop all indexes on the table first
     while (!tab.indexes.empty()) {
         std::vector<ColMeta> index_cols = tab.indexes.back().cols;
-        drop_index(tab_name, index_cols, context);
+        std::vector<std::string> index_col_names;
+        index_col_names.reserve(index_cols.size());
+        for (auto &col : index_cols) {
+            index_col_names.push_back(col.name);
+        }
+        drop_index_unlocked(tab_name, index_col_names, context);
     }
 
     // Close and remove record file handle
@@ -385,7 +414,7 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
     // Remove from metadata
     db_.tabs_.erase(tab_name);
 
-    flush_meta();
+    flush_meta_unlocked();
 }
 
 /**
@@ -395,6 +424,7 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
  * @param {Context*} context
  */
 void SmManager::create_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
+    auto metadata_lock = LockMetadataExclusive();
     TabMeta &tab = db_.get_table(tab_name);
 
     if (tab.is_index(col_names)) {
@@ -461,7 +491,7 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
 
     ihs_.emplace(ix_name, std::move(ih));
 
-    flush_meta();
+    flush_meta_unlocked();
 }
 
 /**
@@ -471,6 +501,12 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
  * @param {Context*} context
  */
 void SmManager::drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
+    auto metadata_lock = LockMetadataExclusive();
+    drop_index_unlocked(tab_name, col_names, context);
+}
+
+void SmManager::drop_index_unlocked(const std::string& tab_name, const std::vector<std::string>& col_names,
+                                    Context* context) {
     TabMeta &tab = db_.get_table(tab_name);
 
     if (!tab.is_index(col_names)) {
@@ -515,7 +551,7 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<std::s
         }
     }
 
-    flush_meta();
+    flush_meta_unlocked();
 }
 
 /**

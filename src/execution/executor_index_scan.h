@@ -157,7 +157,8 @@ class IndexScanExecutor : public AbstractExecutor {
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
             auto *ix_scan = current_index_scan();
-            if (ix_scan->current_visibility().matches_snapshot) {
+            if (ix_scan->current_visibility().matches_snapshot &&
+                !ix_scan->current_visibility().allow_stale_index_entry) {
                 auto key_record = make_record_from_index_key();
                 auto eval_record = make_eval_record_from_index_key();
                 if (evaluate_conditions(residual_conds_, *eval_record, index_eval_cols_)) {
@@ -492,7 +493,8 @@ class IndexScanExecutor : public AbstractExecutor {
         }
         if (use_covering_index_) {
             auto *ix_scan = current_index_scan();
-            if (ix_scan->current_visibility().matches_snapshot) {
+            if (ix_scan->current_visibility().matches_snapshot &&
+                !ix_scan->current_visibility().allow_stale_index_entry) {
                 return make_record_from_index_key();
             }
             auto heap_record = current_heap_record_ != nullptr ? std::move(current_heap_record_)
