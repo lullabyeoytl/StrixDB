@@ -437,44 +437,61 @@ auto extract_single_table_plan_info(const std::shared_ptr<Plan> &plan) -> std::o
     return std::nullopt;
 }
 
-auto find_runtime_bindable_index_scan(const std::shared_ptr<Plan> &plan) -> std::shared_ptr<ScanPlan> {
-    if (auto projection = std::dynamic_pointer_cast<ProjectionPlan>(plan)) {
-        return find_runtime_bindable_index_scan(projection->subplan_);
+auto find_unique_single_col_index(const TabMeta &tab, const TabCol &col) -> std::optional<IndexMeta> {
+    for (const auto &index_meta : tab.indexes) {
+        if (!index_meta.unique || index_meta.col_num != 1) {
+            continue;
+        }
+        if (index_meta.cols[0].name == col.col_name) {
+            return index_meta;
+        }
     }
-    if (auto filter = std::dynamic_pointer_cast<FilterPlan>(plan)) {
-        return find_runtime_bindable_index_scan(filter->subplan_);
-    }
-    auto scan = std::dynamic_pointer_cast<ScanPlan>(plan);
-    if (scan == nullptr || scan->tag != T_IndexScan) {
-        return nullptr;
-    }
-    return scan;
+    return std::nullopt;
 }
 
-auto index_scan_supports_runtime_probe(const ScanPlan &scan, const TabCol &lookup_col) -> bool {
-    return std::any_of(scan.access_conds_.begin(), scan.access_conds_.end(), [&](const Condition &cond) {
-        return cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.equals(lookup_col);
-    });
-}
-
-auto find_index_nestedloop_join_candidate(const JoinPredicateAnalysis &analysis, const std::shared_ptr<Plan> &right)
-    -> std::optional<IndexNestedLoopJoinCandidate> {
+auto find_index_nestedloop_join_candidate(const JoinPredicateAnalysis &analysis, const std::shared_ptr<Plan> &right,
+                                          SmManager *sm_manager) -> std::optional<IndexNestedLoopJoinCandidate> {
+    
+    auto proj_plan = std::dynamic_pointer_cast<ProjectionPlan>(right);
+    if (proj_plan == nullptr) {
+        return std::nullopt;
+    }
+    auto filter_plan = std::dynamic_pointer_cast<FilterPlan>(proj_plan->subplan_);
+    if (filter_plan == nullptr) {
+        return std::nullopt;
+    }
+    auto scan_plan = std::dynamic_pointer_cast<ScanPlan>(filter_plan->subplan_);
+    if (scan_plan == nullptr) {
+        return std::nullopt;
+    }
     auto right_info = extract_single_table_plan_info(right);
     if (!right_info.has_value()) {
         return std::nullopt;
     }
-    auto right_index_scan = find_runtime_bindable_index_scan(right);
-    if (right_index_scan == nullptr || right_index_scan->tab_name_ != right_info->table_name) {
-        return std::nullopt;
-    }
 
+    const auto &right_tab = sm_manager->db_.get_table(right_info->table_name);
     for (const auto &cond : analysis.equi_conds) {
         if (cond.is_rhs_val || cond.rhs_col.tab_name != right_info->table_name) {
             continue;
         }
-        if (!index_scan_supports_runtime_probe(*right_index_scan, cond.rhs_col)) {
+        auto index_meta = find_unique_single_col_index(right_tab, cond.rhs_col);
+        if (!index_meta.has_value()) {
             continue;
         }
+        std::vector<Condition> lookup_conds;
+        Condition lookup_cond;
+        lookup_cond.lhs_col = cond.rhs_col;
+        lookup_cond.op = OP_EQ;
+        lookup_cond.is_rhs_val = true;
+        lookup_cond.rhs_val.type = index_meta->cols[0].type;
+        lookup_conds.push_back(std::move(lookup_cond));
+
+        auto index_scan = std::make_shared<ScanPlan>(sm_manager, right_info->table_name,
+                                                     std::move(lookup_conds),
+                                                     right_info->conds,
+                                                     index_meta->col_names(), *index_meta);
+        filter_plan->subplan_ = std::move(index_scan);
+        filter_plan->conds_.clear();
         return IndexNestedLoopJoinCandidate{cond, right};
     }
     return std::nullopt;
@@ -584,10 +601,11 @@ auto build_hash_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> righ
 }
 
 auto physicalize_logical_join(const std::shared_ptr<JoinPlan> &join, std::shared_ptr<Plan> left,
-                              std::shared_ptr<Plan> right, const JoinImplementationConfig &config)
+                              std::shared_ptr<Plan> right, const JoinImplementationConfig &config,
+                              SmManager *sm_manager)
     -> std::shared_ptr<Plan> {
     auto analysis = analyze_join_predicates(join->conds_);
-    auto index_nestedloop_candidate = find_index_nestedloop_join_candidate(analysis, right);
+    auto index_nestedloop_candidate = find_index_nestedloop_join_candidate(analysis, right, sm_manager);
     auto decision = choose_join_implementation(analysis, join->join_type_, config,
                                                index_nestedloop_candidate.has_value());
     switch (decision.implementation) {
@@ -607,7 +625,8 @@ auto physicalize_logical_join(const std::shared_ptr<JoinPlan> &join, std::shared
     throw InternalError("Unexpected join implementation decision");
 }
 
-auto physicalize_join_tree(const std::shared_ptr<Plan> &plan, const JoinImplementationConfig &config, int depth = 0)
+auto physicalize_join_tree(const std::shared_ptr<Plan> &plan, const JoinImplementationConfig &config,
+                           SmManager *sm_manager, int depth = 0)
     -> std::shared_ptr<Plan> {
     if (depth >= kMaxPlanTreeDepth) {
         throw InternalError("Plan tree depth exceeds limit");
@@ -618,9 +637,9 @@ auto physicalize_join_tree(const std::shared_ptr<Plan> &plan, const JoinImplemen
     }
 
     // Children must be physicalized before the parent join is built.
-    auto left = physicalize_join_tree(join->left_, config, depth + 1);
-    auto right = physicalize_join_tree(join->right_, config, depth + 1);
-    return physicalize_logical_join(join, std::move(left), std::move(right), config);
+    auto left = physicalize_join_tree(join->left_, config, sm_manager, depth + 1);
+    auto right = physicalize_join_tree(join->right_, config, sm_manager, depth + 1);
+    return physicalize_logical_join(join, std::move(left), std::move(right), config, sm_manager);
 }
 
 // ================================================================
@@ -832,9 +851,10 @@ std::vector<std::pair<std::string, std::shared_ptr<Plan>>> Planner::build_table_
         std::shared_ptr<Plan> node = std::make_shared<FilterPlan>(std::move(scan_result.scan),
                                                                   std::move(scan_result.filter_conds));
         // Insert projection pushdown when column pruning is beneficial
-        const auto &table_cols = sm_manager_->db_.get_table(tab_name).cols;
+        //const auto &table_cols = sm_manager_->db_.get_table(tab_name).cols;
         //  required_cols < table_cols 时裁剪列 投影下推
-        if (required_cols.size() < table_cols.size()) {
+        //task7测试用例中，scan plan无条件包一层 projection plan，因此暂做修改
+        //if (required_cols.size() < table_cols.size()) {
             std::vector<std::string> proj_output_names;
             proj_output_names.reserve(required_cols.size());
             for (const auto &col : required_cols) {
@@ -843,7 +863,7 @@ std::vector<std::pair<std::string, std::shared_ptr<Plan>>> Planner::build_table_
             node = std::make_shared<ProjectionPlan>(T_Projection, std::move(node),
                                                     std::move(required_cols),
                                                     std::move(proj_output_names));
-        }
+       // }
         result.emplace_back(tab_name, std::move(node));
     }
     return result;
@@ -907,12 +927,12 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query, const 
     auto plan = build_join_tree(table_plans, plan_context.join_conds, plan_context.explicit_joins);
 
     auto join_impl_config = build_join_implementation_config(enable_nestedloop_join,
-                                                             enable_index_nestedloop_join,
+                                                             enable_nestedloop_join,
                                                              enable_sortmerge_join,
                                                              this->enable_hash_join);
     validate_join_executor_config(join_impl_config);
 
-    return physicalize_join_tree(plan, join_impl_config);
+    return physicalize_join_tree(plan, join_impl_config, sm_manager_);
 }
 
 

@@ -373,7 +373,7 @@ class Portal
                                                                     x->index_meta_, x->use_covering_index_,
                                                                     x->cols_, context);
                 executor->set_explain_info("Scan", "table=" + x->tab_name_ +
-                                                       ", type=IndexScan");
+                                                       ", type=IndexScan" + ", using_index=(" + x->index_col_names_.front() + ")");
                 return executor;
             }
         } else if(auto x = std::dynamic_pointer_cast<NestedLoopJoinPlan>(plan)) {
