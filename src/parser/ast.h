@@ -173,13 +173,25 @@ struct Col : public Expr {
             tab_name(std::move(tab_name_)), col_name(std::move(col_name_)) {}
 };
 
+/**
+ * @brief QueryExpr distinguishes plain SELECT queries from UNION queries.
+ */
+struct QueryExpr : public TreeNode {
+};
+
 struct TableRef : public TreeNode {
     std::string name;
     std::string alias;
+    std::shared_ptr<QueryExpr> query;
 
     explicit TableRef(std::string name_) : name(std::move(name_)), alias(name) {}
 
     TableRef(std::string name_, std::string alias_) : name(std::move(name_)), alias(std::move(alias_)) {}
+
+    TableRef(std::shared_ptr<QueryExpr> query_, std::string alias_) :
+            name(std::move(alias_)), alias(name), query(std::move(query_)) {}
+
+    bool is_derived() const { return query != nullptr; }
 };
 
 struct SelectItem : public TreeNode {
@@ -293,7 +305,7 @@ struct JoinExpr : public TreeNode {
             left(std::move(left_)), right(std::move(right_)), conds(std::move(conds_)), type(type_) {}
 };
 
-struct SelectStmt : public TreeNode {
+struct SelectStmt : public QueryExpr {
     std::vector<std::shared_ptr<SelectItem>> select_items;
     std::vector<std::string> tabs;  // 仅表名列表（丢失别名）
     std::vector<std::shared_ptr<TableRef>> table_refs;  // 查询涉及的所有表引用
@@ -337,6 +349,13 @@ struct SelectStmt : public TreeNode {
             }
 };
 
+struct UnionQuery : public QueryExpr {
+    std::vector<std::shared_ptr<SelectStmt>> branches;
+
+    explicit UnionQuery(std::vector<std::shared_ptr<SelectStmt>> branches_) :
+            branches(std::move(branches_)) {}
+};
+
 struct ExplainAnalyzeStmt : public TreeNode {
     std::shared_ptr<TreeNode> statement;
 
@@ -370,6 +389,7 @@ struct SemValue {
     std::vector<std::shared_ptr<TableRef>> sv_table_refs;
 
     std::shared_ptr<TreeNode> sv_node;
+    std::shared_ptr<QueryExpr> sv_query;
 
     SvCompOp sv_comp_op;
 
@@ -383,6 +403,8 @@ struct SemValue {
     std::vector<std::shared_ptr<Expr>> sv_exprs;
     std::shared_ptr<SelectItem> sv_select_item;
     std::vector<std::shared_ptr<SelectItem>> sv_select_items;
+    std::shared_ptr<SelectStmt> sv_select_stmt;
+    std::vector<std::shared_ptr<SelectStmt>> sv_select_stmts;
 
     std::shared_ptr<Value> sv_val;
     std::vector<std::shared_ptr<Value>> sv_vals;

@@ -38,6 +38,37 @@ void assert_parse_rejected(const std::string &sql, yyscan_t yyscanner) {
     assert(parse_tree == nullptr);
 }
 
+void assert_union_derived_table_shape(const std::string &sql, yyscan_t yyscanner,
+                                      const std::vector<std::string> &branch_tabs) {
+    auto parse_tree = parse_sql(sql, yyscanner);
+    auto select = std::dynamic_pointer_cast<ast::SelectStmt>(parse_tree);
+    assert(select != nullptr);
+    assert(select->table_refs.size() == 1);
+    const auto &table_ref = select->table_refs.front();
+    assert(table_ref->is_derived());
+    assert(table_ref->alias == "u");
+    auto union_query = std::dynamic_pointer_cast<ast::UnionQuery>(table_ref->query);
+    assert(union_query != nullptr);
+    assert(union_query->branches.size() == branch_tabs.size());
+    for (size_t i = 0; i < branch_tabs.size(); ++i) {
+        assert(union_query->branches[i]->tabs.size() == 1);
+        assert(union_query->branches[i]->tabs.front() == branch_tabs[i]);
+    }
+}
+
+void assert_union_derived_table_order_by(const std::string &sql, yyscan_t yyscanner,
+                                         const std::string &col_name, ast::OrderByDir dir) {
+    auto parse_tree = parse_sql(sql, yyscanner);
+    auto select = std::dynamic_pointer_cast<ast::SelectStmt>(parse_tree);
+    assert(select != nullptr);
+    assert(select->has_sort);
+    assert(select->order->items.size() == 1);
+    auto col = std::dynamic_pointer_cast<ast::Col>(select->order->items.front()->expr);
+    assert(col != nullptr);
+    assert(col->col_name == col_name);
+    assert(select->order->items.front()->orderby_dir == dir);
+}
+
 }  // namespace
 
 int main() {
@@ -90,6 +121,12 @@ int main() {
     assert_parse_rejected("create table tb (a int, b int, unique(a, b));", yyscanner);
     assert_parse_rejected("set transaction isolation level unknown;", yyscanner);
     assert_parse_rejected("set isolation level snapshot;", yyscanner);
+    assert_union_derived_table_shape("select * from (select * from t1 union select * from t2) as u order by c1 asc;", yyscanner, {"t1", "t2"});
+    assert_union_derived_table_order_by("select * from (select * from t1 union select * from t2) as u order by c1 asc;", yyscanner, "c1", ast::OrderBy_ASC);
+    assert_union_derived_table_shape("select * from (select * from t1 union select * from t2 union select * from t3) as u;", yyscanner, {"t1", "t2", "t3"});
+    assert_parse_rejected("select * from (select * from t1 union) as u;", yyscanner);
+    assert_parse_rejected("select * from (select * from t1 union select * from t2);", yyscanner);
+    assert_parse_rejected("select * from (select * from t1 union select * from t2) as u, t3;", yyscanner);
     yylex_destroy(yyscanner);
     return 0;
 }

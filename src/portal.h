@@ -27,6 +27,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution/executor_projection.h"
 #include "execution/executor_seq_scan.h"
 #include "execution/executor_index_scan.h"
+#include "execution/executor_union.h"
 #include "execution/executor_update.h"
 #include "execution/executor_insert.h"
 #include "execution/executor_delete.h"
@@ -160,6 +161,12 @@ class Portal
         }
         if (auto aggregation = std::dynamic_pointer_cast<AggregationPlan>(plan)) {
             collect_plan_tables(aggregation->subplan_, tables, depth + 1);
+            return;
+        }
+        if (auto union_plan = std::dynamic_pointer_cast<UnionPlan>(plan)) {
+            for (const auto &subplan : union_plan->subplans_) {
+                collect_plan_tables(subplan, tables, depth + 1);
+            }
             return;
         }
         if (auto limit = std::dynamic_pointer_cast<LimitPlan>(plan)) {
@@ -355,6 +362,15 @@ class Portal
                 std::move(input), x->agg_infos_, x->group_by_cols_,
                 x->having_conds_);
             executor->set_explain_info("Aggregation");
+            return executor;
+        } else if(auto x = std::dynamic_pointer_cast<UnionPlan>(plan)) {
+            std::vector<std::unique_ptr<AbstractExecutor>> children;
+            children.reserve(x->subplans_.size());
+            for (const auto &subplan : x->subplans_) {
+                children.push_back(convert_plan_executor(subplan, context));
+            }
+            auto executor = std::make_unique<UnionExecutor>(std::move(children), x->output_cols_);
+            executor->set_explain_info("Union");
             return executor;
         } else if(auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
             if(x->tag == T_SeqScan) {

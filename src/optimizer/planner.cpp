@@ -547,6 +547,9 @@ auto derive_plan_ordering(const std::shared_ptr<Plan> &plan) -> std::vector<Sort
     if (auto limit = std::dynamic_pointer_cast<LimitPlan>(plan)) {
         return derive_plan_ordering(limit->subplan_);
     }
+    if (std::dynamic_pointer_cast<UnionPlan>(plan)) {
+        return {};
+    }
     if (auto aggregation = std::dynamic_pointer_cast<AggregationPlan>(plan);
         aggregation != nullptr && aggregation->strategy_ == AggStrategy_Sort) {
         return make_sort_key_specs(aggregation->group_by_cols_);
@@ -858,6 +861,13 @@ size_t Planner::estimate_input_rows(const std::shared_ptr<Plan> &plan) const {
     if (auto aggregation = std::dynamic_pointer_cast<AggregationPlan>(plan)) {
         return estimate_input_rows(aggregation->subplan_);
     }
+    if (auto union_plan = std::dynamic_pointer_cast<UnionPlan>(plan)) {
+        size_t total = 0;
+        for (const auto &subplan : union_plan->subplans_) {
+            total += estimate_input_rows(subplan);
+        }
+        return total;
+    }
     if (auto join = std::dynamic_pointer_cast<PhysicalJoinPlan>(plan)) {
         return std::max(estimate_input_rows(join->left_), estimate_input_rows(join->right_));
     }
@@ -945,6 +955,10 @@ std::shared_ptr<Plan> Planner::generate_aggregate_plan(std::shared_ptr<Query> qu
  * @param conds select plan 选取条件
  */
 std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query, Context *context) {
+    if (!query->union_branch_queries.empty()) {
+        return generate_union_select_plan(std::move(query), context);
+    }
+
     //逻辑优化
     auto plan_context = logical_optimization(query, context);
 
@@ -971,6 +985,33 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
                                                    std::move(sel_cols), std::move(output_names));
 
     return plannerRoot;
+}
+
+// 生成包含UNION的select语句的查询执行计划
+std::shared_ptr<Plan> Planner::generate_union_select_plan(std::shared_ptr<Query> query, Context *context) {
+    std::vector<std::shared_ptr<Plan>> branch_plans;
+    branch_plans.reserve(query->union_branch_queries.size());
+    for (auto &branch_query : query->union_branch_queries) {
+        auto plan_context = logical_optimization(branch_query, context);
+        auto branch_plan = physical_optimization(branch_query, plan_context, context);
+        branch_plan = generate_aggregate_plan(branch_query, std::move(branch_plan));
+        if (is_aggregate_query(*branch_query)) {
+            branch_plan = generate_sort_plan(branch_query, std::move(branch_plan));
+        }
+        branch_plan = generate_limit_plan(branch_query, std::move(branch_plan));
+        branch_plan = std::make_shared<ProjectionPlan>(T_Projection, std::move(branch_plan),
+                                                       branch_query->select_items,
+                                                       branch_query->output_names);
+        branch_plans.push_back(std::move(branch_plan));
+    }
+
+    auto sel_cols = query->select_items.empty() ? query->cols : query->select_items;
+    auto output_names = query->output_names;
+    std::shared_ptr<Plan> plan = std::make_shared<UnionPlan>(std::move(branch_plans), query->union_output_cols);
+    plan = generate_sort_plan(query, std::move(plan));
+    plan = generate_limit_plan(query, std::move(plan));
+    return std::make_shared<ProjectionPlan>(T_Projection, std::move(plan),
+                                            std::move(sel_cols), std::move(output_names));
 }
 
 // 生成DDL语句和DML语句的查询执行计划
