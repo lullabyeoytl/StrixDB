@@ -143,6 +143,13 @@ private:
             } else {
                 print_node(x->col, offset);
             }
+        } else if (auto x = std::dynamic_pointer_cast<SelectItem>(node)) {
+            std::cout << "SELECT_ITEM\n";
+            print_node(x->expr, offset);
+            if (x->has_alias) {
+                print_val("ALIAS", offset);
+                print_val(x->alias, offset);
+            }
         } else if (auto x = std::dynamic_pointer_cast<GroupBy>(node)) {
             std::cout << "GROUP_BY\n";
             print_node_list(x->cols, offset);
@@ -153,8 +160,18 @@ private:
             print_node(x->rhs, offset);
         } else if (auto x = std::dynamic_pointer_cast<OrderBy>(node)) {
             std::cout << "ORDER_BY\n";
-            print_node(x->cols, offset);
-            print_val(orderby2str(x->orderby_dir), offset);
+            for (const auto &item : x->items) {
+                if (item->col != nullptr) {
+                    print_node(item->col, offset);
+                } else {
+                    print_node(item->expr, offset);
+                }
+                print_val(orderby2str(item->orderby_dir), offset);
+            }
+        } else if (auto x = std::dynamic_pointer_cast<LimitClause>(node)) {
+            std::cout << "LIMIT\n";
+            print_val(x->limit, offset);
+            print_val(x->offset, offset);
         } else if (auto x = std::dynamic_pointer_cast<TypeLen>(node)) {
             std::cout << "TYPE_LEN\n";
             print_val(type2str(x->type), offset);
@@ -192,7 +209,7 @@ private:
             print_node_list(x->conds, offset);
         } else if (auto x = std::dynamic_pointer_cast<SelectStmt>(node)) {
             std::cout << "SELECT\n";
-            print_node_list(x->cols, offset);
+            print_node_list(x->select_items, offset);
             print_val_list(x->tabs, offset);
             print_node_list(x->conds, offset);
             if (x->has_group_by) {
@@ -203,6 +220,9 @@ private:
             }
             if (x->has_sort) {
                 print_node(x->order, offset);
+            }
+            if (x->has_limit) {
+                print_node(x->limit_clause, offset);
             }
         } else if (auto x = std::dynamic_pointer_cast<TxnBegin>(node)) {
             std::cout << "BEGIN\n";

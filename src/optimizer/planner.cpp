@@ -270,9 +270,6 @@ std::shared_ptr<Plan> Planner::physical_optimization(std::shared_ptr<Query> quer
     
     // 其他物理优化
 
-    // 处理orderby
-    plan = generate_sort_plan(query, std::move(plan)); 
-
     return plan;
 }
 
@@ -428,24 +425,18 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query)
 
 std::shared_ptr<Plan> Planner::generate_sort_plan(std::shared_ptr<Query> query, std::shared_ptr<Plan> plan)
 {
-    auto x = std::dynamic_pointer_cast<ast::SelectStmt>(query->parse);
-    if(!x->has_sort) {
+    if (query->order_by_keys.empty()) {
         return plan;
     }
-    std::vector<std::string> tables = query->tables;
-    std::vector<ColMeta> all_cols;
-    for (auto &sel_tab_name : tables) {
-        // 这里db_不能写成get_db(), 注意要传指针
-        const auto &sel_tab_cols = sm_manager_->db_.get_table(sel_tab_name).cols;
-        all_cols.insert(all_cols.end(), sel_tab_cols.begin(), sel_tab_cols.end());
+    return std::make_shared<SortPlan>(T_Sort, std::move(plan), query->order_by_keys);
+}
+
+std::shared_ptr<Plan> Planner::generate_limit_plan(std::shared_ptr<Query> query, std::shared_ptr<Plan> plan)
+{
+    if (!query->limit_spec.has_value()) {
+        return plan;
     }
-    TabCol sel_col;
-    for (auto &col : all_cols) {
-        if(col.name.compare(x->order->cols->col_name) == 0 )
-        sel_col = {.tab_name = col.tab_name, .col_name = col.name};
-    }
-    return std::make_shared<SortPlan>(T_Sort, std::move(plan), sel_col, 
-                                    x->order->orderby_dir == ast::OrderBy_DESC);
+    return std::make_shared<LimitPlan>(std::move(plan), *query->limit_spec);
 }
 
 
@@ -469,8 +460,11 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
                                                         query->group_by_cols, query->having_conds);
     }
 
+    plannerRoot = generate_sort_plan(query, std::move(plannerRoot));
+    plannerRoot = generate_limit_plan(query, std::move(plannerRoot));
+
     plannerRoot = std::make_shared<ProjectionPlan>(T_Projection, std::move(plannerRoot), 
-                                                        std::move(sel_cols));
+                                                        std::move(sel_cols), query->output_names);
 
     return plannerRoot;
 }

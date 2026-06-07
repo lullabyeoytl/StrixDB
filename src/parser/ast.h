@@ -177,6 +177,17 @@ struct Col : public Expr {
             tab_name(std::move(tab_name_)), col_name(std::move(col_name_)) {}
 };
 
+struct SelectItem : public TreeNode {
+    std::shared_ptr<Expr> expr;
+    bool has_alias = false;
+    std::string alias;
+
+    explicit SelectItem(std::shared_ptr<Expr> expr_) : expr(std::move(expr_)) {}
+
+    SelectItem(std::shared_ptr<Expr> expr_, std::string alias_) :
+            expr(std::move(expr_)), has_alias(true), alias(std::move(alias_)) {}
+};
+
 
 struct SetClause : public TreeNode {
     std::string col_name;
@@ -214,10 +225,28 @@ struct HavingCond : public TreeNode {
 
 struct OrderBy : public TreeNode
 {
-    std::shared_ptr<Col> cols;
-    OrderByDir orderby_dir;
-    OrderBy( std::shared_ptr<Col> cols_, OrderByDir orderby_dir_) :
-       cols(std::move(cols_)), orderby_dir(std::move(orderby_dir_)) {}
+    struct Item : public TreeNode {
+        std::shared_ptr<Expr> expr;
+        std::shared_ptr<Col> col;
+        OrderByDir orderby_dir;
+
+        Item(std::shared_ptr<Col> col_, OrderByDir orderby_dir_) :
+            expr(col_), col(std::move(col_)), orderby_dir(orderby_dir_) {}
+
+        Item(std::shared_ptr<Expr> expr_, OrderByDir orderby_dir_) :
+            expr(std::move(expr_)), col(std::dynamic_pointer_cast<Col>(expr)), orderby_dir(orderby_dir_) {}
+    };
+
+    std::vector<std::shared_ptr<Item>> items;
+
+    explicit OrderBy(std::vector<std::shared_ptr<Item>> items_) : items(std::move(items_)) {}
+};
+
+struct LimitClause : public TreeNode {
+    int limit;
+    int offset;
+
+    LimitClause(int limit_, int offset_) : limit(limit_), offset(offset_) {}
 };
 
 struct InsertStmt : public TreeNode {
@@ -259,7 +288,7 @@ struct JoinExpr : public TreeNode {
 };
 
 struct SelectStmt : public TreeNode {
-    std::vector<std::shared_ptr<Expr>> cols;
+    std::vector<std::shared_ptr<SelectItem>> select_items;
     std::vector<std::string> tabs;
     std::vector<std::shared_ptr<BinaryExpr>> conds;
     std::vector<std::shared_ptr<JoinExpr>> jointree;
@@ -273,33 +302,41 @@ struct SelectStmt : public TreeNode {
     
     bool has_having;
     std::vector<std::shared_ptr<HavingCond>> having_conds;
+    bool has_limit;
+    std::shared_ptr<LimitClause> limit_clause;
 
-    SelectStmt(std::vector<std::shared_ptr<Expr>> cols_,
+    SelectStmt(std::vector<std::shared_ptr<SelectItem>> select_items_,
                std::vector<std::string> tabs_,
                std::vector<std::shared_ptr<BinaryExpr>> conds_,
                std::shared_ptr<OrderBy> order_,
                std::shared_ptr<GroupBy> group_by_,
-               std::vector<std::shared_ptr<HavingCond>> having_conds_) :
-            cols(std::move(cols_)), tabs(std::move(tabs_)), conds(std::move(conds_)), 
-            order(std::move(order_)), group_by(std::move(group_by_)), having_conds(std::move(having_conds_)) {
+               std::vector<std::shared_ptr<HavingCond>> having_conds_,
+               std::shared_ptr<LimitClause> limit_clause_) :
+            select_items(std::move(select_items_)), tabs(std::move(tabs_)), conds(std::move(conds_)),
+            order(std::move(order_)), group_by(std::move(group_by_)), having_conds(std::move(having_conds_)),
+            limit_clause(std::move(limit_clause_)) {
                 has_sort = (bool)order;
                 has_group_by = (bool)group_by;
                 has_having = !having_conds.empty();
+                has_limit = (bool)limit_clause;
             }
 
-    SelectStmt(std::vector<std::shared_ptr<Expr>> cols_,
+    SelectStmt(std::vector<std::shared_ptr<SelectItem>> select_items_,
                std::vector<std::string> tabs_,
                std::vector<std::shared_ptr<BinaryExpr>> conds_,
                std::vector<std::shared_ptr<JoinExpr>> jointree_,
                std::shared_ptr<OrderBy> order_,
                std::shared_ptr<GroupBy> group_by_,
-               std::vector<std::shared_ptr<HavingCond>> having_conds_) :
-            cols(std::move(cols_)), tabs(std::move(tabs_)), conds(std::move(conds_)),
+               std::vector<std::shared_ptr<HavingCond>> having_conds_,
+               std::shared_ptr<LimitClause> limit_clause_) :
+            select_items(std::move(select_items_)), tabs(std::move(tabs_)), conds(std::move(conds_)),
             jointree(std::move(jointree_)), order(std::move(order_)),
-            group_by(std::move(group_by_)), having_conds(std::move(having_conds_)) {
+            group_by(std::move(group_by_)), having_conds(std::move(having_conds_)),
+            limit_clause(std::move(limit_clause_)) {
                 has_sort = (bool)order;
                 has_group_by = (bool)group_by;
                 has_having = !having_conds.empty();
+                has_limit = (bool)limit_clause;
             }
 };
 
@@ -332,6 +369,8 @@ struct SemValue {
 
     std::shared_ptr<Expr> sv_expr;
     std::vector<std::shared_ptr<Expr>> sv_exprs;
+    std::shared_ptr<SelectItem> sv_select_item;
+    std::vector<std::shared_ptr<SelectItem>> sv_select_items;
 
     std::shared_ptr<Value> sv_val;
     std::vector<std::shared_ptr<Value>> sv_vals;
@@ -348,6 +387,9 @@ struct SemValue {
     JoinType sv_join_type;
 
     std::shared_ptr<OrderBy> sv_orderby;
+    std::shared_ptr<OrderBy::Item> sv_orderby_item;
+    std::vector<std::shared_ptr<OrderBy::Item>> sv_orderby_items;
+    std::shared_ptr<LimitClause> sv_limit_clause;
     
     // aggregation concerning
     std::shared_ptr<AggFunc> sv_agg_func;

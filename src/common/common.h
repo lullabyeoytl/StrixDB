@@ -36,6 +36,29 @@ struct TabCol {
     }
 };
 
+struct SortKeySpec {
+    TabCol col;
+    bool is_desc = false;
+
+    inline auto equals(const SortKeySpec &rhs) const -> bool {
+        return col.equals(rhs.col) && is_desc == rhs.is_desc;
+    }
+};
+
+struct LimitSpec {
+    size_t limit = 0;
+    size_t offset = 0;
+};
+
+inline auto make_sort_key_specs(const std::vector<TabCol> &cols, bool is_desc = false) -> std::vector<SortKeySpec> {
+    std::vector<SortKeySpec> keys;
+    keys.reserve(cols.size());
+    for (const auto &col : cols) {
+        keys.push_back(SortKeySpec{col, is_desc});
+    }
+    return keys;
+}
+
 inline bool contains_col(const std::vector<TabCol> &cols, const TabCol &target) {
     return std::any_of(cols.begin(), cols.end(), [&](const TabCol &col) { return col.equals(target); });
 }

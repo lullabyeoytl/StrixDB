@@ -171,6 +171,16 @@ void *client_handler(void *sock_fd) {
                     outfile.close();
                 }
             }
+        } else {
+            has_error = true;
+            static const char kParseFailure[] = "failure\n";
+            memcpy(data_send, kParseFailure, sizeof(kParseFailure));
+            offset = sizeof(kParseFailure) - 1;
+
+            std::fstream outfile;
+            outfile.open("output.txt", std::ios::out | std::ios::app);
+            outfile << "failure\n";
+            outfile.close();
         }
         if(finish_analyze == false) {
             yy_delete_buffer(buf);

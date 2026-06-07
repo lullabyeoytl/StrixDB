@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 #include <algorithm>
 #include <numeric>
+#include <utility>
 #include <vector>
 
 #include "execution_defs.h"
@@ -22,35 +23,46 @@ See the Mulan PSL v2 for more details. */
 class SortExecutor : public AbstractExecutor {
    private:
     std::unique_ptr<AbstractExecutor> prev_;
-    ColMeta sort_col_;
     std::vector<ColMeta> cols_;
+    std::vector<SortKeySpec> sort_keys_;
+    std::vector<ColMeta> sort_key_metas_;
     size_t len_ = 0;
     size_t cursor_ = 0;
-    bool is_desc_;
     std::vector<RmRecord> tuples_;
     std::vector<Rid> tuple_rids_;
     std::vector<size_t> order_;
 
     auto compare_tuple(const RmRecord &lhs, const RmRecord &rhs) const -> bool {
-        auto lhs_val = get_col_value(lhs, sort_col_);
-        auto rhs_val = get_col_value(rhs, sort_col_);
-        int cmp = lhs_val.compare(rhs_val);
-        if (cmp == 0) {
-            return false;
+        for (size_t i = 0; i < sort_key_metas_.size(); ++i) {
+            auto lhs_val = get_col_value(lhs, sort_key_metas_[i]);
+            auto rhs_val = get_col_value(rhs, sort_key_metas_[i]);
+            int cmp = lhs_val.compare(rhs_val);
+            if (cmp == 0) {
+                continue;
+            }
+            return sort_keys_[i].is_desc ? (cmp > 0) : (cmp < 0);
         }
-        return is_desc_ ? cmp > 0 : cmp < 0;
+        return false;
     }
 
    public:
-    SortExecutor(std::unique_ptr<AbstractExecutor> prev, TabCol sel_cols, bool is_desc) {
+    SortExecutor(std::unique_ptr<AbstractExecutor> prev, std::vector<SortKeySpec> sort_keys) {
         prev_ = std::move(prev);
         cols_ = prev_->cols();
-        sort_col_ = find_col_meta(cols_, sel_cols);
-        is_desc_ = is_desc;
+        if (sort_keys.empty()) {
+            throw InternalError("SortExecutor requires at least one sort key");
+        }
+        sort_keys_ = std::move(sort_keys);
+        for (const auto &sort_key : sort_keys_) {
+            sort_key_metas_.push_back(find_col_meta(cols_, sort_key.col));
+        }
         if (!cols_.empty()) {
             len_ = cols_.back().offset + cols_.back().len;
         }
     }
+
+    SortExecutor(std::unique_ptr<AbstractExecutor> prev, SortKeySpec sort_key)
+        : SortExecutor(std::move(prev), std::vector<SortKeySpec>{std::move(sort_key)}) {}
 
     void beginTuple() override { 
         tuples_.clear();

@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include <cassert>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -37,8 +38,11 @@ class Query{
     // aggregation metadata
     std::vector<AggInfo> agg_infos;
     std::vector<TabCol> select_items;
+    std::vector<std::string> output_names;
     std::vector<TabCol> group_by_cols;
     std::vector<HavingCond> having_conds;
+    std::vector<SortKeySpec> order_by_keys;
+    std::optional<LimitSpec> limit_spec;
 
     Query(){}
 

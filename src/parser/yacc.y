@@ -22,7 +22,7 @@ using namespace ast;
 
 // keywords
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY
-WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX UNIQUE AND ON SEMI JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE
+WHERE UPDATE SET SELECT AS INT CHAR FLOAT INDEX UNIQUE AND ON SEMI JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY LIMIT OFFSET ENABLE_NESTLOOP ENABLE_SORTMERGE
 %token COUNT SUM AVG MIN MAX GROUP HAVING
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
@@ -39,8 +39,9 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX UNIQUE AND ON SEMI JOIN EXIT HELP T
 %type <sv_fields> fieldList
 %type <sv_type_len> type
 %type <sv_comp_op> op
-%type <sv_expr> expr
-%type <sv_exprs> exprList selector
+%type <sv_expr> expr order_expr
+%type <sv_select_item> selectItem
+%type <sv_select_items> selectItemList selector
 %type <sv_agg_func> agg_func
 %type <sv_val> value
 %type <sv_vals> valueList
@@ -54,11 +55,14 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT INDEX UNIQUE AND ON SEMI JOIN EXIT HELP T
 %type <sv_set_clauses> setClauses
 %type <sv_cond> condition
 %type <sv_conds> whereClause optWhereClause
-%type <sv_orderby>  order_clause opt_order_clause
+%type <sv_orderby_items> order_clause
+%type <sv_orderby> opt_order_clause
+%type <sv_orderby_item> order_item
 %type <sv_orderby_dir> opt_asc_desc
 %type <sv_group_by> opt_group_clause
 %type <sv_having_cond> having_cond
 %type <sv_having_conds> havingCondList opt_having_clause
+%type <sv_limit_clause> opt_limit_clause
 %type <sv_setKnobType> set_knob_type
 
 %%
@@ -170,11 +174,11 @@ dml:
     {
         $$ = std::make_shared<UpdateStmt>($2, $4, $5);
     }
-    |   SELECT selector FROM tableList optWhereClause opt_group_clause opt_having_clause opt_order_clause
+    |   SELECT selector FROM tableList optWhereClause opt_group_clause opt_having_clause opt_order_clause opt_limit_clause
     {
-        $$ = std::make_shared<SelectStmt>($2, $4, $5, $8, $6, $7);
+        $$ = std::make_shared<SelectStmt>($2, $4, $5, $8, $6, $7, $9);
     }
-    |   SELECT selector FROM tbName joinClauseList optWhereClause opt_group_clause opt_having_clause opt_order_clause
+    |   SELECT selector FROM tbName joinClauseList optWhereClause opt_group_clause opt_having_clause opt_order_clause opt_limit_clause
     {
         std::vector<std::string> tabs{$4};
         std::string current_left = $4;
@@ -183,7 +187,7 @@ dml:
             tabs.push_back(join_expr->right);
             current_left = join_expr->right;
         }
-        $$ = std::make_shared<SelectStmt>($2, std::move(tabs), $6, std::move($5), $9, $7, $8);
+        $$ = std::make_shared<SelectStmt>($2, std::move(tabs), $6, std::move($5), $9, $7, $8, $10);
     }
     ;
 
@@ -450,15 +454,26 @@ selector:
     {
         $$ = {};
     }
-    |   exprList
+    |   selectItemList
     ;
 
-exprList:
+selectItem:
         expr
     {
-        $$ = std::vector<std::shared_ptr<Expr>>{$1};
+        $$ = std::make_shared<SelectItem>($1);
     }
-    |   exprList ',' expr
+    |   agg_func AS colName
+    {
+        $$ = std::make_shared<SelectItem>(std::static_pointer_cast<Expr>($1), $3);
+    }
+    ;
+
+selectItemList:
+        selectItem
+    {
+        $$ = std::vector<std::shared_ptr<SelectItem>>{$1};
+    }
+    |   selectItemList ',' selectItem
     {
         $$.push_back($3);
     }
@@ -526,17 +541,52 @@ tableList:
 opt_order_clause:
     ORDER BY order_clause      
     { 
-        $$ = $3; 
+        $$ = std::make_shared<OrderBy>($3);
     }
-    |   /* epsilon */ { /* ignore*/ }
+    |   /* epsilon */ { $$ = nullptr; }
+    ;
+
+opt_limit_clause:
+    LIMIT VALUE_INT
+    {
+        $$ = std::make_shared<LimitClause>($2, 0);
+    }
+    |   LIMIT VALUE_INT OFFSET VALUE_INT
+    {
+        $$ = std::make_shared<LimitClause>($2, $4);
+    }
+    |   /* epsilon */ { $$ = nullptr; }
     ;
 
 order_clause:
-      col  opt_asc_desc 
+      order_item
     { 
-        $$ = std::make_shared<OrderBy>($1, $2);
+        $$ = std::vector<std::shared_ptr<OrderBy::Item>>{$1};
     }
-    ;   
+    |   order_clause ',' order_item
+    {
+        $1.push_back($3);
+        $$ = std::move($1);
+    }
+    ;
+
+order_item:
+      order_expr opt_asc_desc
+    {
+        $$ = std::make_shared<OrderBy::Item>($1, $2);
+    }
+    ;
+
+order_expr:
+      col
+    {
+        $$ = std::static_pointer_cast<Expr>($1);
+    }
+    |   agg_func
+    {
+        $$ = std::static_pointer_cast<Expr>($1);
+    }
+    ;
 
 opt_asc_desc:
     ASC          { $$ = OrderBy_ASC;     }

@@ -14,6 +14,7 @@ See the Mulan PSL v2 for more details. */
 #include <cstring>
 #include <map>
 #include <sstream>
+#include <unordered_map>
 
 #include "execution_common.h"
 #include "execution_defs.h"
@@ -46,8 +47,9 @@ class AggregationExecutor : public AbstractExecutor {
     std::vector<ColMeta> cols_;
     size_t len_;
 
-    std::map<std::string, AggState> groups_;    // 存储group中间结果， key： 分组键
-    std::map<std::string, AggState>::iterator iter_;    // 指向当前分组的迭代器
+    std::unordered_map<std::string, AggState> groups_;    // 存储group中间结果， key： 分组键
+    std::vector<std::string> group_order_;                // 保留首次出现的分组次序
+    size_t iter_idx_;
     Rid rid_;
     bool built_;
 
@@ -208,12 +210,14 @@ class AggregationExecutor : public AbstractExecutor {
 
     void build_groups() {
         groups_.clear();
+        group_order_.clear();
         prev_->beginTuple();
         for (; !prev_->is_end(); prev_->nextTuple()) {
             auto record = prev_->Next();
             auto key = group_key(*record);  // 计算分组键
             auto it = groups_.find(key);
             if (it == groups_.end()) {
+                group_order_.push_back(key);
                 it = groups_.emplace(key, new_state(*record)).first;    // 新分组
             }
             update_state(it->second, *record);  // 写groups_
@@ -222,15 +226,23 @@ class AggregationExecutor : public AbstractExecutor {
         // no group by and source col is none: SQL standard is to return a single row
         if (groups_.empty() && group_by_cols_.empty()) {
             groups_.emplace(std::string(), empty_state());
+            group_order_.push_back(std::string());
         }
 
-        for (auto it = groups_.begin(); it != groups_.end();) {
-            if (!passes_having(it->second)) {
-                it = groups_.erase(it);
+        std::vector<std::string> filtered_order;
+        filtered_order.reserve(group_order_.size());
+        for (const auto &key : group_order_) {
+            auto it = groups_.find(key);
+            if (it == groups_.end()) {
+                continue;
+            }
+            if (passes_having(it->second)) {
+                filtered_order.push_back(key);
             } else {
-                ++it;
+                groups_.erase(it);
             }
         }
+        group_order_.swap(filtered_order);
     }
     void write_value(char *dest, int len, Value value) const {
         value.init_raw(len);
@@ -268,21 +280,22 @@ class AggregationExecutor : public AbstractExecutor {
         group_by_cols_ = std::move(group_by_cols);
         having_conds_ = std::move(having_conds);
         built_ = false;
+        iter_idx_ = 0;
         rid_ = Rid{-1, -1};
         build_output_cols();
     }
 
     void beginTuple() override {
         build_groups();
-        iter_ = groups_.begin();
+        iter_idx_ = 0;
         built_ = true;
     }
 
     void nextTuple() override {
-        if (!built_ || iter_ == groups_.end()) {
+        if (is_end()) {
             return;
         }
-        ++iter_;
+        ++iter_idx_;
     }
 
     std::unique_ptr<RmRecord> Next() override {
@@ -290,7 +303,7 @@ class AggregationExecutor : public AbstractExecutor {
             return nullptr;
         }
         auto out = std::make_unique<RmRecord>(len_);
-        const AggState &state = iter_->second;
+        const AggState &state = groups_.at(group_order_[iter_idx_]);
         for (size_t i = 0; i < group_by_cols_.size(); i++) {
             write_value(out->data + cols_[i].offset, cols_[i].len, state.group_values[i]);
         }
@@ -305,7 +318,7 @@ class AggregationExecutor : public AbstractExecutor {
     Rid &rid() override { return rid_; }
 
     bool is_end() const override {
-        return !built_ || iter_ == groups_.end();
+        return !built_ || iter_idx_ >= group_order_.size();
     }
 
     size_t tupleLen() const override { return len_; }

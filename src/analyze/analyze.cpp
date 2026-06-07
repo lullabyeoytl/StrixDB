@@ -15,6 +15,11 @@ See the Mulan PSL v2 for more details. */
 
 namespace {
 
+enum class OrderExprKind {
+    Column,
+    Aggregate
+};
+
 AggInfo convert_agg_func(const std::shared_ptr<ast::AggFunc> &sv_agg) {
     AggInfo agg;
     agg.agg_type = sv_agg->agg_type;
@@ -32,6 +37,26 @@ void append_unique_agg(std::vector<AggInfo> &agg_infos, const AggInfo &agg) {
     if (it == agg_infos.end()) {
         agg_infos.push_back(agg);
     }
+}
+
+auto classify_order_expr(const std::shared_ptr<ast::Expr> &expr) -> OrderExprKind {
+    if (std::dynamic_pointer_cast<ast::Col>(expr)) {
+        return OrderExprKind::Column;
+    }
+    if (std::dynamic_pointer_cast<ast::AggFunc>(expr)) {
+        return OrderExprKind::Aggregate;
+    }
+    throw InternalError("Unsupported ORDER BY expression type");
+}
+
+auto normalize_limit_clause(const std::shared_ptr<ast::LimitClause> &limit_clause) -> LimitSpec {
+    if (limit_clause->limit < 0) {
+        throw RMDBError("LIMIT must not be negative");
+    }
+    if (limit_clause->offset < 0) {
+        throw RMDBError("OFFSET must not be negative");
+    }
+    return LimitSpec{static_cast<size_t>(limit_clause->limit), static_cast<size_t>(limit_clause->offset)};
 }
 
 }  // namespace
@@ -54,7 +79,8 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
                 throw TableNotFoundError(tab_name);
             }
         }
-        for (auto &sv_sel_expr : x->cols) {
+        for (auto &sv_select_item : x->select_items) {
+            auto &sv_sel_expr = sv_select_item->expr;
             if (auto sv_sel_col = std::dynamic_pointer_cast<ast::Col>(sv_sel_expr)) {
                 TabCol sel_col = {.tab_name = sv_sel_col->tab_name, .col_name = sv_sel_col->col_name};
                 query->cols.push_back(sel_col);
@@ -68,12 +94,13 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         
         std::vector<ColMeta> all_cols;
         get_all_cols(query->tables, all_cols);
-        if (x->cols.empty()) {
+        if (x->select_items.empty()) {
             // select all columns
             for (auto &col : all_cols) {
                 TabCol sel_col = {.tab_name = col.tab_name, .col_name = col.name};
                 query->cols.push_back(sel_col);
                 query->select_items.push_back(sel_col);
+                query->output_names.push_back(sel_col.col_name);
             }
         } else {
             // infer table name from column name
@@ -81,12 +108,18 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
                 check_column(all_cols, sel_col);  // 列元数据校验
             }
             query->select_items.clear();
+            query->output_names.clear();
             size_t col_idx = 0;
-            for (auto &sv_sel_expr : x->cols) {
+            for (auto &sv_select_item : x->select_items) {
+                auto &sv_sel_expr = sv_select_item->expr;
                 if (std::dynamic_pointer_cast<ast::Col>(sv_sel_expr)) {
-                    query->select_items.push_back(query->cols[col_idx++]);
+                    const auto &sel_col = query->cols[col_idx++];
+                    query->select_items.push_back(sel_col);
+                    query->output_names.push_back(sel_col.col_name);
                 } else if (auto sv_agg = std::dynamic_pointer_cast<ast::AggFunc>(sv_sel_expr)) {
-                    query->select_items.push_back({std::string(), agg_output_name(convert_agg_func(sv_agg))});
+                    auto default_name = agg_output_name(convert_agg_func(sv_agg));
+                    query->select_items.push_back({std::string(), default_name});
+                    query->output_names.push_back(sv_select_item->has_alias ? sv_select_item->alias : default_name);
                 } else {
                     throw InternalError("Unexpected select expression type");
                 }
@@ -103,6 +136,34 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
                 check_column(all_cols, group_col);
                 query->group_by_cols.push_back(group_col);
             }
+        }
+        if (x->has_sort) {
+            for (const auto &sv_order_item : x->order->items) {
+                TabCol order_col;
+                switch (classify_order_expr(sv_order_item->expr)) {
+                    case OrderExprKind::Column: {
+                        auto sv_order_col = std::static_pointer_cast<ast::Col>(sv_order_item->expr);
+                        order_col = {.tab_name = sv_order_col->tab_name, .col_name = sv_order_col->col_name};
+                        check_column(all_cols, order_col);
+                        break;
+                    }
+                    case OrderExprKind::Aggregate: {
+                        auto sv_order_agg = std::static_pointer_cast<ast::AggFunc>(sv_order_item->expr);
+                        auto agg = convert_agg_func(sv_order_agg);
+                        if (!agg.is_star) {
+                            check_column(all_cols, agg.col);
+                        }
+                        append_unique_agg(query->agg_infos, agg);
+                        order_col = {.tab_name = std::string(), .col_name = agg_output_name(agg)};
+                        break;
+                    }
+                }
+                query->order_by_keys.push_back(
+                    SortKeySpec{std::move(order_col), sv_order_item->orderby_dir == ast::OrderBy_DESC});
+            }
+        }
+        if (x->has_limit) {
+            query->limit_spec = normalize_limit_clause(x->limit_clause);
         }
         for (auto &sv_having : x->having_conds) {
             HavingCond having_cond;
@@ -356,6 +417,14 @@ void Analyze::check_aggregate(const std::vector<ColMeta> &all_cols, Query &query
         for (auto &sel_col : query.cols) {
             if (!contains_col(query.group_by_cols, sel_col)) {
                 throw RMDBError(sel_col.col_name + " must appear in GROUP BY");
+            }
+        }
+    }
+
+    for (auto &order_key : query.order_by_keys) {
+        if (!order_key.col.tab_name.empty()) {
+            if (!contains_col(query.group_by_cols, order_key.col)) {
+                throw RMDBError(order_key.col.col_name + " must appear in GROUP BY");
             }
         }
     }

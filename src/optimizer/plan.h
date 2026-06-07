@@ -45,6 +45,7 @@ typedef enum PlanTag{
     T_NestLoop,
     T_SortMerge,    // sort merge join
     T_Sort,
+    T_Limit,
     T_Projection,
     T_Aggregation
 } PlanTag;
@@ -139,33 +140,50 @@ class JoinPlan : public Plan
 class ProjectionPlan : public Plan
 {
     public:
-        ProjectionPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<TabCol> sel_cols)
+        ProjectionPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<TabCol> sel_cols,
+                       std::vector<std::string> output_names = {})
         {
             Plan::tag = tag;
             subplan_ = std::move(subplan);
             sel_cols_ = std::move(sel_cols);
+            output_names_ = std::move(output_names);
         }
         ~ProjectionPlan(){}
         std::shared_ptr<Plan> subplan_;
         std::vector<TabCol> sel_cols_;
+        std::vector<std::string> output_names_;
         
 };
 
 class SortPlan : public Plan
 {
     public:
-        SortPlan(PlanTag tag, std::shared_ptr<Plan> subplan, TabCol sel_col, bool is_desc)
+        SortPlan(PlanTag tag, std::shared_ptr<Plan> subplan, std::vector<SortKeySpec> sort_keys)
         {
             Plan::tag = tag;
             subplan_ = std::move(subplan);
-            sel_col_ = sel_col;
-            is_desc_ = is_desc;
+            sort_keys_ = std::move(sort_keys);
         }
+        SortPlan(PlanTag tag, std::shared_ptr<Plan> subplan, SortKeySpec sort_key)
+            : SortPlan(tag, std::move(subplan), std::vector<SortKeySpec>{std::move(sort_key)}) {}
         ~SortPlan(){}
         std::shared_ptr<Plan> subplan_;
-        TabCol sel_col_;
-        bool is_desc_;
+        std::vector<SortKeySpec> sort_keys_;
         
+};
+
+class LimitPlan : public Plan
+{
+    public:
+        LimitPlan(std::shared_ptr<Plan> subplan, LimitSpec limit_spec)
+        {
+            Plan::tag = T_Limit;
+            subplan_ = std::move(subplan);
+            limit_spec_ = limit_spec;
+        }
+        ~LimitPlan(){}
+        std::shared_ptr<Plan> subplan_;
+        LimitSpec limit_spec_;
 };
 
 class AggregationPlan : public Plan
