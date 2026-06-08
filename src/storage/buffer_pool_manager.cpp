@@ -122,7 +122,7 @@ bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty) {
             if (page->pin_count_ == 0) {
                 replacer_->unpin(it->second);
             }
-            page->is_dirty_ = is_dirty;
+            page->is_dirty_ = page->is_dirty_ || is_dirty;
         }
     }
     return true;
@@ -220,4 +220,4 @@ bool BufferPoolManager::delete_page(PageId page_id) {
       for (auto &page_id : pages_to_flush) {                                                                            
           flush_page(page_id);                                                                                          
       }                                                                                                                 
-  }  
+  }
