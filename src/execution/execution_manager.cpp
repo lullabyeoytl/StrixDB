@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_manager.h"
 
 #include <algorithm>
+#include <fstream>
 
 #include "execution_common.h"
 #include "executor_delete.h"
@@ -279,6 +280,10 @@ void QlManager::explain_analyze(std::unique_ptr<AbstractExecutor> executorTreeRo
 
     std::string output;
     append_executor_tree(executorTreeRoot.get(), 0, output);
+    std::fstream outfile;
+    outfile.open("output.txt", std::ios::out | std::ios::app);
+    outfile << output;
+    outfile.close();
     write_bounded_output(output, context);
 }
 
