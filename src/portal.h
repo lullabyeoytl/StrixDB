@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <iomanip>
 #include <map>
 #include <set>
 #include <sstream>
@@ -91,7 +92,7 @@ class Portal
         std::string result = "[";
         for (size_t i = 0; i < rendered.size(); ++i) {
             if (i != 0) {
-                result += ", ";
+                result += ",";
             }
             result += rendered[i];
         }
@@ -105,7 +106,7 @@ class Portal
             return std::to_string(value.int_val);
         }
         if (value.type == TYPE_FLOAT) {
-            os << value.float_val;
+            os << std::fixed << std::setprecision(6) << value.float_val;
             return os.str();
         }
         if (value.type == TYPE_STRING) {
@@ -141,7 +142,7 @@ class Portal
         std::string result = "[";
         for (size_t i = 0; i < rendered.size(); ++i) {
             if (i != 0) {
-                result += ", ";
+                result += ",";
             }
             result += rendered[i];
         }
@@ -191,7 +192,7 @@ class Portal
         size_t i = 0;
         for (const auto &table : tables) {
             if (i != 0) {
-                result += ", ";
+                result += ",";
             }
             result += table;
             ++i;
@@ -334,14 +335,14 @@ class Portal
             if(x->tag == T_SeqScan) {
                 auto executor = std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->all_conds_,
                                                                   x->empty_result_, context);
-                executor->set_explain_info("Scan", "table=" + x->tab_name_ + ", type=SeqScan");
+                executor->set_explain_info("Scan", "table=" + x->tab_name_ + ",type=SeqScan");
                 return executor;
             }
             else {
                 auto executor = std::make_unique<IndexScanExecutor>(sm_manager_, x->tab_name_, x->index_lookup_conds_,
                                                                     x->residual_conds_, x->index_col_names_,
                                                                     x->index_meta_, context);
-                executor->set_explain_info("Scan", "table=" + x->tab_name_ + ", type=IndexScan");
+                executor->set_explain_info("Scan", "table=" + x->tab_name_ + ",type=IndexScan");
                 return executor;
             }
         } else if(auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
@@ -351,7 +352,7 @@ class Portal
                                 std::move(left),
                                 std::move(right), x->conds_, x->type, x->reverse_right_scan_);
             executor->set_explain_info("Join", "tables=" + format_table_list(plan) +
-                                               ", condition=" + format_condition_list(x->conds_));
+                                               ",condition=" + format_condition_list(x->conds_));
             return executor;
         } else if(auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
             auto executor = std::make_unique<SortExecutor>(convert_plan_executor(x->subplan_, context),
