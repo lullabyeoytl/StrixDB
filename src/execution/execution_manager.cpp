@@ -102,6 +102,43 @@ void write_bounded_output(const std::string &output, Context *context) {
     }
 }
 
+auto truncate_cell(std::string value, size_t width) -> std::string {
+    if (value.size() > width) {
+        value = value.substr(0, width - 3) + "...";
+    }
+    return value;
+}
+
+void append_separator_line(const std::vector<size_t> &col_widths, std::string &output) {
+    for (size_t width : col_widths) {
+        output += "+" + std::string(width + 2, '-');
+    }
+    output += "+\n";
+}
+
+void append_record_line(const std::vector<std::string> &record, const std::vector<size_t> &col_widths, std::string &output) {
+    assert(record.size() == col_widths.size());
+    for (size_t i = 0; i < record.size(); ++i) {
+        const auto value = truncate_cell(record[i], col_widths[i]);
+        output += "| " + std::string(col_widths[i] - value.size(), ' ') + value + " ";
+    }
+    output += "|\n";
+}
+
+auto render_table_output(const std::vector<std::string> &captions, const std::vector<std::vector<std::string>> &rows,
+                         const std::vector<size_t> &col_widths) -> std::string {
+    std::string output;
+    append_separator_line(col_widths, output);
+    append_record_line(captions, col_widths, output);
+    append_separator_line(col_widths, output);
+    for (const auto &row : rows) {
+        append_record_line(row, col_widths, output);
+    }
+    append_separator_line(col_widths, output);
+    output += "Total record(s): " + std::to_string(rows.size()) + "\n";
+    return output;
+}
+
 }  // namespace
 
 const char *help_info = "Supported SQL syntax:\n"
@@ -275,22 +312,8 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
                                                        : RecordPrinter::DEFAULT_COL_WIDTH);
     }
 
-    // Print header into buffer
-    RecordPrinter rec_printer(std::move(col_widths));
-    rec_printer.print_separator(context);
-    rec_printer.print_record(captions, context);
-    rec_printer.print_separator(context);
-    // print header into file
-    std::fstream outfile;
-    outfile.open("output.txt", std::ios::out | std::ios::app);
-    outfile << "|";
-    for (size_t i = 0; i < captions.size(); ++i) {
-        outfile << " " << captions[i] << " |";
-    }
-    outfile << "\n";
-
-    // Print records
-    size_t num_rec = 0;
+    RecordPrinter rec_printer(col_widths);
+    std::vector<std::vector<std::string>> rows;
 
     // 执行query_plan
    auto value_to_string = [](const Value &value) {
@@ -315,19 +338,27 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
         for (auto &col : executorTreeRoot->cols()) {
             columns.push_back(value_to_string(get_col_value(*Tuple, col)));
         }
-        rec_printer.print_record(columns, context);
-        outfile << "|";
-        for (size_t i = 0; i < columns.size(); ++i) {
-            outfile << " " << columns[i] << " |";
-        }
-        outfile << "\n";
-        num_rec++;
+        rows.push_back(std::move(columns));
     }
-    outfile.close();
-    // Print footer into buffer
+
+    const auto num_rec = rows.size();
+
+    // Print result into buffer
     rec_printer.print_separator(context);
-    // Print record count into buffer
+    rec_printer.print_record(captions, context);
+    rec_printer.print_separator(context);
+    for (const auto &row : rows) {
+        rec_printer.print_record(row, context);
+    }
+    rec_printer.print_separator(context);
     RecordPrinter::print_record_count(num_rec, context);
+
+    const auto file_output = render_table_output(captions, rows, col_widths);
+
+    std::fstream outfile;
+    outfile.open("output.txt", std::ios::out | std::ios::app);
+    outfile << file_output;
+    outfile.close();
 }
 
 void QlManager::explain_analyze(std::unique_ptr<AbstractExecutor> executorTreeRoot, Context *context) {
