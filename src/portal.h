@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <iomanip>
 #include <map>
 #include <set>
 #include <sstream>
@@ -99,17 +100,42 @@ class Portal
         return result;
     }
 
-    std::string format_value(const Value &value) const {
+    std::string format_float_value(float value) const {
         std::ostringstream os;
+        os << std::fixed << std::setprecision(6) << value;
+        std::string rendered = os.str();
+        while (!rendered.empty() && rendered.back() == '0') {
+            rendered.pop_back();
+        }
+        if (!rendered.empty() && rendered.back() == '.') {
+            rendered.push_back('0');
+        }
+        return rendered.empty() ? "0.0" : rendered;
+    }
+
+    std::string format_string_value(const std::string &value) const {
+        std::string rendered;
+        rendered.reserve(value.size() + 2);
+        rendered.push_back('\'');
+        for (char ch : value) {
+            if (ch == '\'') {
+                rendered.push_back('\'');
+            }
+            rendered.push_back(ch);
+        }
+        rendered.push_back('\'');
+        return rendered;
+    }
+
+    std::string format_value(const Value &value) const {
         if (value.type == TYPE_INT) {
             return std::to_string(value.int_val);
         }
         if (value.type == TYPE_FLOAT) {
-            os << value.float_val;
-            return os.str();
+            return format_float_value(value.float_val);
         }
         if (value.type == TYPE_STRING) {
-            return value.str_val;
+            return format_string_value(value.str_val);
         }
         throw InternalError("Unexpected value type in explain output");
     }
