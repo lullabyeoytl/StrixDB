@@ -108,9 +108,9 @@ class Portal
             rendered.pop_back();
         }
         if (!rendered.empty() && rendered.back() == '.') {
-            rendered.push_back('0');
+            rendered.pop_back();
         }
-        return rendered.empty() ? "0.0" : rendered;
+        return rendered.empty() ? "0" : rendered;
     }
 
     std::string format_string_value(const std::string &value) const {
