@@ -42,7 +42,7 @@ void append_executor_tree(const AbstractExecutor *executor, int depth, std::stri
 
     out += explain_indent(depth) + executor->explain_name() + "(";
     if (!executor->explain_attrs().empty()) {
-        out += executor->explain_attrs() + ",";
+        out += executor->explain_attrs() + ", ";
     }
     out += "rows=" + std::to_string(executor->rows()) + ")\n";
 
