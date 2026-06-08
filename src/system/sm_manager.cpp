@@ -12,7 +12,6 @@ See the Mulan PSL v2 for more details. */
 
 #include <sys/stat.h>
 #include <unistd.h>
-#include <filesystem>
 
 #include <fstream>
 
@@ -74,9 +73,8 @@ void SmManager::drop_db(const std::string& db_name) {
     if (!is_dir(db_name)) {
         throw DatabaseNotFoundError(db_name);
     }
-    try {
-        std::filesystem::remove_all(db_name);
-    } catch (...) {
+    std::string cmd = "rm -r " + db_name;
+    if (system(cmd.c_str()) < 0) {
         throw UnixError();
     }
 }
