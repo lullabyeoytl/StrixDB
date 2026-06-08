@@ -620,12 +620,8 @@ std::vector<std::pair<std::string, std::shared_ptr<Plan>>> Planner::build_table_
             curr_conds = it->second;
         }
         ScanBuildResult scan_result;
-        if (query->is_explain_analyze) {
-            scan_result.scan = std::make_shared<ScanPlan>(sm_manager_, tab_name, std::vector<Condition>());
-            scan_result.filter_conds = std::move(curr_conds);
-        } else {
-            scan_result = make_scan_plan(tab_name, curr_conds, required_cols);
-        }
+        scan_result.scan = std::make_shared<ScanPlan>(sm_manager_, tab_name, std::vector<Condition>());
+        scan_result.filter_conds = std::move(curr_conds);
         if (plan_context.empty_tables.count(tab_name) != 0) {
             scan_result.scan->empty_result_ = true;
         }
@@ -634,7 +630,7 @@ std::vector<std::pair<std::string, std::shared_ptr<Plan>>> Planner::build_table_
             node = std::make_shared<FilterPlan>(std::move(node), std::move(scan_result.filter_conds));
         }
         const auto &table_cols = sm_manager_->db_.get_table(tab_name).cols;
-        if (query->is_explain_analyze && !required_cols.empty() && required_cols.size() < table_cols.size()) {
+        if (query->tables.size() > 1 && !required_cols.empty() && required_cols.size() < table_cols.size()) {
             node = std::make_shared<ProjectionPlan>(T_Projection, std::move(node), std::move(required_cols));
         }
         result.emplace_back(tab_name, std::move(node));
