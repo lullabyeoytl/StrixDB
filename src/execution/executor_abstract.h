@@ -55,6 +55,14 @@ class AbstractExecutor: public NonCopyable {
 
     virtual std::string getType() { return "AbstractExecutor"; };
 
+    virtual void set_ssi_read_tracking_enabled(bool enabled) {
+        for (auto *child : children_) {
+            if (child != nullptr) {
+                child->set_ssi_read_tracking_enabled(enabled);
+            }
+        }
+    }
+
     void set_explain_info(std::string name, std::string attrs = std::string()) {
         explain_name_ = std::move(name);
         explain_attrs_ = std::move(attrs);

@@ -25,6 +25,7 @@ class SeqScanExecutor : public AbstractExecutor {
     std::vector<ColMeta> cols_;         // scan后生成的记录的字段
     size_t len_;                        // scan后生成的每条记录的长度
     bool empty_result_ = false;
+    bool ssi_read_tracking_enabled_ = true;
 
     Rid rid_;
     std::unique_ptr<RecScan> scan_;     // table_iterator
@@ -58,7 +59,9 @@ class SeqScanExecutor : public AbstractExecutor {
             auto record = fetch_visible_record(rid_);
             if (record != nullptr && evaluate_conditions(conds_, *record, cols_)) {
                 // 登记点读
-                track_ssi_record_read(context_, tab_name_, conds_, rid_, *record);
+                if (ssi_read_tracking_enabled_) {
+                    track_ssi_record_read(context_, tab_name_, conds_, rid_, *record);
+                }
                 return;
             }
             scan_->next();
@@ -91,7 +94,9 @@ class SeqScanExecutor : public AbstractExecutor {
 
     void restartTupleImpl() override {
         // 登记已读范围
-        track_ssi_predicate_read(context_, tab_name_, conds_);
+        if (ssi_read_tracking_enabled_) {
+            track_ssi_predicate_read(context_, tab_name_, conds_);
+        }
         if (empty_result_) {
             scan_.reset();
             set_end();
@@ -126,6 +131,10 @@ class SeqScanExecutor : public AbstractExecutor {
 
     // Expose the scan kind so upper DML executors can choose their row consumption strategy.
     std::string getType() override { return "SeqScanExecutor"; }
+
+    void set_ssi_read_tracking_enabled(bool enabled) override {
+        ssi_read_tracking_enabled_ = enabled;
+    }
 
     size_t tupleLen() const override { return len_; }
 

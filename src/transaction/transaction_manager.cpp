@@ -489,8 +489,11 @@ void TransactionManager::commit(Transaction *txn, LogManager *log_manager) {
 
     // Version links are finalized per tuple without holding the transaction map lock.
     if (IsMvccActive(txn) && sm_manager_ != nullptr) {
-        // for all write records set version link head to committed
-        for (auto *write_record : *txn->get_write_set()) {
+        // For repeated writes on one tuple, the last write record carries the
+        // committed tuple state represented by the current version-link head.
+        auto &write_set = *txn->get_write_set();
+        for (auto it = write_set.rbegin(); it != write_set.rend(); ++it) {
+            auto *write_record = *it;
             const auto &tab_name = write_record->GetTableName();
             auto metadata_lock = sm_manager_->LockMetadataShared();
             auto fh_it = sm_manager_->fhs_.find(tab_name);

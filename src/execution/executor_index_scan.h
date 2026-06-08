@@ -55,6 +55,7 @@ class IndexScanExecutor : public AbstractExecutor {
     std::vector<std::string> index_col_names_;  // index scan涉及到的索引包含的字段
     IndexMeta index_meta_;                      // index scan涉及到的索引元数据
     bool use_covering_index_ = false;
+    bool ssi_read_tracking_enabled_ = true;
     std::vector<int> covered_key_offsets_;
     std::vector<ColMeta> index_eval_cols_;
 
@@ -145,7 +146,9 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void track_ssi_record_read(const Rid &rid, const RmRecord &record) {
-        ::track_ssi_record_read(context_, tab_name_, all_conds_, rid, record);
+        if (ssi_read_tracking_enabled_) {
+            ::track_ssi_record_read(context_, tab_name_, all_conds_, rid, record);
+        }
     }
 
     auto seek_to_next_covered_tuple() -> bool {
@@ -444,7 +447,9 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void restartTupleImpl() override {
-        track_ssi_predicate_read(context_, tab_name_, all_conds_);
+        if (ssi_read_tracking_enabled_) {
+            track_ssi_predicate_read(context_, tab_name_, all_conds_);
+        }
 
         auto ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_);
         auto *ih = sm_manager_->ihs_.at(ix_name).get();
@@ -516,6 +521,10 @@ class IndexScanExecutor : public AbstractExecutor {
 
     // Expose the scan kind so upper DML executors can choose their row consumption strategy.
     std::string getType() override { return "IndexScanExecutor"; }
+
+    void set_ssi_read_tracking_enabled(bool enabled) override {
+        ssi_read_tracking_enabled_ = enabled;
+    }
 
     size_t tupleLen() const override { return len_; }
 
