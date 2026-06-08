@@ -53,7 +53,8 @@ typedef enum PlanTag{
     T_Limit,
     T_Filter,
     T_Projection,
-    T_Aggregation
+    T_Aggregation,
+    T_Union
 } PlanTag;
 
 enum AggStrategy {
@@ -323,6 +324,20 @@ class AggregationPlan : public Plan
         std::vector<AggInfo> agg_infos_;
         std::vector<TabCol> group_by_cols_;
         std::vector<HavingCond> having_conds_;
+};
+
+class UnionPlan : public Plan
+{
+    public:
+        UnionPlan(std::vector<std::shared_ptr<Plan>> subplans, std::vector<ColMeta> output_cols)
+        {
+            Plan::tag = T_Union;
+            subplans_ = std::move(subplans);
+            output_cols_ = std::move(output_cols);
+        }
+        ~UnionPlan(){}
+        std::vector<std::shared_ptr<Plan>> subplans_;
+        std::vector<ColMeta> output_cols_;
 };
 
 // dml语句，包括insert; delete; update; select语句　

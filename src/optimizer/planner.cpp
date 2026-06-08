@@ -969,6 +969,13 @@ size_t Planner::estimate_input_rows(const std::shared_ptr<Plan> &plan) const {
     if (auto aggregation = std::dynamic_pointer_cast<AggregationPlan>(plan)) {
         return estimate_input_rows(aggregation->subplan_);
     }
+    if (auto union_plan = std::dynamic_pointer_cast<UnionPlan>(plan)) {
+        size_t total = 0;
+        for (const auto &subplan : union_plan->subplans_) {
+            total += estimate_input_rows(subplan);
+        }
+        return total;
+    }
     if (auto join = std::dynamic_pointer_cast<PhysicalJoinPlan>(plan)) {
         return std::max(estimate_input_rows(join->left_), estimate_input_rows(join->right_));
     }
@@ -1084,6 +1091,20 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
     return plannerRoot;
 }
 
+std::shared_ptr<Plan> Planner::generate_union_select_plan(std::shared_ptr<Query> query, Context *context) {
+    std::vector<std::shared_ptr<Plan>> branch_plans;
+    branch_plans.reserve(query->union_branch_queries.size());
+    for (auto &branch_query : query->union_branch_queries) {
+        branch_plans.push_back(generate_select_plan(std::move(branch_query), context));
+    }
+
+    std::shared_ptr<Plan> plan = std::make_shared<UnionPlan>(std::move(branch_plans), query->union_output_cols);
+    plan = generate_sort_plan(query, std::move(plan));
+    plan = generate_limit_plan(query, std::move(plan));
+    plan = std::make_shared<ProjectionPlan>(T_Projection, std::move(plan), query->select_items, query->output_names);
+    return plan;
+}
+
 // 生成DDL语句和DML语句的查询执行计划
 std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context *context)
 {
@@ -1143,7 +1164,12 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context 
         auto table_display_names = query->table_display_names;
         bool display_wildcard = x->select_items.empty();
         // 生成select语句的查询执行计划
-        std::shared_ptr<Plan> projection = generate_select_plan(std::move(query), context);
+        std::shared_ptr<Plan> projection;
+        if (!query->union_branch_queries.empty()) {
+            projection = generate_union_select_plan(std::move(query), context);
+        } else {
+            projection = generate_select_plan(std::move(query), context);
+        }
         plannerRoot = std::make_shared<DMLPlan>(T_select, projection, std::string(), std::vector<Value>(),
                                                     std::vector<Condition>(), std::vector<SetClause>(),
                                                     is_explain_analyze,

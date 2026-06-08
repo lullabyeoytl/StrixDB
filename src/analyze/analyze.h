@@ -45,6 +45,8 @@ class Query{
     // ORDER BY keys are normalized during analysis so downstream layers share one spec model.
     std::vector<SortKeySpec> order_by_keys;
     std::optional<LimitSpec> limit_spec;
+    std::vector<ColMeta> union_output_cols;
+    std::vector<std::shared_ptr<Query>> union_branch_queries;
     bool is_explain_analyze = false;
 
     Query(){}
@@ -73,4 +75,9 @@ private:
     ColType get_column_type(const std::vector<ColMeta> &all_cols, const TabCol &target);
     ColType agg_result_type(const AggInfo &agg, const std::vector<ColMeta> &all_cols);
     void check_aggregate(const std::vector<ColMeta> &all_cols, Query &query);
+    std::vector<ColMeta> analyze_select_output_cols(const std::shared_ptr<ast::SelectStmt> &select,
+                                                    std::shared_ptr<Query> *branch_query_out = nullptr);
+    std::vector<ColMeta> analyze_union_output_cols(const std::shared_ptr<ast::UnionQuery> &union_query,
+                                                   const std::string &alias,
+                                                   std::vector<std::shared_ptr<Query>> *branch_queries_out = nullptr);
 };

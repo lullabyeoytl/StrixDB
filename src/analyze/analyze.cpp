@@ -142,6 +142,22 @@ void append_unique_agg(std::vector<AggInfo> &agg_infos, const AggInfo &agg) {
     }
 }
 
+auto common_union_col(const ColMeta &first, const ColMeta &next) -> ColMeta {
+    ColMeta result = first;
+    if (first.type == next.type) {
+        if (first.type == TYPE_STRING) {
+            result.len = std::max(first.len, next.len);
+        }
+        return result;
+    }
+    if (is_numeric_type(first.type) && is_numeric_type(next.type)) {
+        result.type = TYPE_FLOAT;
+        result.len = sizeof(float);
+        return result;
+    }
+    throw IncompatibleTypeError(coltype2str(first.type), coltype2str(next.type));
+}
+
 }  // namespace
 
 
@@ -163,6 +179,36 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
     }
     if (auto x = std::dynamic_pointer_cast<ast::SelectStmt>(parse))
     {
+        if (x->table_refs.size() == 1 && x->table_refs.front()->is_derived()) {
+            auto union_query = std::dynamic_pointer_cast<ast::UnionQuery>(x->table_refs.front()->query);
+            if (union_query == nullptr) {
+                throw InternalError("Unexpected derived query type");
+            }
+            query->tables = x->tabs;
+            query->table_display_names[x->table_refs.front()->name] = x->table_refs.front()->alias;
+            query->union_output_cols = analyze_union_output_cols(union_query, x->table_refs.front()->alias,
+                                                                 &query->union_branch_queries);
+            for (const auto &col : query->union_output_cols) {
+                TabCol tab_col{col.tab_name, col.name};
+                query->cols.push_back(tab_col);
+                query->select_items.push_back(tab_col);
+                query->output_names.push_back(col.name);
+            }
+            if (x->has_sort) {
+                for (const auto &sv_order_item : x->order->items) {
+                    if (classify_order_expr(sv_order_item->expr) != OrderExprKind::Column) {
+                        throw RMDBError("UNION derived table ORDER BY only supports output columns");
+                    }
+                    auto sv_order_col = std::static_pointer_cast<ast::Col>(sv_order_item->expr);
+                    TabCol order_col{sv_order_col->tab_name, sv_order_col->col_name};
+                    check_column(query->union_output_cols, order_col);
+                    query->order_by_keys.push_back(
+                        SortKeySpec{std::move(order_col), sv_order_item->orderby_dir == ast::OrderBy_DESC});
+                }
+            }
+            query->parse = std::move(parse);
+            return query;
+        }
         // 处理表名
         query->tables = x->tabs;
         std::map<std::string, std::string> name_to_table;
@@ -452,6 +498,91 @@ void Analyze::check_clause(const std::vector<ColMeta> &all_cols, std::vector<Con
             throw IncompatibleTypeError(coltype2str(lhs_type), coltype2str(rhs_type));
         }
     }
+}
+
+std::vector<ColMeta> Analyze::analyze_select_output_cols(const std::shared_ptr<ast::SelectStmt> &select,
+                                                         std::shared_ptr<Query> *branch_query_out) {
+    auto branch_query = do_analyze(select);
+    std::vector<ColMeta> all_cols;
+    get_all_cols(branch_query->tables, all_cols);
+
+    std::vector<ColMeta> output_cols;
+    output_cols.reserve(branch_query->select_items.size());
+    for (size_t i = 0; i < branch_query->select_items.size(); ++i) {
+        const auto &selected = branch_query->select_items[i];
+        ColMeta output_col;
+        if (selected.tab_name.empty()) {
+            auto agg_it = std::find_if(branch_query->agg_infos.begin(), branch_query->agg_infos.end(),
+                                       [&](const AggInfo &agg) { return agg_output_name(agg) == selected.col_name; });
+            if (agg_it == branch_query->agg_infos.end()) {
+                throw InternalError("Unable to bind SELECT output column");
+            }
+            output_col.tab_name = selected.tab_name;
+            output_col.name = selected.col_name;
+            output_col.type = agg_result_type(*agg_it, all_cols);
+            if (output_col.type == TYPE_INT) {
+                output_col.len = sizeof(int);
+            } else if (output_col.type == TYPE_FLOAT) {
+                output_col.len = sizeof(float);
+            } else if (output_col.type == TYPE_STRING) {
+                output_col.len = find_col_meta(all_cols, agg_it->col).len;
+            } else if (output_col.type == TYPE_DATETIME) {
+                output_col.len = kDatetimeLen;
+            } else {
+                throw InternalError("Unexpected aggregate output type");
+            }
+        } else {
+            output_col = find_col_meta(all_cols, selected);
+        }
+        output_col.name = branch_query->output_names[i];
+        output_cols.push_back(std::move(output_col));
+    }
+    if (branch_query_out != nullptr) {
+        *branch_query_out = std::move(branch_query);
+    }
+    return output_cols;
+}
+
+std::vector<ColMeta> Analyze::analyze_union_output_cols(const std::shared_ptr<ast::UnionQuery> &union_query,
+                                                        const std::string &alias,
+                                                        std::vector<std::shared_ptr<Query>> *branch_queries_out) {
+    if (union_query->branches.size() < 2) {
+        throw RMDBError("UNION requires at least two branches");
+    }
+
+    std::vector<std::vector<ColMeta>> branch_cols;
+    branch_cols.reserve(union_query->branches.size());
+    std::vector<std::shared_ptr<Query>> branch_queries;
+    branch_queries.reserve(union_query->branches.size());
+    for (const auto &branch : union_query->branches) {
+        std::shared_ptr<Query> branch_query;
+        branch_cols.push_back(analyze_select_output_cols(branch, &branch_query));
+        branch_queries.push_back(std::move(branch_query));
+    }
+
+    const auto &first_cols = branch_cols.front();
+    std::vector<ColMeta> output_cols = first_cols;
+    for (size_t branch_idx = 1; branch_idx < branch_cols.size(); ++branch_idx) {
+        if (branch_cols[branch_idx].size() != first_cols.size()) {
+            throw RMDBError("UNION branches must have the same number of columns");
+        }
+        for (size_t col_idx = 0; col_idx < output_cols.size(); ++col_idx) {
+            output_cols[col_idx] = common_union_col(output_cols[col_idx], branch_cols[branch_idx][col_idx]);
+        }
+    }
+
+    int offset = 0;
+    for (size_t i = 0; i < output_cols.size(); ++i) {
+        output_cols[i].tab_name = alias;
+        output_cols[i].name = first_cols[i].name;
+        output_cols[i].offset = offset;
+        output_cols[i].index = false;
+        offset += output_cols[i].len;
+    }
+    if (branch_queries_out != nullptr) {
+        *branch_queries_out = std::move(branch_queries);
+    }
+    return output_cols;
 }
 
 

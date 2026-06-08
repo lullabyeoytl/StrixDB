@@ -97,6 +97,7 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "LIMIT" { return LIMIT; }
 "OFFSET" { return OFFSET; }
 "AS" { return AS; }
+"UNION" { return UNION; }
 "ASC" { return ASC; }
 "COUNT" { return COUNT; }
 "SUM" { return SUM; }

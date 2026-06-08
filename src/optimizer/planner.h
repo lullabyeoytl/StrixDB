@@ -103,6 +103,7 @@ class Planner {
     std::shared_ptr<Plan> generate_aggregate_plan(std::shared_ptr<Query> query, std::shared_ptr<Plan> plan);
 
     std::shared_ptr<Plan> generate_select_plan(std::shared_ptr<Query> query, Context *context);
+    std::shared_ptr<Plan> generate_union_select_plan(std::shared_ptr<Query> query, Context *context);
 
 
     // int get_indexNo(std::string tab_name, std::vector<Condition> curr_conds);

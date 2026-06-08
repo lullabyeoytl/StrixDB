@@ -39,7 +39,7 @@ void append_join_clause(std::vector<std::shared_ptr<JoinExpr>> &join_exprs,
 %param {yyscan_t yyscanner}
 
 // keywords
-%token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY LIMIT OFFSET AS
+%token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY LIMIT OFFSET AS UNION
 WHERE UPDATE SET SELECT INT CHAR FLOAT DATETIME INDEX UNIQUE AND ON SEMI JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE ENABLE_HASHJOIN
 %token COUNT SUM AVG MIN MAX GROUP HAVING EXPLAIN ANALYZE
 // non-keywords
@@ -52,20 +52,22 @@ WHERE UPDATE SET SELECT INT CHAR FLOAT DATETIME INDEX UNIQUE AND ON SEMI JOIN EX
 %token <sv_bool> VALUE_BOOL
 
 // specify types for non-terminal symbol
-%type <sv_node> stmt dbStmt ddl dml txnStmt setStmt selectStmt explainAnalyzeTarget
+%type <sv_node> stmt dbStmt ddl dml txnStmt setStmt explainAnalyzeTarget
+%type <sv_query> unionQuery
 %type <sv_field> field
 %type <sv_fields> fieldList
 %type <sv_type_len> type
 %type <sv_comp_op> op
 %type <sv_expr> expr
 %type <sv_select_item> selectItem
-%type <sv_select_items> selectItemList selector
+%type <sv_select_items> selectItemList
+%type <sv_select_stmt> selectStmt plainSelectStmt derivedUnionSelectStmt
 %type <sv_agg_func> agg_func
 %type <sv_val> value
 %type <sv_vals> valueList
 %type <sv_str> tbName colName
 %type <sv_strs> colNameList
-%type <sv_table_ref> tableRef
+%type <sv_table_ref> tableRef derivedTableRef
 %type <sv_table_refs> tableRefList
 %type <sv_join_exprs> joinClauseList
 %type <sv_join_type> joinType
@@ -209,10 +211,28 @@ dml:
         $$ = std::make_shared<UpdateStmt>($2, $4, $5);
     }
     |   selectStmt
+    {
+        $$ = std::static_pointer_cast<TreeNode>($1);
+    }
     ;
 
 selectStmt:
-        SELECT selector FROM tableRefList optWhereClause opt_group_clause opt_having_clause opt_order_clause opt_limit_clause
+        plainSelectStmt
+    |   derivedUnionSelectStmt
+    ;
+
+plainSelectStmt:
+        SELECT '*' FROM tableRefList optWhereClause opt_group_clause opt_having_clause opt_order_clause opt_limit_clause
+    {
+        std::vector<std::string> tabs;
+        tabs.reserve($4.size());
+        for (const auto &ref : $4) {
+            tabs.push_back(ref->name);
+        }
+        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<SelectItem>>(), std::move(tabs), $5, $8, $6, $7, $9,
+                                          std::vector<std::shared_ptr<JoinExpr>>(), std::move($4));
+    }
+    |   SELECT selectItemList FROM tableRefList optWhereClause opt_group_clause opt_having_clause opt_order_clause opt_limit_clause
     {
         std::vector<std::string> tabs;
         tabs.reserve($4.size());
@@ -222,7 +242,24 @@ selectStmt:
         $$ = std::make_shared<SelectStmt>($2, std::move(tabs), $5, $8, $6, $7, $9,
                                           std::vector<std::shared_ptr<JoinExpr>>(), std::move($4));
     }
-    |   SELECT selector FROM tableRef joinClauseList optWhereClause opt_group_clause opt_having_clause opt_order_clause opt_limit_clause
+    |   SELECT '*' FROM tableRef joinClauseList optWhereClause opt_group_clause opt_having_clause opt_order_clause opt_limit_clause
+    {
+        std::vector<std::shared_ptr<TableRef>> table_refs{$4};
+        std::vector<std::string> tabs{$4->name};
+        std::string current_left = $4->alias;
+        auto right_refs = std::move($<sv_table_refs>5);
+        for (size_t i = 0; i < $5.size(); ++i) {
+            auto &join_expr = $5[i];
+            const auto &right_ref = right_refs[i];
+            join_expr->left = current_left;
+            table_refs.push_back(right_ref);
+            tabs.push_back(right_ref->name);
+            current_left = join_expr->right;
+        }
+        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<SelectItem>>(), std::move(tabs), $6, $9, $7, $8, $10,
+                                          std::move($5), std::move(table_refs));
+    }
+    |   SELECT selectItemList FROM tableRef joinClauseList optWhereClause opt_group_clause opt_having_clause opt_order_clause opt_limit_clause
     {
         std::vector<std::shared_ptr<TableRef>> table_refs{$4};
         std::vector<std::string> tabs{$4->name};
@@ -238,6 +275,18 @@ selectStmt:
         }
         $$ = std::make_shared<SelectStmt>($2, std::move(tabs), $6, $9, $7, $8, $10,
                                           std::move($5), std::move(table_refs));
+    }
+    ;
+
+derivedUnionSelectStmt:
+        SELECT '*' FROM derivedTableRef opt_order_clause
+    {
+        std::vector<std::shared_ptr<TableRef>> table_refs{$4};
+        std::vector<std::string> tabs{$4->name};
+        $$ = std::make_shared<SelectStmt>(std::vector<std::shared_ptr<SelectItem>>(), std::move(tabs),
+                                          std::vector<std::shared_ptr<BinaryExpr>>(), $5, nullptr,
+                                          std::vector<std::shared_ptr<ast::HavingCond>>(), nullptr,
+                                          std::vector<std::shared_ptr<JoinExpr>>(), std::move(table_refs));
     }
     ;
 
@@ -305,6 +354,19 @@ field:
     |   UNIQUE '(' colNameList ')'
     {
         $$ = std::make_shared<UniqueDef>($3);
+    }
+    ;
+
+unionQuery:
+        plainSelectStmt UNION plainSelectStmt
+    {
+        $$ = std::make_shared<UnionQuery>(std::vector<std::shared_ptr<SelectStmt>>{$1, $3});
+    }
+    |   unionQuery UNION plainSelectStmt
+    {
+        auto union_query = std::static_pointer_cast<UnionQuery>($1);
+        union_query->branches.push_back($3);
+        $$ = union_query;
     }
     ;
 
@@ -512,14 +574,6 @@ setClause:
     }
     ;
 
-selector:
-        '*'
-    {
-        $$ = {};
-    }
-    |   selectItemList
-    ;
-
 selectItem:
         expr
     {
@@ -609,6 +663,13 @@ tableRef:
     |   tbName AS IDENTIFIER
     {
         $$ = std::make_shared<TableRef>($1, $3);
+    }
+    ;
+
+derivedTableRef:
+        '(' unionQuery ')' AS IDENTIFIER
+    {
+        $$ = std::make_shared<TableRef>($2, $5);
     }
     ;
 
