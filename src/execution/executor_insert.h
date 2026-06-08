@@ -65,7 +65,39 @@ class InsertExecutor : public AbstractExecutor {
 
         std::vector<std::pair<IndexMeta *, std::unique_ptr<char[]>>> inserted_keys;
         std::vector<std::string> violation_cols;
+        bool version_link_prepared = false;
+        bool heap_inserted = false;
+        auto cleanup_insert_attempt = [&]() {
+            for (auto it = inserted_keys.rbegin(); it != inserted_keys.rend(); ++it) {
+                auto ih = sm_manager_->get_ih(tab_name_, it->first->cols);
+                ih->delete_entry(it->second.get(), rid_, context_->txn_);
+            }
+            if (heap_inserted) {
+                try {
+                    fh_->delete_record(rid_, nullptr);
+                } catch (const RecordNotFoundError &) {
+                }
+            }
+            if (version_link_prepared && context_ != nullptr && context_->txn_mgr_ != nullptr &&
+                context_->txn_ != nullptr) {
+                txn_id_t txn_id = context_->txn_->get_transaction_id();
+                context_->txn_mgr_->UpdateVersionLink(
+                    fh_->GetFd(), rid_, std::nullopt,
+                    [txn_id](std::optional<VersionUndoLink> current) {
+                        return current.has_value() && current->prev_.prev_txn_ == txn_id;
+                    });
+            }
+            fh_->release_reserved_rid(rid_);
+        };
         try {
+            if (context_ != nullptr && context_->txn_mgr_ != nullptr && context_->txn_ != nullptr) {
+                context_->txn_mgr_->PrepareInsert(fh_->GetFd(), rid_, rec, context_->txn_);
+                version_link_prepared = TransactionManager::IsMvccActive(context_->txn_);
+            }
+
+            fh_->insert_record(rid_, rec.data, INVALID_LSN);
+            heap_inserted = true;
+
             for (size_t i = 0; i < tab_.indexes.size(); ++i) {
                 auto &index = tab_.indexes[i];
                 auto ih = sm_manager_->get_ih(tab_name_, index.cols);
@@ -90,27 +122,17 @@ class InsertExecutor : public AbstractExecutor {
                 op_lsn = context_->log_mgr_->add_log_to_buffer(&log_record);
                 context_->txn_->set_prev_lsn(op_lsn);
             }
-
-            fh_->insert_record(rid_, rec.data, op_lsn);
             if (context_ != nullptr && context_->txn_ != nullptr) {
-                if (context_->txn_mgr_ != nullptr) {
-                    context_->txn_mgr_->PrepareInsert(fh_->GetFd(), rid_, rec, context_->txn_);
+                if (op_lsn != INVALID_LSN) {
+                    fh_->set_page_lsn(rid_, op_lsn);
                 }
                 context_->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name_, rid_, op_prev_lsn));
             }
         } catch (const UniqueKeyViolationError &) {
-            for (auto it = inserted_keys.rbegin(); it != inserted_keys.rend(); ++it) {
-                auto ih = sm_manager_->get_ih(tab_name_, it->first->cols);
-                ih->delete_entry(it->second.get(), rid_, context_->txn_);
-            }
-            fh_->release_reserved_rid(rid_);
+            cleanup_insert_attempt();
             throw UniqueViolationError(tab_name_, violation_cols);
         } catch (...) {
-            for (auto it = inserted_keys.rbegin(); it != inserted_keys.rend(); ++it) {
-                auto ih = sm_manager_->get_ih(tab_name_, it->first->cols);
-                ih->delete_entry(it->second.get(), rid_, context_->txn_);
-            }
-            fh_->release_reserved_rid(rid_);
+            cleanup_insert_attempt();
             throw;
         }
         return nullptr;

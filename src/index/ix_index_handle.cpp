@@ -259,7 +259,7 @@ IndexVisibility IxIndexHandle::check_entry_visibility(const Rid &rid, Transactio
         return IndexVisibility{!link->is_deleted_, false, true};
     }
 
-    return IndexVisibility{true, false, true};
+    return IndexVisibility{true, true, true};
 }
 
 /**
@@ -353,8 +353,13 @@ void IxIndexHandle::validate_unique_hit(const char *key, const Rid &hit, IndexVi
 
     if (visibility.check_write_conflict) {
         auto link = txn_mgr_->GetVersionLink(table_fd_, hit);
-        if (link.has_value() && link->in_progress_ && link->prev_.prev_txn_ != transaction->get_transaction_id()) {
-            throw TransactionAbortException(transaction->get_transaction_id(), AbortReason::WRITE_CONFLICT);
+        if (link.has_value()) {
+            if (link->in_progress_ && link->prev_.prev_txn_ != transaction->get_transaction_id()) {
+                throw TransactionAbortException(transaction->get_transaction_id(), AbortReason::WRITE_CONFLICT);
+            }
+            if (!link->in_progress_ && link->ts_ != INVALID_TS && link->ts_ > transaction->get_start_ts()) {
+                throw TransactionAbortException(transaction->get_transaction_id(), AbortReason::WRITE_CONFLICT);
+            }
         }
     }
 

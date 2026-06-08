@@ -1103,7 +1103,7 @@ bool TransactionManager::HasDangerousStructure(Transaction *from, Transaction *t
             return true;
         }
         if (tout->get_state() != TransactionState::COMMITTED) {
-            return true;
+            return false;
         }
         if (tin->get_state() == TransactionState::COMMITTED) {
             return tout->get_commit_ts() < tin->get_commit_ts();
