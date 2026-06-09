@@ -13,7 +13,6 @@ See the Mulan PSL v2 for more details. */
 #include <assert.h>    // for assert
 #include <errno.h>
 #include <string.h>    // for memset
-#include <filesystem>
 #include <sys/stat.h>  // for stat
 #include <unistd.h>    // for lseek
 
@@ -111,17 +110,15 @@ bool DiskManager::is_dir(const std::string& path) {
 }
 
 void DiskManager::create_dir(const std::string &path) {
-    try {
-        std::filesystem::create_directories(path);
-    } catch (const std::filesystem::filesystem_error &) {
+    std::string cmd = "mkdir -p " + path;
+    if (system(cmd.c_str()) < 0) {
         throw UnixError();
     }
 }
 
 void DiskManager::destroy_dir(const std::string &path) {
-    try {
-        std::filesystem::remove_all(path);
-    } catch (const std::filesystem::filesystem_error &) {
+    std::string cmd = "rm -r " + path;
+    if (system(cmd.c_str()) < 0) {
         throw UnixError();
     }
 }
