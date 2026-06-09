@@ -82,7 +82,7 @@ public:
     ~TransactionManager();
 
     Transaction* begin(Transaction* txn, LogManager* log_manager,
-                       IsolationLevel isolation_level = IsolationLevel::SERIALIZABLE);
+                       IsolationLevel isolation_level = IsolationLevel::SNAPSHOT_ISOLATION);
 
     void commit(Transaction* txn, LogManager* log_manager);
 

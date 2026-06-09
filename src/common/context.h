@@ -29,7 +29,7 @@ public:
         : lock_mgr_(lock_mgr), log_mgr_(log_mgr), txn_(txn),
           data_send_(data_send), offset_(offset) {
             ellipsis_ = false;
-            isolation_level_ = IsolationLevel::SERIALIZABLE;
+            isolation_level_ = IsolationLevel::SNAPSHOT_ISOLATION;
             txn_mgr_ = nullptr;
           }
 

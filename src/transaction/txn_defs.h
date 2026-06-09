@@ -26,7 +26,7 @@ See the Mulan PSL v2 for more details. */
  */
 enum class TransactionState { DEFAULT, GROWING, SHRINKING, COMMITTED, ABORTED };
 
-/* 系统的隔离级别，当前赛题中为可串行化隔离级别 */
+/* 系统的隔离级别，默认事务级别为快照隔离，可按会话显式切换 */
 enum class IsolationLevel { READ_UNCOMMITTED, REPEATABLE_READ, READ_COMMITTED, SNAPSHOT_ISOLATION, SERIALIZABLE };
 
 /* 事务写操作类型，包括插入、删除、更新三种操作 */
