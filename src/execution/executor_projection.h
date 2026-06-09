@@ -71,4 +71,8 @@ class ProjectionExecutor : public AbstractExecutor {
 
     bool is_end() const override { return prev_->is_end(); }
 
+    void bind_outer_tuple(const RmRecord *record, const std::vector<ColMeta> *cols) override {
+        prev_->bind_outer_tuple(record, cols);
+    }
+
 };

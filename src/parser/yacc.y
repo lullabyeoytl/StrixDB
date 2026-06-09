@@ -574,9 +574,9 @@ tableRef:
     ;
 
 opt_order_clause:
-    ORDER BY order_clause      
-    { 
-        $$ = $3; 
+    ORDER BY order_clause
+    {
+        $$ = $3;
     }
     |   /* epsilon */ { /* ignore*/ }
     ;

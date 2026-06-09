@@ -52,6 +52,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
     }
 
     void begin_right_scan() {
+        right_->bind_outer_tuple(left_rec_.get(), &left_->cols());
         if (!reverse_right_scan_) {
             right_->restartTuple();
             return;
@@ -173,11 +174,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
         cache_right_records();
         left_rid_ = left_->rid();
         left_rec_ = left_->Next();
-        if (reverse_right_scan_) {
-            begin_right_scan();
-        } else {
-            right_->beginTuple();
-        }
+        begin_right_scan();
         isend = false;
         seek_next_match(false);
     }

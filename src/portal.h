@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include <string>
 #include "optimizer/plan.h"
 #include "execution/executor_abstract.h"
+#include "execution/executor_index_nestedloop_join.h"
 #include "execution/executor_nestedloop_join.h"
 #include "execution/executor_projection.h"
 #include "execution/executor_filter.h"
@@ -39,7 +40,6 @@ constexpr int kTreeMaxDepth = 64;
 typedef enum portalTag{
     PORTAL_Invalid_Query = 0,
     PORTAL_ONE_SELECT,
-    PORTAL_EXPLAIN_ANALYZE,
     PORTAL_DML_WITHOUT_SELECT,
     PORTAL_MULTI_QUERY,
     PORTAL_CMD_UTILITY
@@ -237,7 +237,9 @@ class Portal
         if (auto x = std::dynamic_pointer_cast<OtherPlan>(plan)) {
             return std::make_shared<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<TabCol>(), std::unique_ptr<AbstractExecutor>(),plan);
         } else if(auto x = std::dynamic_pointer_cast<SetKnobPlan>(plan)) {
-            return std::make_shared<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<TabCol>(), std::unique_ptr<AbstractExecutor>(), plan); 
+            return std::make_shared<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<TabCol>(), std::unique_ptr<AbstractExecutor>(), plan);
+        } else if (auto x = std::dynamic_pointer_cast<ExplainPlan>(plan)) {
+            return std::make_shared<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<TabCol>(), std::unique_ptr<AbstractExecutor>(), plan);
         } else if (auto x = std::dynamic_pointer_cast<DDLPlan>(plan)) {
             return std::make_shared<PortalStmt>(PORTAL_MULTI_QUERY, std::vector<TabCol>(), std::unique_ptr<AbstractExecutor>(),plan);
         } else if (auto x = std::dynamic_pointer_cast<DMLPlan>(plan)) {
@@ -250,8 +252,7 @@ class Portal
                     if (x->is_explain_analyze_ && x->display_wildcard_) {
                         root->set_explain_info("Project", "columns=[*]");
                     }
-                    auto tag = x->is_explain_analyze_ ? PORTAL_EXPLAIN_ANALYZE : PORTAL_ONE_SELECT;
-                    return std::make_shared<PortalStmt>(tag, std::move(p->sel_cols_), std::move(root), plan);
+                    return std::make_shared<PortalStmt>(PORTAL_ONE_SELECT, std::move(p->sel_cols_), std::move(root), plan);
                 }
                     
                 case T_Update:
@@ -304,12 +305,6 @@ class Portal
             case PORTAL_ONE_SELECT:
             {
                 ql->select_from(std::move(portal->root), std::move(portal->sel_cols), context);
-                break;
-            }
-
-            case PORTAL_EXPLAIN_ANALYZE:
-            {
-                ql->explain_analyze(std::move(portal->root), context);
                 break;
             }
 
@@ -367,17 +362,33 @@ class Portal
                 auto executor = std::make_unique<IndexScanExecutor>(sm_manager_, x->tab_name_, x->index_lookup_conds_,
                                                                     x->residual_conds_, x->index_col_names_,
                                                                     x->index_meta_, context, x->visible_name_);
-                executor->set_explain_info("Scan", "table=" + x->tab_name_ + ", type=IndexScan");
+                std::string attrs = "table=" + x->tab_name_ + ", type=IndexScan";
+                if (!x->index_col_names_.empty()) {
+                    attrs += ", using_index=(" + x->index_col_names_.front() + ")";
+                }
+                executor->set_explain_info("Scan", std::move(attrs));
                 return executor;
             }
         } else if(auto x = std::dynamic_pointer_cast<JoinPlan>(plan)) {
             std::unique_ptr<AbstractExecutor> left = convert_plan_executor(x->left_, context);
+            if (x->tag == T_IndexNestLoop) {
+                auto right_scan = std::dynamic_pointer_cast<ScanPlan>(x->right_);
+                if (right_scan == nullptr) {
+                    throw InternalError("Index nested-loop join requires a scan right child");
+                }
+                auto executor = std::make_unique<IndexNestedLoopJoinExecutor>(
+                    std::move(left), sm_manager_, right_scan->tab_name_, x->conds_, x->index_col_names_, context,
+                    right_scan->visible_name_);
+                executor->set_explain_info("Join", "tables=" + format_table_list(plan) +
+                                                   ", condition=" + format_condition_list(x->display_conds_));
+                return executor;
+            }
             std::unique_ptr<AbstractExecutor> right = convert_plan_executor(x->right_, context);
             auto executor = std::make_unique<NestedLoopJoinExecutor>(
                                 std::move(left),
                                 std::move(right), x->conds_, x->type, x->reverse_right_scan_);
             executor->set_explain_info("Join", "tables=" + format_table_list(plan) +
-                                               ", condition=" + format_condition_list(x->conds_));
+                                               ", condition=" + format_condition_list(x->display_conds_));
             return executor;
         } else if(auto x = std::dynamic_pointer_cast<SortPlan>(plan)) {
             auto executor = std::make_unique<SortExecutor>(convert_plan_executor(x->subplan_, context),

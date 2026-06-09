@@ -94,6 +94,11 @@ class AbstractExecutor {
         return result;
     }
 
+    virtual void bind_outer_tuple(const RmRecord *record, const std::vector<ColMeta> *cols) {
+        (void)record;
+        (void)cols;
+    }
+
     virtual Rid &rid() = 0;
 
     std::unique_ptr<RmRecord> Next() {

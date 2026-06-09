@@ -43,6 +43,7 @@ class Query{
     std::vector<TabCol> group_by_cols;
     std::vector<HavingCond> having_conds;
     bool is_explain_analyze = false;
+    bool display_wildcard = false;
 
     Query(){}
 

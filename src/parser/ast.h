@@ -273,10 +273,9 @@ struct SelectStmt : public TreeNode {
     std::vector<std::shared_ptr<BinaryExpr>> conds;
     std::vector<std::shared_ptr<JoinExpr>> jointree;
 
-    
     bool has_sort;
     std::shared_ptr<OrderBy> order;
-    
+
     bool has_group_by;
     std::shared_ptr<GroupBy> group_by;
     
@@ -291,7 +290,8 @@ struct SelectStmt : public TreeNode {
                std::vector<std::shared_ptr<HavingCond>> having_conds_,
                std::vector<std::shared_ptr<TableRef>> table_refs_ = {}) :
             cols(std::move(cols_)), tabs(std::move(tabs_)), table_refs(std::move(table_refs_)), conds(std::move(conds_)),
-            order(std::move(order_)), group_by(std::move(group_by_)), having_conds(std::move(having_conds_)) {
+            order(std::move(order_)),
+            group_by(std::move(group_by_)), having_conds(std::move(having_conds_)) {
                 if (table_refs.empty()) {
                     for (const auto &tab : tabs) {
                         table_refs.push_back(std::make_shared<TableRef>(tab));
@@ -377,7 +377,7 @@ struct SemValue {
     JoinType sv_join_type;
 
     std::shared_ptr<OrderBy> sv_orderby;
-    
+
     // aggregation concerning
     std::shared_ptr<AggFunc> sv_agg_func;
     std::shared_ptr<GroupBy> sv_group_by;

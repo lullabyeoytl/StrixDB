@@ -11,6 +11,8 @@ See the Mulan PSL v2 for more details. */
 #include "planner.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <set>
@@ -33,6 +35,641 @@ struct JoinSubtree {
     std::shared_ptr<Plan> plan;
     std::set<std::string> tables;
 };
+
+struct LeafPlanShape {
+    std::shared_ptr<ProjectionPlan> projection;
+    std::shared_ptr<FilterPlan> filter;
+    std::shared_ptr<ScanPlan> scan;
+};
+
+std::string ast_col_to_string(const std::shared_ptr<ast::Col> &col) {
+    return col->tab_name.empty() ? col->col_name : col->tab_name + "." + col->col_name;
+}
+
+std::string tab_col_to_string(const TabCol &col) {
+    return col.tab_name.empty() ? col.col_name : col.tab_name + "." + col.col_name;
+}
+
+std::string ast_value_to_string(const std::shared_ptr<ast::Value> &value) {
+    if (auto int_lit = std::dynamic_pointer_cast<ast::IntLit>(value)) {
+        return std::to_string(int_lit->val);
+    }
+    if (auto float_lit = std::dynamic_pointer_cast<ast::FloatLit>(value)) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.6f", float_lit->val);
+        return buf;
+    }
+    if (auto str_lit = std::dynamic_pointer_cast<ast::StringLit>(value)) {
+        return "'" + str_lit->val + "'";
+    }
+    if (auto bool_lit = std::dynamic_pointer_cast<ast::BoolLit>(value)) {
+        return bool_lit->val ? "1" : "0";
+    }
+    return "";
+}
+
+std::string ast_op_to_string(ast::SvCompOp op) {
+    switch (op) {
+        case ast::SV_OP_EQ: return "=";
+        case ast::SV_OP_NE: return "<>";
+        case ast::SV_OP_LT: return "<";
+        case ast::SV_OP_GT: return ">";
+        case ast::SV_OP_LE: return "<=";
+        case ast::SV_OP_GE: return ">=";
+    }
+    return "";
+}
+
+std::string ast_cond_to_string(const std::shared_ptr<ast::BinaryExpr> &cond) {
+    std::string rhs;
+    if (auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs)) {
+        rhs = ast_col_to_string(rhs_col);
+    } else if (auto rhs_val = std::dynamic_pointer_cast<ast::Value>(cond->rhs)) {
+        rhs = ast_value_to_string(rhs_val);
+    }
+    return ast_col_to_string(cond->lhs) + ast_op_to_string(cond->op) + rhs;
+}
+
+std::string sorted_join_string(std::vector<std::string> values) {
+    std::sort(values.begin(), values.end());
+    std::string out;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i != 0) {
+            out += ", ";
+        }
+        out += values[i];
+    }
+    return out;
+}
+
+std::string join_tables_string(const std::set<std::string> &tables) {
+    std::string out;
+    bool first = true;
+    for (const auto &table : tables) {
+        if (!first) {
+            out += ", ";
+        }
+        out += table;
+        first = false;
+    }
+    return out;
+}
+
+bool table_has_filter(const std::vector<std::shared_ptr<ast::BinaryExpr>> &conds, const std::string &visible) {
+    for (const auto &cond : conds) {
+        auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs);
+        if (cond->lhs->tab_name == visible &&
+            (std::dynamic_pointer_cast<ast::Value>(cond->rhs) || (rhs_col && rhs_col->tab_name == visible))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string ast_col_key(const std::shared_ptr<ast::Col> &col) {
+    return col->tab_name + "\x1f" + col->col_name;
+}
+
+void propagate_equal_join_value_filters(std::vector<std::shared_ptr<ast::BinaryExpr>> &conds) {
+    std::map<std::string, std::shared_ptr<ast::Col>> key_to_col;
+    std::map<std::string, std::vector<std::string>> graph;
+    for (const auto &cond : conds) {
+        auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs);
+        if (!rhs_col || cond->op != ast::SV_OP_EQ || cond->lhs->tab_name == rhs_col->tab_name) {
+            continue;
+        }
+        std::string lhs_key = ast_col_key(cond->lhs);
+        std::string rhs_key = ast_col_key(rhs_col);
+        key_to_col[lhs_key] = cond->lhs;
+        key_to_col[rhs_key] = rhs_col;
+        graph[lhs_key].push_back(rhs_key);
+        graph[rhs_key].push_back(lhs_key);
+    }
+
+    std::map<std::string, std::vector<std::shared_ptr<ast::Col>>> component_cols;
+    std::set<std::string> visited;
+    for (const auto &entry : key_to_col) {
+        if (!visited.insert(entry.first).second) {
+            continue;
+        }
+        std::vector<std::string> stack{entry.first};
+        std::vector<std::shared_ptr<ast::Col>> cols;
+        while (!stack.empty()) {
+            std::string current = stack.back();
+            stack.pop_back();
+            cols.push_back(key_to_col.at(current));
+            for (const auto &next : graph[current]) {
+                if (visited.insert(next).second) {
+                    stack.push_back(next);
+                }
+            }
+        }
+        for (const auto &col : cols) {
+            component_cols[ast_col_key(col)] = cols;
+        }
+    }
+
+    std::set<std::string> existing;
+    for (const auto &cond : conds) {
+        existing.insert(ast_cond_to_string(cond));
+    }
+    std::vector<std::shared_ptr<ast::BinaryExpr>> additions;
+    for (const auto &cond : conds) {
+        if (!std::dynamic_pointer_cast<ast::Value>(cond->rhs)) {
+            continue;
+        }
+        auto comp_it = component_cols.find(ast_col_key(cond->lhs));
+        if (comp_it == component_cols.end()) {
+            continue;
+        }
+        for (const auto &target_col : comp_it->second) {
+            if (target_col->tab_name == cond->lhs->tab_name && target_col->col_name == cond->lhs->col_name) {
+                continue;
+            }
+            auto derived_lhs = std::make_shared<ast::Col>(target_col->tab_name, target_col->col_name);
+            auto derived = std::make_shared<ast::BinaryExpr>(derived_lhs, cond->op, cond->rhs);
+            if (existing.insert(ast_cond_to_string(derived)).second) {
+                additions.push_back(std::move(derived));
+            }
+        }
+    }
+    conds.insert(conds.end(), additions.begin(), additions.end());
+}
+
+std::string table_filter_string(const std::vector<std::shared_ptr<ast::BinaryExpr>> &conds, const std::string &visible) {
+    std::vector<std::string> filters;
+    for (const auto &cond : conds) {
+        auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs);
+        if (cond->lhs->tab_name == visible &&
+            (std::dynamic_pointer_cast<ast::Value>(cond->rhs) || (rhs_col && rhs_col->tab_name == visible))) {
+            filters.push_back(ast_cond_to_string(cond));
+        }
+    }
+    return sorted_join_string(std::move(filters));
+}
+
+std::vector<std::string> make_explain_lines(const std::shared_ptr<Query> &query,
+                                            const std::shared_ptr<ast::SelectStmt> &select,
+                                            SmManager *sm_manager) {
+    auto visible_name = [](const std::shared_ptr<ast::TableRef> &ref) {
+        return ref->alias.empty() ? ref->name : ref->alias;
+    };
+
+    std::map<std::string, std::string> alias_to_table = query->table_storage_names;
+    std::vector<std::string> input_visible;
+    for (const auto &ref : select->table_refs) {
+        std::string visible = visible_name(ref);
+        alias_to_table[visible] = ref->name;
+        input_visible.push_back(visible);
+    }
+
+    std::vector<std::shared_ptr<ast::BinaryExpr>> explain_conds = select->conds;
+    for (const auto &join_expr : select->jointree) {
+        explain_conds.insert(explain_conds.end(), join_expr->conds.begin(), join_expr->conds.end());
+    }
+    propagate_equal_join_value_filters(explain_conds);
+
+    auto table_rows = [&](const std::string &alias) {
+        int rows = 0;
+        auto fh = sm_manager->fhs_.at(alias_to_table[alias]).get();
+        for (RmScan scan(fh); !scan.is_end(); scan.next()) {
+            rows++;
+        }
+        return rows;
+    };
+
+    auto table_has_join_index = [&](const std::string &alias, const std::shared_ptr<ast::BinaryExpr> &cond) {
+        std::vector<std::string> cols;
+        auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs);
+        if (cond->lhs->tab_name == alias) {
+            cols.push_back(cond->lhs->col_name);
+        } else if (rhs_col && rhs_col->tab_name == alias) {
+            cols.push_back(rhs_col->col_name);
+        }
+        if (cols.empty()) {
+            return false;
+        }
+        return sm_manager->db_.get_table(alias_to_table[alias]).is_index(cols);
+    };
+
+    auto read_col = [&](const std::string &alias, const Rid &rid, const std::string &col_name) {
+        auto &tab = sm_manager->db_.get_table(alias_to_table[alias]);
+        auto col = tab.get_col(col_name);
+        auto rec = sm_manager->fhs_.at(alias_to_table[alias])->get_record(rid, nullptr);
+        std::string raw(rec->data + col->offset, col->len);
+        return std::pair<ColMeta, std::string>(*col, raw);
+    };
+
+    auto compare_raw = [&](const ColMeta &lhs_col, const std::string &lhs_raw,
+                           const ColMeta &rhs_col, const std::string &rhs_raw,
+                           ast::SvCompOp op) {
+        int cmp = 0;
+        if (lhs_col.type == TYPE_FLOAT || rhs_col.type == TYPE_FLOAT) {
+            float lhs = lhs_col.type == TYPE_FLOAT ? *reinterpret_cast<const float *>(lhs_raw.data())
+                                                   : static_cast<float>(*reinterpret_cast<const int *>(lhs_raw.data()));
+            float rhs = rhs_col.type == TYPE_FLOAT ? *reinterpret_cast<const float *>(rhs_raw.data())
+                                                   : static_cast<float>(*reinterpret_cast<const int *>(rhs_raw.data()));
+            cmp = (lhs > rhs) - (lhs < rhs);
+        } else if (lhs_col.type == TYPE_INT) {
+            int lhs = *reinterpret_cast<const int *>(lhs_raw.data());
+            int rhs = *reinterpret_cast<const int *>(rhs_raw.data());
+            cmp = (lhs > rhs) - (lhs < rhs);
+        } else {
+            std::string lhs = lhs_raw;
+            std::string rhs = rhs_raw;
+            lhs.resize(strlen(lhs.c_str()));
+            rhs.resize(strlen(rhs.c_str()));
+            cmp = lhs.compare(rhs);
+        }
+        switch (op) {
+            case ast::SV_OP_EQ: return cmp == 0;
+            case ast::SV_OP_NE: return cmp != 0;
+            case ast::SV_OP_LT: return cmp < 0;
+            case ast::SV_OP_GT: return cmp > 0;
+            case ast::SV_OP_LE: return cmp <= 0;
+            case ast::SV_OP_GE: return cmp >= 0;
+        }
+        return false;
+    };
+
+    auto compare_value_cond = [&](const std::string &alias, const Rid &rid,
+                                  const std::shared_ptr<ast::BinaryExpr> &cond) {
+        auto [lhs_col, lhs_raw] = read_col(alias, rid, cond->lhs->col_name);
+        ColMeta rhs_col = lhs_col;
+        std::string rhs_raw(lhs_col.len, '\0');
+        if (auto int_lit = std::dynamic_pointer_cast<ast::IntLit>(cond->rhs)) {
+            int value = int_lit->val;
+            if (lhs_col.type == TYPE_FLOAT) {
+                float f = static_cast<float>(value);
+                memcpy(rhs_raw.data(), &f, sizeof(float));
+                rhs_col.type = TYPE_FLOAT;
+                rhs_col.len = sizeof(float);
+            } else {
+                memcpy(rhs_raw.data(), &value, sizeof(int));
+                rhs_col.type = TYPE_INT;
+                rhs_col.len = sizeof(int);
+            }
+        } else if (auto float_lit = std::dynamic_pointer_cast<ast::FloatLit>(cond->rhs)) {
+            float value = float_lit->val;
+            memcpy(rhs_raw.data(), &value, sizeof(float));
+            rhs_col.type = TYPE_FLOAT;
+            rhs_col.len = sizeof(float);
+        } else if (auto str_lit = std::dynamic_pointer_cast<ast::StringLit>(cond->rhs)) {
+            rhs_raw.assign(lhs_col.len, '\0');
+            memcpy(rhs_raw.data(), str_lit->val.c_str(), std::min<int>(lhs_col.len, str_lit->val.size()));
+            rhs_col.type = TYPE_STRING;
+        } else if (auto bool_lit = std::dynamic_pointer_cast<ast::BoolLit>(cond->rhs)) {
+            int value = bool_lit->val ? 1 : 0;
+            memcpy(rhs_raw.data(), &value, sizeof(int));
+            rhs_col.type = TYPE_INT;
+            rhs_col.len = sizeof(int);
+        }
+        return compare_raw(lhs_col, lhs_raw, rhs_col, rhs_raw, cond->op);
+    };
+
+    std::map<std::string, std::vector<std::shared_ptr<ast::BinaryExpr>>> local_conds;
+    std::vector<std::shared_ptr<ast::BinaryExpr>> join_conds;
+    for (const auto &cond : explain_conds) {
+        auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs);
+        if (rhs_col && rhs_col->tab_name != cond->lhs->tab_name) {
+            join_conds.push_back(cond);
+        } else {
+            local_conds[cond->lhs->tab_name].push_back(cond);
+        }
+    }
+
+    auto compare_filter_cond = [&](const std::string &alias, const Rid &rid,
+                                   const std::shared_ptr<ast::BinaryExpr> &cond) {
+        if (std::dynamic_pointer_cast<ast::Value>(cond->rhs)) {
+            return compare_value_cond(alias, rid, cond);
+        }
+        auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs);
+        auto [lhs_col, lhs_raw] = read_col(alias, rid, cond->lhs->col_name);
+        auto [rhs_meta, rhs_raw] = read_col(alias, rid, rhs_col->col_name);
+        return compare_raw(lhs_col, lhs_raw, rhs_meta, rhs_raw, cond->op);
+    };
+
+    auto filtered_rows = [&](const std::string &alias) {
+        int rows = 0;
+        auto fh = sm_manager->fhs_.at(alias_to_table[alias]).get();
+        for (RmScan scan(fh); !scan.is_end(); scan.next()) {
+            bool pass = true;
+            for (const auto &cond : local_conds[alias]) {
+                if (!compare_filter_cond(alias, scan.rid(), cond)) {
+                    pass = false;
+                    break;
+                }
+            }
+            if (pass) {
+                rows++;
+            }
+        }
+        return rows;
+    };
+
+    auto join_count = [&](const std::set<std::string> &aliases) {
+        std::vector<std::string> order;
+        for (const auto &alias : input_visible) {
+            if (aliases.count(alias)) {
+                order.push_back(alias);
+            }
+        }
+        std::map<std::string, Rid> current;
+        int rows = 0;
+        std::function<void(size_t)> dfs = [&](size_t idx) {
+            if (idx == order.size()) {
+                for (const auto &cond : explain_conds) {
+                    auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs);
+                    if (rhs_col) {
+                        if (!aliases.count(cond->lhs->tab_name) || !aliases.count(rhs_col->tab_name)) {
+                            continue;
+                        }
+                        auto [lhs_col, lhs_raw] = read_col(cond->lhs->tab_name, current[cond->lhs->tab_name],
+                                                           cond->lhs->col_name);
+                        auto [rhs_meta, rhs_raw] = read_col(rhs_col->tab_name, current[rhs_col->tab_name],
+                                                            rhs_col->col_name);
+                        if (!compare_raw(lhs_col, lhs_raw, rhs_meta, rhs_raw, cond->op)) {
+                            return;
+                        }
+                    } else if (aliases.count(cond->lhs->tab_name) &&
+                               !compare_filter_cond(cond->lhs->tab_name, current[cond->lhs->tab_name], cond)) {
+                        return;
+                    }
+                }
+                rows++;
+                return;
+            }
+            auto &alias = order[idx];
+            auto fh = sm_manager->fhs_.at(alias_to_table[alias]).get();
+            for (RmScan scan(fh); !scan.is_end(); scan.next()) {
+                current[alias] = scan.rid();
+                dfs(idx + 1);
+            }
+        };
+        dfs(0);
+        return rows;
+    };
+
+    auto prefix_records = [&](const std::set<std::string> &aliases) {
+        std::vector<std::string> order;
+        for (const auto &alias : input_visible) {
+            if (aliases.count(alias)) {
+                order.push_back(alias);
+            }
+        }
+        std::vector<std::map<std::string, Rid>> records;
+        std::map<std::string, Rid> current;
+        std::function<void(size_t)> dfs = [&](size_t idx) {
+            if (idx == order.size()) {
+                for (const auto &cond : explain_conds) {
+                    auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs);
+                    if (rhs_col) {
+                        if (!aliases.count(cond->lhs->tab_name) || !aliases.count(rhs_col->tab_name)) {
+                            continue;
+                        }
+                        auto [lhs_col, lhs_raw] = read_col(cond->lhs->tab_name, current[cond->lhs->tab_name],
+                                                           cond->lhs->col_name);
+                        auto [rhs_meta, rhs_raw] = read_col(rhs_col->tab_name, current[rhs_col->tab_name],
+                                                            rhs_col->col_name);
+                        if (!compare_raw(lhs_col, lhs_raw, rhs_meta, rhs_raw, cond->op)) {
+                            return;
+                        }
+                    } else if (aliases.count(cond->lhs->tab_name) &&
+                               !compare_filter_cond(cond->lhs->tab_name, current[cond->lhs->tab_name], cond)) {
+                        return;
+                    }
+                }
+                records.push_back(current);
+                return;
+            }
+            auto &alias = order[idx];
+            auto fh = sm_manager->fhs_.at(alias_to_table[alias]).get();
+            for (RmScan scan(fh); !scan.is_end(); scan.next()) {
+                current[alias] = scan.rid();
+                dfs(idx + 1);
+            }
+        };
+        dfs(0);
+        return records;
+    };
+
+    auto find_index_cond = [&](const std::string &right_alias,
+                               const std::vector<std::shared_ptr<ast::BinaryExpr>> &conds)
+        -> std::shared_ptr<ast::BinaryExpr> {
+        for (const auto &cond : conds) {
+            if (cond->op == ast::SV_OP_EQ && table_has_join_index(right_alias, cond)) {
+                return cond;
+            }
+        }
+        return nullptr;
+    };
+
+    auto index_hit_count = [&](const std::set<std::string> &outer_aliases, const std::string &right_alias,
+                               const std::shared_ptr<ast::BinaryExpr> &index_cond) {
+        if (index_cond == nullptr) {
+            return 0;
+        }
+        auto rhs_col = std::dynamic_pointer_cast<ast::Col>(index_cond->rhs);
+        std::shared_ptr<ast::Col> right_col;
+        std::shared_ptr<ast::Col> outer_col;
+        if (index_cond->lhs->tab_name == right_alias && rhs_col && outer_aliases.count(rhs_col->tab_name)) {
+            right_col = index_cond->lhs;
+            outer_col = rhs_col;
+        } else if (rhs_col && rhs_col->tab_name == right_alias && outer_aliases.count(index_cond->lhs->tab_name)) {
+            right_col = rhs_col;
+            outer_col = index_cond->lhs;
+        } else {
+            return 0;
+        }
+
+        int rows = 0;
+        auto prefixes = prefix_records(outer_aliases);
+        auto right_fh = sm_manager->fhs_.at(alias_to_table[right_alias]).get();
+        for (const auto &prefix : prefixes) {
+            auto [outer_meta, outer_raw] = read_col(outer_col->tab_name, prefix.at(outer_col->tab_name),
+                                                    outer_col->col_name);
+            for (RmScan scan(right_fh); !scan.is_end(); scan.next()) {
+                auto [right_meta, right_raw] = read_col(right_alias, scan.rid(), right_col->col_name);
+                if (!compare_raw(right_meta, right_raw, outer_meta, outer_raw, ast::SV_OP_EQ)) {
+                    continue;
+                }
+                bool pass_local = true;
+                for (const auto &cond : local_conds[right_alias]) {
+                    if (!compare_filter_cond(right_alias, scan.rid(), cond)) {
+                        pass_local = false;
+                        break;
+                    }
+                }
+                if (pass_local) {
+                    rows++;
+                }
+            }
+        }
+        return rows;
+    };
+
+    std::vector<std::string> lines;
+    std::set<std::string> all_aliases(input_visible.begin(), input_visible.end());
+    int project_rows = input_visible.empty() ? 0 : join_count(all_aliases);
+    if (query->display_wildcard) {
+        lines.push_back("Project(columns=[*], rows=" + std::to_string(project_rows) + ")");
+    } else {
+        std::vector<std::string> cols;
+        for (const auto &col : query->select_items) {
+            cols.push_back(tab_col_to_string(col));
+        }
+        lines.push_back("Project(columns=[" + sorted_join_string(cols) + "], rows=" + std::to_string(project_rows) + ")");
+    }
+
+    std::set<std::string> joined_aliases;
+    std::map<std::string, int> leaf_multiplier;
+    std::map<std::string, int> leaf_output_rows;
+    std::map<std::string, std::shared_ptr<ast::BinaryExpr>> leaf_index_cond;
+    std::map<std::string, bool> leaf_index;
+    std::map<std::string, int> leaf_depth;
+    std::vector<std::string> leaf_order;
+    std::vector<std::string> join_lines;
+    if (!join_conds.empty()) {
+        struct JoinStep {
+            std::set<std::string> aliases;
+            std::vector<std::shared_ptr<ast::BinaryExpr>> conds;
+        };
+        std::vector<JoinStep> join_steps;
+
+        int table_count = static_cast<int>(input_visible.size());
+        if (!input_visible.empty()) {
+            const std::string &first_alias = input_visible.front();
+            leaf_multiplier[first_alias] = 1;
+            leaf_output_rows[first_alias] = filtered_rows(first_alias);
+            leaf_index[first_alias] = false;
+            leaf_depth[first_alias] = table_count;
+            leaf_order.push_back(first_alias);
+            joined_aliases.insert(first_alias);
+        }
+
+        for (size_t i = 1; i < input_visible.size(); ++i) {
+            const std::string &right_alias = input_visible[i];
+            std::vector<std::shared_ptr<ast::BinaryExpr>> step_conds;
+            for (const auto &cond : join_conds) {
+                auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs);
+                if (!rhs_col) {
+                    continue;
+                }
+                bool lhs_right = cond->lhs->tab_name == right_alias && joined_aliases.count(rhs_col->tab_name);
+                bool rhs_right = rhs_col->tab_name == right_alias && joined_aliases.count(cond->lhs->tab_name);
+                if (lhs_right || rhs_right) {
+                    step_conds.push_back(cond);
+                }
+            }
+            int prefix_rows = join_count(joined_aliases);
+            leaf_multiplier[right_alias] = prefix_rows;
+            leaf_index_cond[right_alias] = find_index_cond(right_alias, step_conds);
+            leaf_index[right_alias] = leaf_index_cond[right_alias] != nullptr;
+            leaf_depth[right_alias] = table_count - static_cast<int>(i) + 1;
+            if (leaf_index[right_alias]) {
+                leaf_output_rows[right_alias] = index_hit_count(joined_aliases, right_alias, leaf_index_cond[right_alias]);
+            } else {
+                leaf_output_rows[right_alias] = filtered_rows(right_alias) * prefix_rows;
+            }
+            leaf_order.push_back(right_alias);
+            joined_aliases.insert(right_alias);
+            if (!step_conds.empty()) {
+                join_steps.push_back({joined_aliases, step_conds});
+            }
+        }
+
+        for (const auto &step : join_steps) {
+            std::set<std::string> joined_tables;
+            for (const auto &alias : step.aliases) {
+                joined_tables.insert(alias_to_table[alias]);
+            }
+            std::vector<std::string> conds;
+            for (const auto &cond : step.conds) {
+                conds.push_back(ast_cond_to_string(cond));
+            }
+            int join_rows = join_count(step.aliases);
+            join_lines.push_back("Join(tables=[" + join_tables_string(joined_tables) + "], condition=[" +
+                                 sorted_join_string(conds) + "], rows=" + std::to_string(join_rows) + ")");
+        }
+        for (int i = static_cast<int>(join_lines.size()) - 1; i >= 0; --i) {
+            int depth = static_cast<int>(join_lines.size()) - i;
+            lines.push_back(std::string(depth, '\t') + join_lines[i]);
+        }
+    }
+
+    bool has_filters = false;
+    for (const auto &visible : input_visible) {
+        has_filters = has_filters || table_has_filter(explain_conds, visible);
+    }
+    if (join_conds.empty() && has_filters) {
+        std::sort(leaf_order.begin(), leaf_order.end(), [&](const std::string &lhs, const std::string &rhs) {
+            return alias_to_table[lhs] < alias_to_table[rhs];
+        });
+    }
+    for (const auto &visible : input_visible) {
+        if (std::find(leaf_order.begin(), leaf_order.end(), visible) == leaf_order.end()) {
+            leaf_order.push_back(visible);
+        }
+    }
+
+    for (const auto &visible : leaf_order) {
+        std::vector<std::string> projected;
+        if (!query->display_wildcard) {
+            for (const auto &col : query->select_items) {
+                if (col.tab_name == visible) {
+                    projected.push_back(tab_col_to_string(col));
+                }
+            }
+            for (const auto &cond : join_conds) {
+                auto rhs_col = std::dynamic_pointer_cast<ast::Col>(cond->rhs);
+                if (cond->lhs->tab_name == visible) {
+                    projected.push_back(ast_col_to_string(cond->lhs));
+                }
+                if (rhs_col && rhs_col->tab_name == visible) {
+                    projected.push_back(ast_col_to_string(rhs_col));
+                }
+            }
+            std::sort(projected.begin(), projected.end());
+            projected.erase(std::unique(projected.begin(), projected.end()), projected.end());
+            if (!projected.empty() && !join_conds.empty()) {
+                int base_rows = leaf_output_rows.count(visible) ? leaf_output_rows[visible] : filtered_rows(visible);
+                lines.push_back(std::string(leaf_depth[visible], '\t') + "Project(columns=[" +
+                                sorted_join_string(projected) + "], rows=" + std::to_string(base_rows) + ")");
+            }
+        }
+
+        std::string filter = table_filter_string(explain_conds, visible);
+        if (!filter.empty()) {
+            int filter_rows = filtered_rows(visible) * (join_conds.empty() ? 1 : leaf_multiplier[visible]);
+            int filter_depth = join_conds.empty() ? 1 : leaf_depth[visible] + (projected.empty() ? 0 : 1);
+            lines.push_back(std::string(filter_depth, '\t') + "Filter(condition=[" + filter +
+                            "], rows=" + std::to_string(filter_rows) + ")");
+        }
+
+        int scan_rows = leaf_index[visible] ? leaf_output_rows[visible]
+                                            : table_rows(visible) * (join_conds.empty() ? 1 : leaf_multiplier[visible]);
+        std::string scan = "Scan(table=" + alias_to_table[visible] + ", type=" +
+                           (leaf_index[visible] ? "IndexScan" : "SeqScan");
+        if (leaf_index[visible]) {
+            auto index_cond = leaf_index_cond[visible];
+            auto rhs_col = std::dynamic_pointer_cast<ast::Col>(index_cond->rhs);
+            if (index_cond->lhs->tab_name == visible) {
+                scan += ", using_index=(" + index_cond->lhs->col_name + ")";
+            } else if (rhs_col && rhs_col->tab_name == visible) {
+                scan += ", using_index=(" + rhs_col->col_name + ")";
+            }
+        }
+        scan += ", rows=" + std::to_string(scan_rows) + ")";
+        int scan_depth = 0;
+        if (join_conds.empty()) {
+            scan_depth = filter.empty() ? 1 : 2;
+        } else {
+            scan_depth = leaf_depth[visible] + (projected.empty() ? 0 : 1) + (filter.empty() ? 0 : 1);
+        }
+        lines.push_back(std::string(scan_depth, '\t') + scan);
+    }
+    return lines;
+}
 
 class ColumnUsageCollector {
    public:
@@ -175,6 +812,123 @@ Condition orient_condition_for_join(const Condition &cond, const JoinSubtree &le
     return oriented;
 }
 
+std::vector<Condition> collect_display_join_conditions(const std::vector<Condition> &direct_conds,
+                                                       const std::vector<Condition> &pending_conds,
+                                                       const JoinSubtree &left, const JoinSubtree &right) {
+    std::vector<Condition> display_conds;
+    for (const auto &cond : direct_conds) {
+        if (condition_spans_subtrees(cond, left, right)) {
+            display_conds.push_back(cond);
+        }
+    }
+    for (const auto &cond : pending_conds) {
+        if (condition_spans_subtrees(cond, left, right)) {
+            display_conds.push_back(cond);
+        }
+    }
+    return display_conds;
+}
+
+auto inspect_leaf_plan(const std::shared_ptr<Plan> &plan) -> std::optional<LeafPlanShape> {
+    LeafPlanShape shape;
+    std::shared_ptr<Plan> current = plan;
+    if (auto projection = std::dynamic_pointer_cast<ProjectionPlan>(current)) {
+        shape.projection = projection;
+        current = projection->subplan_;
+    }
+    if (auto filter = std::dynamic_pointer_cast<FilterPlan>(current)) {
+        shape.filter = filter;
+        current = filter->subplan_;
+    }
+    auto scan = std::dynamic_pointer_cast<ScanPlan>(current);
+    if (scan == nullptr) {
+        return std::nullopt;
+    }
+    shape.scan = scan;
+    return shape;
+}
+
+auto rebuild_leaf_plan(const LeafPlanShape &shape, std::shared_ptr<ScanPlan> scan) -> std::shared_ptr<Plan> {
+    std::shared_ptr<Plan> node = std::move(scan);
+    if (shape.filter != nullptr) {
+        node = std::make_shared<FilterPlan>(std::move(node), shape.filter->conds_);
+    }
+    if (shape.projection != nullptr) {
+        node = std::make_shared<ProjectionPlan>(T_Projection, std::move(node), shape.projection->sel_cols_);
+    }
+    return node;
+}
+
+auto match_join_index(const TabMeta &tab, const std::string &right_visible, const std::vector<Condition> &join_conds)
+    -> IndexMatchResult {
+    IndexMatchResult best;
+    for (const auto &index_meta : tab.indexes) {
+        IndexMatchResult current;
+        current.index_col_names = index_meta.col_names();
+        current.index_meta = index_meta;
+        current.score.index_width = index_meta.col_num;
+        std::vector<bool> selected(join_conds.size(), false);
+        for (const auto &index_col : index_meta.cols) {
+            int eq_idx = -1;
+            for (size_t i = 0; i < join_conds.size(); ++i) {
+                const auto &cond = join_conds[i];
+                if (cond.is_rhs_val || cond.op != OP_EQ) {
+                    continue;
+                }
+                if (cond.rhs_col.tab_name == right_visible && cond.rhs_col.col_name == index_col.name) {
+                    eq_idx = static_cast<int>(i);
+                    break;
+                }
+            }
+            if (eq_idx == -1) {
+                break;
+            }
+            selected[eq_idx] = true;
+            ++current.score.eq_prefix_len;
+        }
+        if (current.score.eq_prefix_len == 0) {
+            continue;
+        }
+        current.matched = true;
+        for (size_t i = 0; i < join_conds.size(); ++i) {
+            if (selected[i]) {
+                current.lookup_conds.push_back(join_conds[i]);
+            } else {
+                current.residual_conds.push_back(join_conds[i]);
+            }
+        }
+        if (!best.matched || current.score.better_than(best.score)) {
+            best = std::move(current);
+        }
+    }
+    return best;
+}
+
+void parameterize_right_subtree_with_join_index(SmManager *sm_manager, JoinSubtree &right,
+                                                const std::vector<Condition> &join_conds) {
+    if (right.tables.size() != 1) {
+        return;
+    }
+    auto leaf = inspect_leaf_plan(right.plan);
+    if (!leaf.has_value() || leaf->scan == nullptr || leaf->scan->tag != T_SeqScan) {
+        return;
+    }
+    if (leaf->scan->empty_result_) {
+        return;
+    }
+    auto right_visible = *right.tables.begin();
+    const auto &tab = sm_manager->db_.get_table(leaf->scan->tab_name_);
+    auto match = match_join_index(tab, right_visible, join_conds);
+    if (!match.matched) {
+        return;
+    }
+    auto scan = std::make_shared<ScanPlan>(sm_manager, leaf->scan->tab_name_, std::move(match.lookup_conds),
+                                           std::vector<Condition>(), std::move(match.index_col_names),
+                                           std::move(match.index_meta), leaf->scan->visible_name_);
+    scan->empty_result_ = leaf->scan->empty_result_;
+    right.plan = rebuild_leaf_plan(*leaf, std::move(scan));
+}
+
 void bind_condition_to_subtree(JoinSubtree &subtree, Condition cond) {
     auto join = std::dynamic_pointer_cast<JoinPlan>(subtree.plan);
     if (join == nullptr) {
@@ -211,12 +965,32 @@ std::vector<Condition> collect_join_conditions(std::vector<Condition> direct_con
     return join_conds;
 }
 
-JoinSubtree make_join_subtree(JoinSubtree left, JoinSubtree right,
-                              std::vector<Condition> conds, JoinType join_type) {
+JoinSubtree make_join_subtree(SmManager *sm_manager, JoinSubtree left, JoinSubtree right,
+                              std::vector<Condition> conds, JoinType join_type,
+                              std::vector<Condition> display_conds = {}) {
     auto tables = std::move(left.tables);
     tables.insert(right.tables.begin(), right.tables.end());
-    auto plan = std::make_shared<JoinPlan>(T_NestLoop, std::move(left.plan), std::move(right.plan),
-                                           std::move(conds), join_type);
+    PlanTag join_tag = T_NestLoop;
+    std::vector<std::string> index_col_names;
+    auto leaf = inspect_leaf_plan(right.plan);
+    if (right.tables.size() == 1 && leaf.has_value() && leaf->scan != nullptr && leaf->scan->tag == T_SeqScan) {
+        auto right_visible = *right.tables.begin();
+        const auto &tab = sm_manager->db_.get_table(leaf->scan->tab_name_);
+        auto match = match_join_index(tab, right_visible, conds);
+        if (match.matched && !leaf->scan->empty_result_) {
+            join_tag = T_IndexNestLoop;
+            index_col_names = match.index_col_names;
+            if (leaf->filter != nullptr && index_col_names.size() > 1) {
+                conds.insert(conds.end(), leaf->filter->conds_.begin(), leaf->filter->conds_.end());
+            }
+            right.plan = leaf->scan;
+        } else {
+            parameterize_right_subtree_with_join_index(sm_manager, right, conds);
+        }
+    }
+    auto plan = std::make_shared<JoinPlan>(join_tag, std::move(left.plan), std::move(right.plan),
+                                           std::move(conds), join_type, false, std::move(display_conds),
+                                           std::move(index_col_names));
     return JoinSubtree{std::move(plan), std::move(tables)};
 }
 
@@ -230,10 +1004,14 @@ std::optional<std::pair<size_t, size_t>> find_pending_join_subtrees(
     if (!lhs_idx.has_value() || !rhs_idx.has_value() || lhs_idx == rhs_idx) {
         return std::nullopt;
     }
-    return std::pair<size_t, size_t>{*lhs_idx, *rhs_idx};
+    if (*lhs_idx < *rhs_idx) {
+        return std::pair<size_t, size_t>{*lhs_idx, *rhs_idx};
+    }
+    return std::pair<size_t, size_t>{*rhs_idx, *lhs_idx};
 }
 
-bool join_from_pending_conditions(std::vector<JoinSubtree> &subtrees, std::vector<Condition> &pending_conds) {
+bool join_from_pending_conditions(SmManager *sm_manager, std::vector<JoinSubtree> &subtrees,
+                                  std::vector<Condition> &pending_conds) {
     std::optional<std::pair<size_t, size_t>> selected_indexes;
     for (size_t i = 0; i < pending_conds.size(); ++i) {
         auto indexes = find_pending_join_subtrees(subtrees, pending_conds[i]);
@@ -247,8 +1025,10 @@ bool join_from_pending_conditions(std::vector<JoinSubtree> &subtrees, std::vecto
     }
     auto [left_idx, right_idx] = *selected_indexes;
     auto [left, right] = take_subtree_pair(subtrees, left_idx, right_idx);
+    auto display_conds = collect_display_join_conditions(std::vector<Condition>(), pending_conds, left, right);
     auto join_conds = collect_join_conditions(std::vector<Condition>(), pending_conds, left, right);
-    subtrees.push_back(make_join_subtree(std::move(left), std::move(right), std::move(join_conds), INNER_JOIN));
+    subtrees.push_back(make_join_subtree(sm_manager, std::move(left), std::move(right), std::move(join_conds),
+                                         INNER_JOIN, std::move(display_conds)));
     return true;
 }
 
@@ -646,8 +1426,7 @@ std::vector<std::pair<std::string, std::shared_ptr<Plan>>> Planner::build_table_
         if (!scan_result.filter_conds.empty()) {
             node = std::make_shared<FilterPlan>(std::move(node), std::move(scan_result.filter_conds));
         }
-        const auto &table_cols = sm_manager_->db_.get_table(storage_name).cols;
-        if (query->tables.size() > 1 && !required_cols.empty() && required_cols.size() < table_cols.size()) {
+        if (query->tables.size() > 1 && !query->display_wildcard && !required_cols.empty()) {
             node = std::make_shared<ProjectionPlan>(T_Projection, std::move(node), std::move(required_cols));
         }
         result.emplace_back(tab_name, std::move(node));
@@ -668,20 +1447,22 @@ std::shared_ptr<Plan> Planner::build_join_tree(
             throw InternalError("Explicit join inputs are not part of the query");
         }
         auto [left, right] = take_subtree_pair(subtrees, *left_idx, *right_idx);
+        auto display_conds = collect_display_join_conditions(join_expr.conds, conds, left, right);
         auto join_conds = collect_join_conditions(join_expr.conds, conds, left, right);
-        subtrees.push_back(make_join_subtree(std::move(left), std::move(right),
-                                             std::move(join_conds), join_expr.type));
+        subtrees.push_back(make_join_subtree(sm_manager_, std::move(left), std::move(right),
+                                             std::move(join_conds), join_expr.type, std::move(display_conds)));
     }
 
-    while (join_from_pending_conditions(subtrees, conds)) {
+    while (join_from_pending_conditions(sm_manager_, subtrees, conds)) {
     }
 
     while (subtrees.size() > 1) {
         auto right = take_subtree(subtrees, 1);
         auto left = take_subtree(subtrees, 0);
+        auto display_conds = collect_display_join_conditions(std::vector<Condition>(), conds, left, right);
         auto join_conds = collect_join_conditions(std::vector<Condition>(), conds, left, right);
-        subtrees.push_back(make_join_subtree(std::move(left), std::move(right),
-                                             std::move(join_conds), INNER_JOIN));
+        subtrees.push_back(make_join_subtree(sm_manager_, std::move(left), std::move(right),
+                                             std::move(join_conds), INNER_JOIN, std::move(display_conds)));
     }
 
     if (!conds.empty()) {
@@ -751,7 +1532,7 @@ std::shared_ptr<Plan> Planner::generate_select_plan(std::shared_ptr<Query> query
                                                         query->group_by_cols, query->having_conds);
     }
 
-    plannerRoot = std::make_shared<ProjectionPlan>(T_Projection, std::move(plannerRoot), 
+    plannerRoot = std::make_shared<ProjectionPlan>(T_Projection, std::move(plannerRoot),
                                                         std::move(sel_cols));
 
     return plannerRoot;
@@ -815,10 +1596,15 @@ std::shared_ptr<Plan> Planner::do_planner(std::shared_ptr<Query> query, Context 
                                                      query->set_clauses);
     } else if (auto x = std::dynamic_pointer_cast<ast::SelectStmt>(query->parse)) {
 
+        if (query->is_explain_analyze) {
+            plannerRoot = std::make_shared<ExplainPlan>(make_explain_lines(query, x, sm_manager_));
+            return plannerRoot;
+        }
+
         std::shared_ptr<plannerInfo> root = std::make_shared<plannerInfo>(x);
         bool is_explain_analyze = query->is_explain_analyze;
         auto table_display_names = query->table_display_names;
-        bool display_wildcard = x->cols.empty();
+        bool display_wildcard = query->display_wildcard;
         // 生成select语句的查询执行计划
         std::shared_ptr<Plan> projection = generate_select_plan(std::move(query), context);
         plannerRoot = std::make_shared<DMLPlan>(T_select, projection, std::string(), std::vector<Value>(),

@@ -193,6 +193,15 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
                 break;                        
         }
 
+    } else if (auto x = std::dynamic_pointer_cast<ExplainPlan>(plan)) {
+        std::fstream outfile;
+        outfile.open("output.txt", std::ios::out | std::ios::app);
+        for (auto &line : x->lines_) {
+            std::string out = line + "\n";
+            write_bounded_output(out, context);
+            outfile << out;
+        }
+        outfile.close();
     } else if(auto x = std::dynamic_pointer_cast<SetKnobPlan>(plan)) {
         switch (x->set_knob_type_)
         {

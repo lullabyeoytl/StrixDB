@@ -83,4 +83,8 @@ class FilterExecutor : public AbstractExecutor {
     std::string getType() override { return "FilterExecutor"; }
 
     auto child_executor() const -> AbstractExecutor * { return prev_.get(); }
+
+    void bind_outer_tuple(const RmRecord *record, const std::vector<ColMeta> *cols) override {
+        prev_->bind_outer_tuple(record, cols);
+    }
 };

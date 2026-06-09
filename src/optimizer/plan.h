@@ -43,12 +43,14 @@ typedef enum PlanTag{
     T_Transaction_rollback,
     T_SeqScan,
     T_IndexScan,
+    T_IndexNestLoop,
     T_NestLoop,
     T_SortMerge,    // sort merge join
     T_Sort,
     T_Filter,
     T_Projection,
-    T_Aggregation
+    T_Aggregation,
+    T_Explain
 } PlanTag;
 
 enum AggStrategy {
@@ -126,7 +128,9 @@ class JoinPlan : public Plan
 {
     public:
         JoinPlan(PlanTag tag, std::shared_ptr<Plan> left, std::shared_ptr<Plan> right, std::vector<Condition> conds,
-                 JoinType join_type = INNER_JOIN, bool reverse_right_scan = false)
+                 JoinType join_type = INNER_JOIN, bool reverse_right_scan = false,
+                 std::vector<Condition> display_conds = {},
+                 std::vector<std::string> index_col_names = {})
         {
             Plan::tag = tag;
             left_ = std::move(left);
@@ -134,6 +138,8 @@ class JoinPlan : public Plan
             conds_ = std::move(conds);
             type = join_type;
             reverse_right_scan_ = reverse_right_scan;
+            display_conds_ = display_conds.empty() ? conds_ : std::move(display_conds);
+            index_col_names_ = std::move(index_col_names);
         }
         ~JoinPlan(){}
         // 左节点
@@ -142,6 +148,8 @@ class JoinPlan : public Plan
         std::shared_ptr<Plan> right_;
         // 连接条件
         std::vector<Condition> conds_;
+        std::vector<Condition> display_conds_;
+        std::vector<std::string> index_col_names_;
         // Logical join type; output schema depends on it.
         JoinType type;
         bool reverse_right_scan_;
@@ -190,7 +198,19 @@ class SortPlan : public Plan
         std::shared_ptr<Plan> subplan_;
         TabCol sel_col_;
         bool is_desc_;
-        
+
+};
+
+class ExplainPlan : public Plan
+{
+    public:
+        explicit ExplainPlan(std::vector<std::string> lines)
+        {
+            Plan::tag = T_Explain;
+            lines_ = std::move(lines);
+        }
+        ~ExplainPlan(){}
+        std::vector<std::string> lines_;
 };
 
 class AggregationPlan : public Plan

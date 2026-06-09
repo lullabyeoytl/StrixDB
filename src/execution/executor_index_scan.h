@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include <algorithm>
 #include <climits>
 #include <cfloat>
+#include <utility>
 
 #include "common/common.h"
 #include "execution_common.h"
@@ -57,6 +58,10 @@ class IndexScanExecutor : public AbstractExecutor {
     std::unique_ptr<RecScan> scan_;
 
     SmManager *sm_manager_;
+    std::vector<Condition> template_index_lookup_conds_;
+    std::vector<Condition> template_residual_conds_;
+    const RmRecord *outer_record_ = nullptr;
+    const std::vector<ColMeta> *outer_cols_ = nullptr;
 
     void set_end() {
         rid_ = Rid{-1, -1};
@@ -128,6 +133,28 @@ class IndexScanExecutor : public AbstractExecutor {
                 cond.rhs_val.init_raw(col_it->len);
             }
         }
+    }
+
+    void materialize_outer_lookup_values() {
+        if (outer_record_ == nullptr || outer_cols_ == nullptr) {
+            return;
+        }
+        auto materialize = [&](std::vector<Condition> &conds) {
+            for (auto &cond : conds) {
+                if (cond.is_rhs_val) {
+                    continue;
+                }
+                const auto &outer_meta = find_col_meta(*outer_cols_, cond.rhs_col);
+                Value rhs_val = get_col_value(*outer_record_, outer_meta);
+                const auto &lhs_meta = find_col_meta(cols_, cond.lhs_col);
+                rhs_val = coerce_value_to_type(rhs_val, lhs_meta.type);
+                rhs_val.init_raw(lhs_meta.len);
+                cond.rhs_val = std::move(rhs_val);
+                cond.is_rhs_val = true;
+            }
+        };
+        materialize(index_lookup_conds_);
+        materialize(residual_conds_);
     }
 
     auto find_eq_condition(const std::string &col_name) const -> const Condition * {
@@ -281,6 +308,8 @@ class IndexScanExecutor : public AbstractExecutor {
                 cond.op = kSwapOp.at(cond.op);
             }
         }
+        template_index_lookup_conds_ = index_lookup_conds_;
+        template_residual_conds_ = residual_conds_;
         prepare_lookup_values();
         set_end();
     }
@@ -290,6 +319,10 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void restartTupleImpl() override {
+        index_lookup_conds_ = template_index_lookup_conds_;
+        residual_conds_ = template_residual_conds_;
+        materialize_outer_lookup_values();
+        prepare_lookup_values();
         auto ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_);
         auto *ih = sm_manager_->ihs_.at(ix_name).get();
 
@@ -355,4 +388,9 @@ class IndexScanExecutor : public AbstractExecutor {
     size_t tupleLen() const override { return len_; }
 
     const std::vector<ColMeta> &cols() const override { return cols_; }
+
+    void bind_outer_tuple(const RmRecord *record, const std::vector<ColMeta> *cols) override {
+        outer_record_ = record;
+        outer_cols_ = cols;
+    }
 };

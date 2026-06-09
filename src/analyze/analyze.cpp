@@ -195,6 +195,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
     }
     if (auto x = std::dynamic_pointer_cast<ast::SelectStmt>(parse))
     {
+        query->display_wildcard = x->cols.empty();
         // 处理表名
         std::map<std::string, int> storage_name_counts;
         for (const auto &ref : x->table_refs) {
@@ -297,6 +298,7 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
                 normalize_sv_conds(join_expr->conds, all_cols, &query->table_storage_names);
             }
         }
+        normalize_sv_conds(x->conds, all_cols, &query->table_storage_names);
         //处理where条件
         get_clause(x->conds, query->conds);
         check_clause(all_cols, query->conds, &query->table_storage_names);
