@@ -82,7 +82,7 @@ void *client_handler(void *sock_fd) {
     txn_id_t txn_id = INVALID_TXN_ID;
 
     // Session isolation level used by newly started transactions.
-    IsolationLevel session_isolation_level_ = IsolationLevel::SERIALIZABLE;
+    IsolationLevel session_isolation_level_ = IsolationLevel::SNAPSHOT_ISOLATION;
 
     // 初始化可重入解析器扫描器
     yyscan_t yyscanner;
