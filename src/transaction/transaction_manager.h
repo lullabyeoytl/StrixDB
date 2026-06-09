@@ -207,6 +207,8 @@ public:
     /** @brief Execute one garbage collection pass. */
     void GarbageCollection();
 
+    void RunCheckpointGarbageCollection();
+
     class WriteTxnGuard {
        public:
         explicit WriteTxnGuard(TransactionManager *txn_mgr) {
@@ -324,6 +326,8 @@ private:
     void GarbageCollectionWorkerLoop();
 
     void RunGarbageCollection(bool apply_throttle);
+
+    void RunGarbageCollection(bool apply_throttle, bool force_reclaim_committed_versions);
 
     bool AddRwDependency(Transaction *from, Transaction *to, Transaction *current, const std::string &reason);
 

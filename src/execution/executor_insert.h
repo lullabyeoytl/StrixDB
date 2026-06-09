@@ -90,14 +90,6 @@ class InsertExecutor : public AbstractExecutor {
             fh_->release_reserved_rid(rid_);
         };
         try {
-            if (context_ != nullptr && context_->txn_mgr_ != nullptr && context_->txn_ != nullptr) {
-                context_->txn_mgr_->PrepareInsert(fh_->GetFd(), rid_, rec, context_->txn_);
-                version_link_prepared = TransactionManager::IsMvccActive(context_->txn_);
-            }
-
-            fh_->insert_record(rid_, rec.data, INVALID_LSN);
-            heap_inserted = true;
-
             for (size_t i = 0; i < tab_.indexes.size(); ++i) {
                 auto &index = tab_.indexes[i];
                 auto ih = sm_manager_->get_ih(tab_name_, index.cols);
@@ -113,8 +105,13 @@ class InsertExecutor : public AbstractExecutor {
             }
 
             track_ssi_write(context_, tab_name_, rid_, nullptr, &rec);
+            if (context_ != nullptr && context_->txn_mgr_ != nullptr && context_->txn_ != nullptr) {
+                context_->txn_mgr_->PrepareInsert(fh_->GetFd(), rid_, rec, context_->txn_);
+                version_link_prepared = TransactionManager::IsMvccActive(context_->txn_);
+            }
 
-            lsn_t op_prev_lsn = context_ != nullptr && context_->txn_ != nullptr ? context_->txn_->get_prev_lsn() : INVALID_LSN;
+            lsn_t op_prev_lsn =
+                context_ != nullptr && context_->txn_ != nullptr ? context_->txn_->get_prev_lsn() : INVALID_LSN;
             lsn_t op_lsn = INVALID_LSN;
             if (context_ != nullptr && context_->txn_ != nullptr && context_->log_mgr_ != nullptr) {
                 InsertLogRecord log_record(context_->txn_->get_transaction_id(), rec, rid_, tab_name_);
@@ -122,10 +119,10 @@ class InsertExecutor : public AbstractExecutor {
                 op_lsn = context_->log_mgr_->add_log_to_buffer(&log_record);
                 context_->txn_->set_prev_lsn(op_lsn);
             }
+
+            fh_->insert_record(rid_, rec.data, op_lsn);
+            heap_inserted = true;
             if (context_ != nullptr && context_->txn_ != nullptr) {
-                if (op_lsn != INVALID_LSN) {
-                    fh_->set_page_lsn(rid_, op_lsn);
-                }
                 context_->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name_, rid_, op_prev_lsn));
             }
         } catch (const UniqueKeyViolationError &) {

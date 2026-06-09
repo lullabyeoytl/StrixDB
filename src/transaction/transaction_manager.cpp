@@ -175,6 +175,10 @@ auto gc_version_safe_to_reclaim(const VersionUndoLink &version, timestamp_t wate
     return version.ts_ < watermark;
 }
 
+auto checkpoint_version_safe_to_reclaim(const VersionUndoLink &version) -> bool {
+    return !version.in_progress_ && version.ts_ != INVALID_TS;
+}
+
 void collect_referenced_txns_from_chain(const VersionUndoLink &version, std::unordered_set<txn_id_t> *referenced_txns,
                                         TransactionManager *txn_manager) {
     UndoLink undo_link = version.prev_;
@@ -724,6 +728,8 @@ lsn_t TransactionManager::create_static_checkpoint(LogManager *log_manager) {
         throw InternalError("checkpoint log record is too large");
     }
     log_manager->flush_log_to_disk();
+
+    RunCheckpointGarbageCollection();
 
     if (!sm_manager_->flush_storage()) {
         throw InternalError("checkpoint storage flush failed");
@@ -1324,10 +1330,23 @@ timestamp_t TransactionManager::GetWatermark() {
 // GarbageCollection  — reclaim version info and physical space
 //--------------------------------------------------------------------------
 void TransactionManager::GarbageCollection() {
-    RunGarbageCollection(false);
+    RunGarbageCollection(false, false);
+}
+
+void TransactionManager::RunCheckpointGarbageCollection() {
+    RunGarbageCollection(false, true);
 }
 
 void TransactionManager::RunGarbageCollection(bool apply_throttle) {
+    RunGarbageCollection(apply_throttle, false);
+}
+
+void TransactionManager::RunGarbageCollection(bool apply_throttle, bool force_reclaim_committed_versions) {
+    std::shared_lock<std::shared_mutex> checkpoint_guard;
+    if (!force_reclaim_committed_versions) {
+        checkpoint_guard = std::shared_lock<std::shared_mutex>(checkpoint_mutex_);
+    }
+
     std::vector<GcDeleteRecord> deleted_records;
     std::vector<GcVersionRecord> reclaimed_versions;
     std::vector<std::unique_ptr<Transaction>> released_txns;
@@ -1344,7 +1363,7 @@ void TransactionManager::RunGarbageCollection(bool apply_throttle) {
     {
         std::lock_guard<std::mutex> wm_lock(watermark_mutex_);
         refresh_reader_snapshot();
-        if (watermark == INVALID_TS) {
+        if (!force_reclaim_committed_versions && watermark == INVALID_TS) {
             return;
         }
         std::unique_lock<std::shared_mutex> table_lock(version_info_mutex_);
@@ -1354,7 +1373,10 @@ void TransactionManager::RunGarbageCollection(bool apply_throttle) {
                 std::unique_lock<std::shared_mutex> page_lock(page_info->mutex_);
                 for (auto slot_it = page_info->prev_version_.begin(); slot_it != page_info->prev_version_.end();) {
                     const auto &version = slot_it->second;
-                    if (!gc_version_safe_to_reclaim(version, watermark, has_active_readers)) {
+                    bool reclaimable = force_reclaim_committed_versions
+                                           ? checkpoint_version_safe_to_reclaim(version)
+                                           : gc_version_safe_to_reclaim(version, watermark, has_active_readers);
+                    if (!reclaimable) {
                         ++slot_it;
                         continue;
                     }
