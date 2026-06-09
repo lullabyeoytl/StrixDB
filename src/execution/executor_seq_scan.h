@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 class SeqScanExecutor : public AbstractExecutor {
    private:
     std::string tab_name_;              // 表的名称
+    std::string visible_name_;
     std::vector<Condition> conds_;      // scan的条件
     RmFileHandle *fh_;                  // 表的数据文件句柄
     std::vector<ColMeta> cols_;         // scan后生成的记录的字段
@@ -46,13 +47,17 @@ class SeqScanExecutor : public AbstractExecutor {
 
    public:
     SeqScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> conds,
-                    bool empty_result, Context *context) {
+                    bool empty_result, Context *context, std::string visible_name = std::string()) {
         sm_manager_ = sm_manager;
         tab_name_ = std::move(tab_name);
+        visible_name_ = visible_name.empty() ? tab_name_ : std::move(visible_name);
         conds_ = std::move(conds);
         TabMeta &tab = sm_manager_->db_.get_table(tab_name_);
         fh_ = sm_manager_->fhs_.at(tab_name_).get();
         cols_ = tab.cols;
+        for (auto &col : cols_) {
+            col.tab_name = visible_name_;
+        }
         len_ = cols_.back().offset + cols_.back().len;
 
         context_ = context;

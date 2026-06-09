@@ -91,7 +91,8 @@ std::shared_ptr<Plan> generate_select_plan(std::shared_ptr<Query> query, Context
 
     // int get_indexNo(std::string tab_name, std::vector<Condition> curr_conds);
     ScanBuildResult make_scan_plan(const std::string &tab_name, const std::vector<Condition> &semantic_conds,
-                                   std::vector<TabCol> required_cols = {});
+                                   std::vector<TabCol> required_cols = {},
+                                   std::string visible_name = std::string());
     std::shared_ptr<Plan> build_dml_scan_plan(const LogicalPlanContext &plan_context, const std::string &tab_name);
 
     ColType interp_sv_type(ast::SvType sv_type) {

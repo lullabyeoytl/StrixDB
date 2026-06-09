@@ -359,14 +359,14 @@ class Portal
         } else if(auto x = std::dynamic_pointer_cast<ScanPlan>(plan)) {
             if(x->tag == T_SeqScan) {
                 auto executor = std::make_unique<SeqScanExecutor>(sm_manager_, x->tab_name_, x->all_conds_,
-                                                                  x->empty_result_, context);
+                                                                  x->empty_result_, context, x->visible_name_);
                 executor->set_explain_info("Scan", "table=" + x->tab_name_ + ", type=SeqScan");
                 return executor;
             }
             else {
                 auto executor = std::make_unique<IndexScanExecutor>(sm_manager_, x->tab_name_, x->index_lookup_conds_,
                                                                     x->residual_conds_, x->index_col_names_,
-                                                                    x->index_meta_, context);
+                                                                    x->index_meta_, context, x->visible_name_);
                 executor->set_explain_info("Scan", "table=" + x->tab_name_ + ", type=IndexScan");
                 return executor;
             }

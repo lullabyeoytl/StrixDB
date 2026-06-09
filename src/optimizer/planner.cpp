@@ -381,18 +381,25 @@ std::vector<TabCol> Planner::collect_dml_required_cols(const Query &query, const
 
 Planner::ScanBuildResult Planner::make_scan_plan(const std::string &tab_name,
                                                  const std::vector<Condition> &semantic_conds,
-                                                 std::vector<TabCol> required_cols) {
+                                                 std::vector<TabCol> required_cols,
+                                                 std::string visible_name) {
     ScanBuildResult result;
-    const auto &table_cols = sm_manager_->db_.get_table(tab_name).cols;
+    auto display_name = visible_name.empty() ? tab_name : std::move(visible_name);
+    auto table_cols = sm_manager_->db_.get_table(tab_name).cols;
+    for (auto &col : table_cols) {
+        col.tab_name = display_name;
+    }
     auto normalized = normalize_predicates(table_cols, semantic_conds);
     if (normalized.contradiction) {
-        result.scan = std::make_shared<ScanPlan>(sm_manager_, tab_name, std::vector<Condition>(), true);
+        result.scan = std::make_shared<ScanPlan>(sm_manager_, tab_name, std::vector<Condition>(), true,
+                                                 display_name);
         return result;
     }
     const auto &tab = sm_manager_->db_.get_table(tab_name);
     auto best_match = match_best_index(tab, normalized.normalized_conds, required_cols);
     if (!best_match.matched) {
-        result.scan = std::make_shared<ScanPlan>(sm_manager_, tab_name, std::vector<Condition>());
+        result.scan = std::make_shared<ScanPlan>(sm_manager_, tab_name, std::vector<Condition>(), false,
+                                                 display_name);
         result.filter_conds = std::move(normalized.normalized_conds);
         return result;
     }
@@ -403,7 +410,7 @@ Planner::ScanBuildResult Planner::make_scan_plan(const std::string &tab_name,
                                              std::move(best_match.lookup_conds),
                                              std::move(best_match.residual_conds),
                                              std::move(best_match.index_col_names),
-                                             std::move(best_match.index_meta));
+                                             std::move(best_match.index_meta), display_name);
     return result;
 }
 
@@ -517,13 +524,13 @@ Planner::LogicalPlanContext Planner::logical_optimization(const std::shared_ptr<
 
     auto classify_condition = [&](const Condition &cond, std::vector<Condition> *join_conds) {
         plan_context.all_conds.push_back(cond);
-        column_usage.collect_condition(cond);
         if (cond.is_rhs_val) {
             raw_table_conds[cond.lhs_col.tab_name].push_back(cond);
         } else if (cond.lhs_col.tab_name == cond.rhs_col.tab_name) {
             raw_table_conds[cond.lhs_col.tab_name].push_back(cond);
         } else if (join_conds != nullptr) {
             join_conds->push_back(cond);
+            column_usage.collect_condition(cond);
         }
     };
 
@@ -547,7 +554,9 @@ Planner::LogicalPlanContext Planner::logical_optimization(const std::shared_ptr<
                 std::string resolved_table;
                 bool ambiguous = false;
                 for (const auto &tab_name : query->tables) {
-                    const auto &cols = sm_manager_->db_.get_table(tab_name).cols;
+                    auto storage_it = query->table_storage_names.find(tab_name);
+                    const auto &storage_name = storage_it == query->table_storage_names.end() ? tab_name : storage_it->second;
+                    const auto &cols = sm_manager_->db_.get_table(storage_name).cols;
                     auto it = std::find_if(cols.begin(), cols.end(),
                                            [&](const ColMeta &col) { return col.name == order_col.col_name; });
                     if (it == cols.end()) {
@@ -568,7 +577,12 @@ Planner::LogicalPlanContext Planner::logical_optimization(const std::shared_ptr<
     }
 
     for (auto &[tab_name, conds] : raw_table_conds) {
-        const auto &table_cols = sm_manager_->db_.get_table(tab_name).cols;
+        auto storage_it = query->table_storage_names.find(tab_name);
+        const auto &storage_name = storage_it == query->table_storage_names.end() ? tab_name : storage_it->second;
+        auto table_cols = sm_manager_->db_.get_table(storage_name).cols;
+        for (auto &col : table_cols) {
+            col.tab_name = tab_name;
+        }
         auto normalized = normalize_predicates(table_cols, conds);
         if (normalized.contradiction) {
             plan_context.table_conds[tab_name].clear();
@@ -619,8 +633,11 @@ std::vector<std::pair<std::string, std::shared_ptr<Plan>>> Planner::build_table_
         if (it != plan_context.table_conds.end()) {
             curr_conds = it->second;
         }
+        auto storage_it = query->table_storage_names.find(tab_name);
+        const auto &storage_name = storage_it == query->table_storage_names.end() ? tab_name : storage_it->second;
         ScanBuildResult scan_result;
-        scan_result.scan = std::make_shared<ScanPlan>(sm_manager_, tab_name, std::vector<Condition>());
+        scan_result.scan = std::make_shared<ScanPlan>(sm_manager_, storage_name, std::vector<Condition>(), false,
+                                                      tab_name);
         scan_result.filter_conds = std::move(curr_conds);
         if (plan_context.empty_tables.count(tab_name) != 0) {
             scan_result.scan->empty_result_ = true;
@@ -629,7 +646,7 @@ std::vector<std::pair<std::string, std::shared_ptr<Plan>>> Planner::build_table_
         if (!scan_result.filter_conds.empty()) {
             node = std::make_shared<FilterPlan>(std::move(node), std::move(scan_result.filter_conds));
         }
-        const auto &table_cols = sm_manager_->db_.get_table(tab_name).cols;
+        const auto &table_cols = sm_manager_->db_.get_table(storage_name).cols;
         if (query->tables.size() > 1 && !required_cols.empty() && required_cols.size() < table_cols.size()) {
             node = std::make_shared<ProjectionPlan>(T_Projection, std::move(node), std::move(required_cols));
         }
@@ -695,8 +712,14 @@ std::shared_ptr<Plan> Planner::generate_sort_plan(std::shared_ptr<Query> query, 
     std::vector<ColMeta> all_cols;
     for (auto &sel_tab_name : tables) {
         // 这里db_不能写成get_db(), 注意要传指针
-        const auto &sel_tab_cols = sm_manager_->db_.get_table(sel_tab_name).cols;
+        auto storage_it = query->table_storage_names.find(sel_tab_name);
+        const auto &storage_name = storage_it == query->table_storage_names.end() ? sel_tab_name : storage_it->second;
+        const auto &sel_tab_cols = sm_manager_->db_.get_table(storage_name).cols;
+        auto old_size = all_cols.size();
         all_cols.insert(all_cols.end(), sel_tab_cols.begin(), sel_tab_cols.end());
+        for (auto it = all_cols.begin() + static_cast<std::ptrdiff_t>(old_size); it != all_cols.end(); ++it) {
+            it->tab_name = sel_tab_name;
+        }
     }
     TabCol sel_col;
     for (auto &col : all_cols) {

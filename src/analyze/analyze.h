@@ -31,6 +31,7 @@ class Query{
     std::vector<TabCol> cols;
     // 表名
     std::vector<std::string> tables;
+    std::map<std::string, std::string> table_storage_names;
     std::map<std::string, std::string> table_display_names;
     // update 的set 值
     std::vector<SetClause> set_clauses;
@@ -62,9 +63,11 @@ private:
     void get_all_cols(const std::vector<std::string> &tab_names, std::vector<ColMeta> &all_cols);
     void get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds, std::vector<Condition> &conds);
     void normalize_sv_conds(std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds,
-                            const std::vector<ColMeta> &all_cols);
+                            const std::vector<ColMeta> &all_cols,
+                            const std::map<std::string, std::string> *table_storage_names = nullptr);
     // 直接传入已经构造好的all_cols防止重复获取
-    void check_clause(const std::vector<ColMeta> &all_cols, std::vector<Condition> &conds);
+    void check_clause(const std::vector<ColMeta> &all_cols, std::vector<Condition> &conds,
+                      const std::map<std::string, std::string> *table_storage_names = nullptr);
     Value convert_sv_value(const std::shared_ptr<ast::Value> &sv_val);
     CompOp convert_sv_comp_op(ast::SvCompOp op);
     ColType get_column_type(const std::vector<ColMeta> &all_cols, const TabCol &target);

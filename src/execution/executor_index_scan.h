@@ -42,6 +42,7 @@ class IndexScanExecutor : public AbstractExecutor {
     };
 
     std::string tab_name_;                      // 表名称
+    std::string visible_name_;
     TabMeta tab_;                               // 表的元数据
     std::vector<Condition> index_lookup_conds_; // 索引查找条件
     std::vector<Condition> residual_conds_;     // 索引扫描后的剩余过滤条件
@@ -241,10 +242,12 @@ class IndexScanExecutor : public AbstractExecutor {
    public:
     IndexScanExecutor(SmManager *sm_manager, std::string tab_name, std::vector<Condition> index_lookup_conds,
                       std::vector<Condition> residual_conds, std::vector<std::string> index_col_names,
-                      std::optional<IndexMeta> index_meta, Context *context) {
+                      std::optional<IndexMeta> index_meta, Context *context,
+                      std::string visible_name = std::string()) {
         sm_manager_ = sm_manager;
         context_ = context;
         tab_name_ = std::move(tab_name);
+        visible_name_ = visible_name.empty() ? tab_name_ : std::move(visible_name);
         tab_ = sm_manager_->db_.get_table(tab_name_);
         index_lookup_conds_ = std::move(index_lookup_conds);
         residual_conds_ = std::move(residual_conds);
@@ -256,21 +259,24 @@ class IndexScanExecutor : public AbstractExecutor {
         }
         fh_ = sm_manager_->fhs_.at(tab_name_).get();
         cols_ = tab_.cols;
+        for (auto &col : cols_) {
+            col.tab_name = visible_name_;
+        }
         len_ = cols_.back().offset + cols_.back().len;
-        
+
         // normalize conds
         for (auto &cond : index_lookup_conds_) {
-            if (cond.lhs_col.tab_name != tab_name_) {
+            if (cond.lhs_col.tab_name != visible_name_) {
                 // lhs is on other table, now rhs must be on this table
-                assert(!cond.is_rhs_val && cond.rhs_col.tab_name == tab_name_);
+                assert(!cond.is_rhs_val && cond.rhs_col.tab_name == visible_name_);
                 // swap lhs and rhs
                 std::swap(cond.lhs_col, cond.rhs_col);
                 cond.op = kSwapOp.at(cond.op);
             }
         }
         for (auto &cond : residual_conds_) {
-            if (cond.lhs_col.tab_name != tab_name_) {
-                assert(!cond.is_rhs_val && cond.rhs_col.tab_name == tab_name_);
+            if (cond.lhs_col.tab_name != visible_name_) {
+                assert(!cond.is_rhs_val && cond.rhs_col.tab_name == visible_name_);
                 std::swap(cond.lhs_col, cond.rhs_col);
                 cond.op = kSwapOp.at(cond.op);
             }

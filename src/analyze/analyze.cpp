@@ -13,6 +13,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <map>
+#include <set>
 
 namespace {
 
@@ -103,6 +104,78 @@ void append_unique_agg(std::vector<AggInfo> &agg_infos, const AggInfo &agg) {
     }
 }
 
+void append_unique_condition(std::vector<Condition> &conds, const Condition &cond) {
+    auto it = std::find_if(conds.begin(), conds.end(), [&](const Condition &existing) {
+        return existing.equals(cond);
+    });
+    if (it == conds.end()) {
+        conds.push_back(cond);
+    }
+}
+
+std::string condition_col_key(const TabCol &col) {
+    return col.tab_name + '\x1f' + col.col_name;
+}
+
+std::vector<Condition> derive_equal_join_value_filters(const std::vector<Condition> &conds) {
+    std::map<std::string, TabCol> key_to_col;
+    std::map<std::string, std::vector<std::string>> graph;
+    for (const auto &cond : conds) {
+        if (cond.is_rhs_val || cond.op != OP_EQ || cond.lhs_col.tab_name == cond.rhs_col.tab_name) {
+            continue;
+        }
+        std::string lhs_key = condition_col_key(cond.lhs_col);
+        std::string rhs_key = condition_col_key(cond.rhs_col);
+        key_to_col[lhs_key] = cond.lhs_col;
+        key_to_col[rhs_key] = cond.rhs_col;
+        graph[lhs_key].push_back(rhs_key);
+        graph[rhs_key].push_back(lhs_key);
+    }
+
+    std::map<std::string, std::vector<TabCol>> component_cols;
+    std::set<std::string> visited;
+    for (const auto &entry : key_to_col) {
+        if (!visited.insert(entry.first).second) {
+            continue;
+        }
+        std::vector<std::string> stack{entry.first};
+        std::vector<TabCol> cols;
+        while (!stack.empty()) {
+            std::string current = stack.back();
+            stack.pop_back();
+            cols.push_back(key_to_col.at(current));
+            for (const auto &next : graph[current]) {
+                if (visited.insert(next).second) {
+                    stack.push_back(next);
+                }
+            }
+        }
+        for (const auto &col : cols) {
+            component_cols[condition_col_key(col)] = cols;
+        }
+    }
+
+    std::vector<Condition> derived_conds;
+    for (const auto &cond : conds) {
+        if (!cond.is_rhs_val) {
+            continue;
+        }
+        auto comp_it = component_cols.find(condition_col_key(cond.lhs_col));
+        if (comp_it == component_cols.end()) {
+            continue;
+        }
+        for (const auto &target_col : comp_it->second) {
+            if (target_col.equals(cond.lhs_col)) {
+                continue;
+            }
+            Condition derived = cond;
+            derived.lhs_col = target_col;
+            append_unique_condition(derived_conds, derived);
+        }
+    }
+    return derived_conds;
+}
+
 }  // namespace
 
 /**
@@ -123,20 +196,24 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
     if (auto x = std::dynamic_pointer_cast<ast::SelectStmt>(parse))
     {
         // 处理表名
-        query->tables = x->tabs;
+        std::map<std::string, int> storage_name_counts;
+        for (const auto &ref : x->table_refs) {
+            storage_name_counts[ref->name]++;
+        }
         std::map<std::string, std::string> name_to_table;
         for (const auto &ref : x->table_refs) {
-            name_to_table[ref->name] = ref->name;
-            name_to_table[ref->alias] = ref->name;
-            query->table_display_names[ref->name] = ref->alias;
-        }
-        rewrite_select_tables(*x, name_to_table);
-        /** TODO: 检查表是否存在 */
-        for (auto &tab_name : query->tables) {
-            if (!sm_manager_->db_.is_table(tab_name)) {
-                throw TableNotFoundError(tab_name);
+            if (!sm_manager_->db_.is_table(ref->name)) {
+                throw TableNotFoundError(ref->name);
+            }
+            query->tables.push_back(ref->alias);
+            query->table_storage_names[ref->alias] = ref->name;
+            query->table_display_names[ref->alias] = ref->alias;
+            name_to_table[ref->alias] = ref->alias;
+            if (storage_name_counts[ref->name] == 1) {
+                name_to_table[ref->name] = ref->alias;
             }
         }
+        rewrite_select_tables(*x, name_to_table);
         for (auto &sv_sel_expr : x->cols) {
             if (auto sv_sel_col = std::dynamic_pointer_cast<ast::Col>(sv_sel_expr)) {
                 TabCol sel_col = {.tab_name = sv_sel_col->tab_name, .col_name = sv_sel_col->col_name};
@@ -150,7 +227,13 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         }
         
         std::vector<ColMeta> all_cols;
-        get_all_cols(query->tables, all_cols);
+        for (const auto &ref : x->table_refs) {
+            const auto &sel_tab_cols = sm_manager_->db_.get_table(ref->name).cols;
+            all_cols.insert(all_cols.end(), sel_tab_cols.begin(), sel_tab_cols.end());
+            for (auto it = all_cols.end() - static_cast<std::ptrdiff_t>(sel_tab_cols.size()); it != all_cols.end(); ++it) {
+                it->tab_name = ref->alias;
+            }
+        }
         if (x->cols.empty()) {
             // select all columns
             for (auto &col : all_cols) {
@@ -211,12 +294,27 @@ std::shared_ptr<Query> Analyze::do_analyze(std::shared_ptr<ast::TreeNode> parse)
         check_aggregate(all_cols, *query);
         if (!x->jointree.empty()) {
             for (auto &join_expr : x->jointree) {
-                normalize_sv_conds(join_expr->conds, all_cols);
+                normalize_sv_conds(join_expr->conds, all_cols, &query->table_storage_names);
             }
         }
         //处理where条件
         get_clause(x->conds, query->conds);
-        check_clause(all_cols, query->conds);
+        check_clause(all_cols, query->conds, &query->table_storage_names);
+        if (!x->jointree.empty()) {
+            std::vector<Condition> propagation_conds = query->conds;
+            for (auto &join_expr : x->jointree) {
+                std::vector<Condition> join_conds;
+                get_clause(join_expr->conds, join_conds);
+                propagation_conds.insert(propagation_conds.end(), join_conds.begin(), join_conds.end());
+            }
+            auto derived_conds = derive_equal_join_value_filters(propagation_conds);
+            if (!derived_conds.empty()) {
+                check_clause(all_cols, derived_conds, &query->table_storage_names);
+                for (const auto &cond : derived_conds) {
+                    append_unique_condition(query->conds, cond);
+                }
+            }
+        }
     } else if (auto x = std::dynamic_pointer_cast<ast::UpdateStmt>(parse)) {
         // 检查表是否存在
         if (!sm_manager_->db_.is_table(x->tab_name)) {
@@ -314,10 +412,11 @@ void Analyze::get_clause(const std::vector<std::shared_ptr<ast::BinaryExpr>> &sv
 }
 
 void Analyze::normalize_sv_conds(std::vector<std::shared_ptr<ast::BinaryExpr>> &sv_conds,
-                                 const std::vector<ColMeta> &all_cols) {
+                                 const std::vector<ColMeta> &all_cols,
+                                 const std::map<std::string, std::string> *table_storage_names) {
     std::vector<Condition> conds;
     get_clause(sv_conds, conds);
-    check_clause(all_cols, conds);
+    check_clause(all_cols, conds, table_storage_names);
     for (size_t i = 0; i < sv_conds.size(); ++i) {
         sv_conds[i]->lhs->tab_name = conds[i].lhs_col.tab_name;
         if (!conds[i].is_rhs_val) {
@@ -329,8 +428,16 @@ void Analyze::normalize_sv_conds(std::vector<std::shared_ptr<ast::BinaryExpr>> &
     }
 }
 
-void Analyze::check_clause(const std::vector<ColMeta> &all_cols, std::vector<Condition> &conds) {
+void Analyze::check_clause(const std::vector<ColMeta> &all_cols, std::vector<Condition> &conds,
+                           const std::map<std::string, std::string> *table_storage_names) {
     std::map<std::string, TabMeta> tab_cache;
+    auto storage_name = [&](const std::string &visible_name) -> std::string {
+        if (table_storage_names == nullptr) {
+            return visible_name;
+        }
+        auto it = table_storage_names->find(visible_name);
+        return it == table_storage_names->end() ? visible_name : it->second;
+    };
     // Get raw values in where clause
     for (auto &cond : conds) {
         // Infer table name from column name
@@ -340,7 +447,8 @@ void Analyze::check_clause(const std::vector<ColMeta> &all_cols, std::vector<Con
         }
         auto tab_it = tab_cache.find(cond.lhs_col.tab_name);
         if (tab_it == tab_cache.end()) {
-            tab_it = tab_cache.emplace(cond.lhs_col.tab_name, sm_manager_->db_.get_table(cond.lhs_col.tab_name)).first;
+            tab_it = tab_cache.emplace(cond.lhs_col.tab_name,
+                                       sm_manager_->db_.get_table(storage_name(cond.lhs_col.tab_name))).first;
         }
         TabMeta &lhs_tab = tab_it->second;
         auto lhs_col = lhs_tab.get_col(cond.lhs_col.col_name);
@@ -355,7 +463,8 @@ void Analyze::check_clause(const std::vector<ColMeta> &all_cols, std::vector<Con
         } else {
             auto rhs_it = tab_cache.find(cond.rhs_col.tab_name);
             if (rhs_it == tab_cache.end()) {
-                rhs_it = tab_cache.emplace(cond.rhs_col.tab_name, sm_manager_->db_.get_table(cond.rhs_col.tab_name)).first;
+                rhs_it = tab_cache.emplace(cond.rhs_col.tab_name,
+                                           sm_manager_->db_.get_table(storage_name(cond.rhs_col.tab_name))).first;
             }
             TabMeta &rhs_tab = rhs_it->second;
             auto rhs_col = rhs_tab.get_col(cond.rhs_col.col_name);
