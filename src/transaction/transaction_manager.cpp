@@ -805,6 +805,9 @@ std::optional<UndoLog> TransactionManager::GetUndoLogOptional(UndoLink link) {
     if (txn == nullptr) {
         return std::nullopt;
     }
+    if (static_cast<size_t>(link.prev_log_idx_) >= txn->GetUndoLogNum()) {
+        return std::nullopt;
+    }
     return txn->GetUndoLog(link.prev_log_idx_);
 }
 
@@ -1157,16 +1160,8 @@ void TransactionManager::PrepareInsert(int fd, const Rid &rid, const RmRecord &n
     if (!IsMvccActive(txn)) {
         return;
     }
-    UndoLog log;
-    log.is_deleted_ = true;
-    log.old_record_ = std::make_unique<RmRecord>(new_record);
-    log.ts_ = make_txn_write_ts(txn);
-    auto prev = GetVersionLink(fd, rid);
-    if (prev.has_value()) {
-        log.prev_version_ = prev->prev_;
-    }
-    UndoLink undo_link = txn->AppendUndoLog(std::move(log));
-    UpdateVersionLink(fd, rid, VersionUndoLink{undo_link, true, make_txn_write_ts(txn), false});
+    UpdateVersionLink(fd, rid, VersionUndoLink{UndoLink{txn->get_transaction_id(), -1}, true,
+                                               make_txn_write_ts(txn), false});
 }
 
 //--------------------------------------------------------------------------
@@ -1302,6 +1297,10 @@ void TransactionManager::CleanupTransaction(Transaction *txn) {
         metadata_lock.unlock();
         auto link = GetVersionLink(table_fd, write_record->GetRid());
         if (link.has_value() && link->prev_.prev_txn_ == txn->get_transaction_id()) {
+            if (!link->prev_.IsValid()) {
+                UpdateVersionLink(table_fd, write_record->GetRid(), std::nullopt);
+                continue;
+            }
             auto undo_log = txn->GetUndoLog(link->prev_.prev_log_idx_);
             std::optional<VersionUndoLink> restored = std::nullopt;
             if (undo_log.ts_ != make_txn_write_ts(txn) && undo_log.ts_ != 0) {

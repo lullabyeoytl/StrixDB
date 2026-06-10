@@ -55,7 +55,23 @@ void BufferPoolManager::update_page(Page *page, PageId new_page_id, frame_id_t n
 }
 
 BufferPoolManager::PageKey BufferPoolManager::make_page_key(PageId page_id) {
-    return PageKey{disk_manager_->get_file_name(page_id.fd), page_id.page_no};
+    return PageKey{get_cached_file_name(page_id.fd), page_id.page_no};
+}
+
+std::string BufferPoolManager::get_cached_file_name(int fd) {
+    {
+        std::shared_lock<std::shared_mutex> lock(fd_name_cache_latch_);
+        auto it = fd_name_cache_.find(fd);
+        if (it != fd_name_cache_.end()) {
+            return it->second;
+        }
+    }
+    std::string file_name = disk_manager_->get_file_name(fd);
+    {
+        std::unique_lock<std::shared_mutex> lock(fd_name_cache_latch_);
+        auto [it, inserted] = fd_name_cache_.emplace(fd, file_name);
+        return it->second;
+    }
 }
 
 void BufferPoolManager::flush_wal_before_page_write(const char *data) {
@@ -452,7 +468,7 @@ bool BufferPoolManager::delete_page(PageId page_id) {
  */
  bool BufferPoolManager::flush_all_pages(int fd) {
       std::vector<PageId> pages_to_flush;
-      std::string file_name = disk_manager_->get_file_name(fd);
+      std::string file_name = get_cached_file_name(fd);
       {
         // also need lock in flush_page, so first get all page_id in vec
           std::lock_guard<std::mutex> lock(latch_);
@@ -466,6 +482,10 @@ bool BufferPoolManager::delete_page(PageId page_id) {
           if (!flush_page(page_id)) {
               return false;
           }
+      }
+      {
+          std::unique_lock<std::shared_mutex> lock(fd_name_cache_latch_);
+          fd_name_cache_.erase(fd);
       }
       return true;
   }

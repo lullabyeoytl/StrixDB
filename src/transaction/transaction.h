@@ -40,7 +40,7 @@ struct UndoLink {
   friend auto operator!=(const UndoLink &a, const UndoLink &b) { return !(a == b); }
 
   /* Checks if the undo link points to something. */
-  bool IsValid() { return prev_txn_ != INVALID_TXN_ID; }
+  bool IsValid() const { return prev_txn_ != INVALID_TXN_ID && prev_log_idx_ >= 0; }
 };
 
 struct UndoLog {

@@ -73,9 +73,11 @@ class DiskManager: public NonCopyable {
 
     void write_log(char *log_data, int size);
 
+    int get_log_file_size();
+
     void sync_log();
 
-    void SetLogFd(int log_fd) { log_fd_ = log_fd; }
+    void SetLogFd(int log_fd);
 
     int GetLogFd() { return log_fd_; }
 
@@ -104,5 +106,8 @@ class DiskManager: public NonCopyable {
     std::mutex log_latch_;                          // 日志追加锁
 
     int log_fd_ = -1;                             // WAL日志文件的文件句柄，默认为-1，代表未打开日志文件
+    int cached_log_size_ = -1;
     std::atomic<page_id_t> fd2pageno_[MAX_FD]{};  // 文件中已经分配的页面个数，初始值为0
+
+    int ensure_log_file_open();
 };

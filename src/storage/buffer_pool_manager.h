@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include <list>
 #include <string>
 #include <unordered_map>
+#include <shared_mutex>
 #include <vector>
 
 #include "disk_manager.h"
@@ -64,6 +65,8 @@ class BufferPoolManager: public NonCopyable {
     std::vector<FrameState> frame_states_;
     std::vector<PageKey> frame_keys_;
     LogManager *log_manager_ = nullptr;
+    std::unordered_map<int, std::string> fd_name_cache_;
+    mutable std::shared_mutex fd_name_cache_latch_;
 
    public:
     BufferPoolManager(size_t pool_size, DiskManager *disk_manager)
@@ -119,6 +122,8 @@ class BufferPoolManager: public NonCopyable {
     void update_page(Page* page, PageId new_page_id, frame_id_t new_frame_id);
 
     PageKey make_page_key(PageId page_id);
+
+    std::string get_cached_file_name(int fd);
 
     void write_page_data(const PageKey &page_key, const char *data);
 

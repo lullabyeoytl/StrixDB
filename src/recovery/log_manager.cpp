@@ -118,10 +118,14 @@ lsn_t LogManager::sync_global_lsn_with_disk() {
  * @return {lsn_t} 返回该日志的日志记录号
  */
 lsn_t LogManager::add_log_to_buffer(LogRecord* log_record) {
-    return add_log_to_buffer_with_result(log_record).lsn;
+    return append_log_to_buffer(log_record, false).lsn;
 }
 
 LogAppendResult LogManager::add_log_to_buffer_with_result(LogRecord *log_record) {
+    return append_log_to_buffer(log_record, true);
+}
+
+LogAppendResult LogManager::append_log_to_buffer(LogRecord *log_record, bool include_offset) {
     std::lock_guard<std::mutex> lock(latch_);
     if (log_record == nullptr) {
         return {};
@@ -134,7 +138,9 @@ LogAppendResult LogManager::add_log_to_buffer_with_result(LogRecord *log_record)
         flush_buffer_to_disk();
     }
     LogAppendResult result;
-    result.offset = disk_manager_->get_file_size(LOG_FILE_NAME) + log_buffer_.offset_;
+    if (include_offset) {
+        result.offset = disk_manager_->get_log_file_size() + log_buffer_.offset_;
+    }
     log_record->lsn_ = global_lsn_++;
     result.lsn = log_record->lsn_;
     log_record->serialize(log_buffer_.buffer_ + log_buffer_.offset_);

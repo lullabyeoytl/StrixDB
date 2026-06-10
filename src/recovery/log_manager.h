@@ -476,6 +476,7 @@ public:
     LogBuffer* get_log_buffer() { return &log_buffer_; }
 
 private:
+    LogAppendResult append_log_to_buffer(LogRecord *log_record, bool include_offset);
     void flush_buffer_to_disk();
     void sync_written_log();
 

@@ -24,6 +24,25 @@ class InsertExecutor : public AbstractExecutor {
     Rid rid_;                       // 插入的位置，在 Next() 中通过 next_insert_rid() 赋值后再写入记录
     SmManager *sm_manager_;
 
+    static void serialize_value_to_column(const Value &src, const ColMeta &col, char *dest) {
+        Value val = coerce_value_to_type(src, col.type);
+        if (val.type == TYPE_INT) {
+            memcpy(dest, &val.int_val, sizeof(int));
+        } else if (val.type == TYPE_FLOAT) {
+            memcpy(dest, &val.float_val, sizeof(float));
+        } else if (val.type == TYPE_STRING) {
+            if (col.len < static_cast<int>(val.str_val.size())) {
+                throw StringOverflowError();
+            }
+            memset(dest, 0, col.len);
+            memcpy(dest, val.str_val.c_str(), val.str_val.size());
+        } else if (val.type == TYPE_DATETIME) {
+            memcpy(dest, &val.datetime_val, sizeof(int64_t));
+        } else {
+            throw InternalError("Unexpected value type in insert executor");
+        }
+    }
+
    public:
     InsertExecutor(SmManager *sm_manager, const std::string &tab_name, std::vector<Value> values, Context *context) {
         sm_manager_ = sm_manager;
@@ -44,23 +63,14 @@ class InsertExecutor : public AbstractExecutor {
         auto write_guard = context_ != nullptr && context_->txn_mgr_ != nullptr
                                ? context_->txn_mgr_->write_txn_guard()
                                : TransactionManager::WriteTxnGuard(nullptr);
-        // Make record buffer
         RmRecord rec(fh_->get_file_hdr().record_size);
         for (size_t i = 0; i < values_.size(); i++) {
             auto &col = tab_.cols[i];
-            Value val = coerce_value_to_type(values_[i], col.type);
-            val.init_raw(col.len);
-            memcpy(rec.data + col.offset, val.raw->data, col.len);
+            serialize_value_to_column(values_[i], col, rec.data + col.offset);
         }
-        while (true) {
-            rid_ = fh_->next_insert_rid();
-            if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
-                context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid_, fh_->GetFd());
-            }
-            // avoid insert duplicate slot
-            if (!fh_->is_record(rid_)) {
-                break;
-            }
+        rid_ = fh_->next_insert_rid();
+        if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
+            context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid_, fh_->GetFd());
         }
 
         std::vector<std::pair<IndexMeta *, std::unique_ptr<char[]>>> inserted_keys;

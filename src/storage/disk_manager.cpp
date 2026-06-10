@@ -282,6 +282,34 @@ bool DiskManager::is_file_open(const std::string &file_name) {
     return path2fd_.count(file_name) > 0;
 }
 
+int DiskManager::ensure_log_file_open() {
+    if (log_fd_ == -1) {
+        log_fd_ = open_file(LOG_FILE_NAME);
+    }
+    if (cached_log_size_ < 0) {
+        cached_log_size_ = get_file_size(LOG_FILE_NAME);
+    }
+    return log_fd_;
+}
+
+void DiskManager::SetLogFd(int log_fd) {
+    std::lock_guard<std::mutex> log_lock(log_latch_);
+    log_fd_ = log_fd;
+    cached_log_size_ = -1;
+    if (log_fd_ != -1) {
+        struct stat stat_buf;
+        if (fstat(log_fd_, &stat_buf) == 0) {
+            cached_log_size_ = static_cast<int>(stat_buf.st_size);
+        }
+    }
+}
+
+int DiskManager::get_log_file_size() {
+    std::lock_guard<std::mutex> log_lock(log_latch_);
+    ensure_log_file_open();
+    return cached_log_size_;
+}
+
 
 /**
  * @description:  读取日志文件内容
@@ -292,11 +320,8 @@ bool DiskManager::is_file_open(const std::string &file_name) {
  */
 int DiskManager::read_log(char *log_data, int size, int offset) {
     std::lock_guard<std::mutex> log_lock(log_latch_);
-    // read log file from the previous end
-    if (log_fd_ == -1) {
-        log_fd_ = open_file(LOG_FILE_NAME);
-    }
-    int file_size = get_file_size(LOG_FILE_NAME);
+    ensure_log_file_open();
+    int file_size = cached_log_size_;
     if (offset > file_size) {
         return -1;
     }
@@ -314,20 +339,18 @@ int DiskManager::read_log(char *log_data, int size, int offset) {
  */
 void DiskManager::write_log(char *log_data, int size) {
     std::lock_guard<std::mutex> log_lock(log_latch_);
-    if (log_fd_ == -1) {
-        log_fd_ = open_file(LOG_FILE_NAME);
+    if (size <= 0) {
+        return;
     }
-
-    // write from the file_end
-    const int file_size = get_file_size(LOG_FILE_NAME);
+    ensure_log_file_open();
+    const int file_size = cached_log_size_;
     write_all_at(log_fd_, log_data, size, file_size);
+    cached_log_size_ = file_size + size;
 }
 
 void DiskManager::sync_log() {
     std::lock_guard<std::mutex> log_lock(log_latch_);
-    if (log_fd_ == -1) {
-        log_fd_ = open_file(LOG_FILE_NAME);
-    }
+    ensure_log_file_open();
 
     while (fdatasync(log_fd_) < 0) {
         if (errno == EINTR) {
