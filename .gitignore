@@ -46,3 +46,12 @@ deps/googletest/**/cmake_install.cmake
 deps/googletest/**/Makefile
 
 /demo
+
+# Test and documentation files (not tracked per project requirements)
+test/
+/mvcc_ssi_draft.md
+/mvcc_ssi_fix_plan.md
+/mvcc_ssi_fix_plan.generated.md
+/plan.md
+/idempotent-hugging-lake.md
+/MVCC_SSI_STRUCTURE_ANALYSIS.md
