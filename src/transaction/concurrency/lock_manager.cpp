@@ -65,6 +65,22 @@ bool LockManager::has_prior_upgrade_request(const LockRequestQueue &queue, txn_i
     return false;
 }
 
+bool LockManager::should_wait_for_conflict(Transaction *txn, const LockDataId &lock_data_id) const {
+    if (txn == nullptr) {
+        return false;
+    }
+    auto lock_set = txn->get_lock_set();
+    if (lock_set == nullptr) {
+        return false;
+    }
+    // Only count record-level locks — a transaction that only holds table
+    // intent locks has not modified any row and should not wait (fail fast
+    // so the upper layer detects the write-write conflict immediately).
+    return std::any_of(lock_set->begin(), lock_set->end(), [&](const LockDataId &held) {
+        return held.type_ == LockDataType::RECORD && !(held == lock_data_id);
+    });
+}
+
 bool LockManager::should_wait(const LockRequestQueue &queue, txn_id_t requester_id, LockMode mode) const {
     return has_prior_upgrade_request(queue, requester_id) || !is_compatible(queue, requester_id, mode);
 }

@@ -1142,13 +1142,19 @@ UndoLog TransactionManager::BuildUndoLogForWrite(int fd, const Rid &rid, const R
     auto current = GetVersionLink(fd, rid);
     if (current.has_value()) {
         if (current->prev_.prev_txn_ == txn->get_transaction_id()) {
-            // Same transaction already owns this slot: inherit the earlier undo log so
-            // the chain points to the state before the first write of this transaction.
-            auto previous_log = GetUndoLog(current->prev_);
-            log.is_deleted_ = previous_log.is_deleted_;
-            log.old_record_ = std::make_unique<RmRecord>(*previous_log.old_record_);
-            log.ts_ = previous_log.ts_;
-            log.prev_version_ = previous_log.prev_version_;
+            // Same transaction already owns this slot.
+            if (current->prev_.IsValid()) {
+                // Inherit the earlier undo log so the chain points to the state
+                // before the first write of this transaction.
+                auto previous_log = GetUndoLog(current->prev_);
+                log.is_deleted_ = previous_log.is_deleted_;
+                log.old_record_ = std::make_unique<RmRecord>(*previous_log.old_record_);
+                log.ts_ = previous_log.ts_;
+                log.prev_version_ = previous_log.prev_version_;
+            }
+            // When prev_ is invalid (e.g. INSERT on a fresh slot followed by
+            // DELETE/UPDATE in the same transaction), leave the defaults:
+            // is_deleted_=false, ts_=0, prev_version_ stays invalid.
         } else {
             log.ts_ = current->ts_;
             log.prev_version_ = current->prev_;

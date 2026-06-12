@@ -101,11 +101,18 @@ class UpdateExecutor : public AbstractExecutor {
         auto write_guard = context_ != nullptr && context_->txn_mgr_ != nullptr
                                ? context_->txn_mgr_->write_txn_guard()
                                : TransactionManager::WriteTxnGuard(nullptr);
+        bool has_prior_writes = context_ != nullptr && context_->txn_ != nullptr &&
+                                !context_->txn_->get_write_set()->empty();
+        bool use_mvcc = is_mvcc_active(context_);
+        if (!has_prior_writes) {
+            check_write_conflict(context_, fh_->GetFd(), rid);
+        }
         if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
             context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd());
         }
-        bool use_mvcc = is_mvcc_active(context_);
-        check_write_conflict(context_, fh_->GetFd(), rid);
+        if (has_prior_writes) {
+            check_write_conflict(context_, fh_->GetFd(), rid);
+        }
         track_ssi_write(context_, tab_name_, rid, &old_rec, &new_rec);
         lsn_t op_lsn = INVALID_LSN;
         if (context_ != nullptr && context_->txn_ != nullptr && context_->log_mgr_ != nullptr) {
