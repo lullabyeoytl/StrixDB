@@ -80,6 +80,7 @@ private:
     bool has_prior_upgrade_request(const LockRequestQueue &queue, txn_id_t requester_id) const;
     bool should_wait(const LockRequestQueue &queue, txn_id_t requester_id, LockMode mode) const;
     bool should_wait_for_conflict(Transaction *txn, const LockDataId &lock_data_id) const;
+    bool has_older_wait_blocker(const std::vector<txn_id_t> &blockers, txn_id_t requester_id) const;
     bool is_at_least_as_strong(LockMode held, LockMode requested) const;
     std::vector<txn_id_t> collect_wait_blockers(const LockRequestQueue &queue, txn_id_t requester_id,
                                                 LockMode mode) const;
