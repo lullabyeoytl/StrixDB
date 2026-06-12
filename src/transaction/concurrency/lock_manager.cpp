@@ -81,12 +81,6 @@ bool LockManager::should_wait_for_conflict(Transaction *txn, const LockDataId &l
     });
 }
 
-bool LockManager::has_older_wait_blocker(const std::vector<txn_id_t> &blockers, txn_id_t requester_id) const {
-    return std::any_of(blockers.begin(), blockers.end(), [requester_id](txn_id_t blocker) {
-        return blocker < requester_id;
-    });
-}
-
 bool LockManager::should_wait(const LockRequestQueue &queue, txn_id_t requester_id, LockMode mode) const {
     return has_prior_upgrade_request(queue, requester_id) || !is_compatible(queue, requester_id, mode);
 }
@@ -303,14 +297,6 @@ bool LockManager::perform_upgrade(std::unique_lock<std::mutex> &lock, LockReques
 
     while (should_wait(queue, tid, mode)) {
         auto blockers = collect_wait_blockers(queue, tid, mode);
-        if (has_older_wait_blocker(blockers, tid)) {
-            clear_waiter_edges(tid);
-            clear_blocker_edges(tid);
-            queue.request_queue_.erase(upgrade_it);
-            queue.upgrading_ = false;
-            queue.cv_.notify_all();
-            throw TransactionAbortException(tid, AbortReason::DEADLOCK_PREVENTION);
-        }
         set_wait_edges(tid, blockers, lock_data_id);
         if (has_wait_cycle(tid)) {
             clear_waiter_edges(tid);
@@ -350,13 +336,6 @@ bool LockManager::acquire_new_lock(std::unique_lock<std::mutex> &lock, LockReque
 
     while (should_wait(queue, tid, mode)) {
         auto blockers = collect_wait_blockers(queue, tid, mode);
-        if (has_older_wait_blocker(blockers, tid)) {
-            clear_waiter_edges(tid);
-            clear_blocker_edges(tid);
-            queue.request_queue_.erase(request_it);
-            queue.cv_.notify_all();
-            throw TransactionAbortException(tid, AbortReason::DEADLOCK_PREVENTION);
-        }
         set_wait_edges(tid, blockers, lock_data_id);
         if (has_wait_cycle(tid)) {
             clear_waiter_edges(tid);

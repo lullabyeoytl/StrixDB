@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include <cfloat>
 #include <cstdint>
 #include <limits>
+#include <set>
 
 #include "common/common.h"
 #include "execution_common.h"
@@ -62,6 +63,7 @@ class IndexScanExecutor : public AbstractExecutor {
     Rid rid_;
     std::unique_ptr<RecScan> scan_;
     std::unique_ptr<RmRecord> current_heap_record_;
+    std::set<std::pair<int, int>> returned_rids_;
 
     SmManager *sm_manager_;
 
@@ -151,6 +153,10 @@ class IndexScanExecutor : public AbstractExecutor {
         }
     }
 
+    auto mark_returned_rid(const Rid &rid) -> bool {
+        return returned_rids_.insert({rid.page_no, rid.slot_no}).second;
+    }
+
     auto seek_to_next_covered_tuple() -> bool {
         if (scan_ == nullptr || scan_->is_end()) {
             rid_ = Rid{-1, -1};
@@ -164,14 +170,15 @@ class IndexScanExecutor : public AbstractExecutor {
                 !ix_scan->current_visibility().allow_stale_index_entry) {
                 auto key_record = make_record_from_index_key();
                 auto eval_record = make_eval_record_from_index_key();
-                if (evaluate_conditions(residual_conds_, *eval_record, index_eval_cols_)) {
+                if (evaluate_conditions(residual_conds_, *eval_record, index_eval_cols_) && mark_returned_rid(rid_)) {
                     track_ssi_record_read(rid_, *key_record);
                     current_heap_record_.reset();
                     return true;
                 }
             } else {
                 auto heap_record = fetch_visible_heap_record(rid_);
-                if (heap_record != nullptr && evaluate_conditions(all_conds_, *heap_record, tab_.cols)) {
+                if (heap_record != nullptr && evaluate_conditions(all_conds_, *heap_record, tab_.cols) &&
+                    mark_returned_rid(rid_)) {
                     track_ssi_record_read(rid_, *heap_record);
                     current_heap_record_ = std::move(heap_record);
                     return true;
@@ -199,7 +206,8 @@ class IndexScanExecutor : public AbstractExecutor {
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
             auto heap_record = fetch_visible_heap_record(rid_);
-            if (heap_record != nullptr && evaluate_conditions(all_conds_, *heap_record, tab_.cols)) {
+            if (heap_record != nullptr && evaluate_conditions(all_conds_, *heap_record, tab_.cols) &&
+                mark_returned_rid(rid_)) {
                 track_ssi_record_read(rid_, *heap_record);
                 current_heap_record_ = std::move(heap_record);
                 return;
@@ -447,6 +455,7 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void restartTupleImpl() override {
+        returned_rids_.clear();
         if (ssi_read_tracking_enabled_) {
             track_ssi_predicate_read(context_, tab_name_, all_conds_);
         }

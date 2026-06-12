@@ -354,6 +354,10 @@ void IxIndexHandle::validate_unique_hit(const char *key, const Rid &hit, IndexVi
     if (visibility.check_write_conflict) {
         auto link = txn_mgr_->GetVersionLink(table_fd_, hit);
         if (link.has_value()) {
+            // Logical deletes keep stale index entries for MVCC readers, but they no longer occupy the unique key.
+            if (link->is_deleted_) {
+                return;
+            }
             if (link->in_progress_ && link->prev_.prev_txn_ != transaction->get_transaction_id()) {
                 throw TransactionAbortException(transaction->get_transaction_id(), AbortReason::WRITE_CONFLICT);
             }

@@ -102,40 +102,28 @@ void write_bounded_output(const std::string &output, Context *context) {
     }
 }
 
-auto truncate_cell(std::string value, size_t width) -> std::string {
-    if (value.size() > width) {
-        value = value.substr(0, width - 3) + "...";
-    }
-    return value;
+void append_file_cell(std::string &output, const std::string &cell) {
+    output.push_back(' ');
+    output.append(cell);
+    output.append(" |");
 }
 
-void append_separator_line(const std::vector<size_t> &col_widths, std::string &output) {
-    for (size_t width : col_widths) {
-        output += "+" + std::string(width + 2, '-');
+void append_file_record(const std::vector<std::string> &record, std::string &output) {
+    output.push_back('|');
+    for (const auto &cell : record) {
+        append_file_cell(output, cell);
     }
-    output += "+\n";
+    output.push_back('\n');
 }
 
-void append_record_line(const std::vector<std::string> &record, const std::vector<size_t> &col_widths, std::string &output) {
-    assert(record.size() == col_widths.size());
-    for (size_t i = 0; i < record.size(); ++i) {
-        const auto value = truncate_cell(record[i], col_widths[i]);
-        output += "| " + std::string(col_widths[i] - value.size(), ' ') + value + " ";
-    }
-    output += "|\n";
-}
-
-auto render_table_output(const std::vector<std::string> &captions, const std::vector<std::vector<std::string>> &rows,
-                         const std::vector<size_t> &col_widths) -> std::string {
+auto render_file_table_output(const std::vector<std::string> &captions,
+                              const std::vector<std::vector<std::string>> &rows) -> std::string {
     std::string output;
-    append_separator_line(col_widths, output);
-    append_record_line(captions, col_widths, output);
-    append_separator_line(col_widths, output);
+    output.reserve((rows.size() + 1) * captions.size() * 16);
+    append_file_record(captions, output);
     for (const auto &row : rows) {
-        append_record_line(row, col_widths, output);
+        append_file_record(row, output);
     }
-    append_separator_line(col_widths, output);
-    output += "Total record(s): " + std::to_string(rows.size()) + "\n";
     return output;
 }
 
@@ -353,7 +341,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     rec_printer.print_separator(context);
     RecordPrinter::print_record_count(num_rec, context);
 
-    const auto file_output = render_table_output(captions, rows, col_widths);
+    const auto file_output = render_file_table_output(captions, rows);
 
     std::fstream outfile;
     outfile.open("output.txt", std::ios::out | std::ios::app);
