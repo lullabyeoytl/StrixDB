@@ -108,7 +108,10 @@ class UpdateExecutor : public AbstractExecutor {
             check_write_conflict(context_, fh_->GetFd(), rid);
         }
         if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
-            context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd());
+            if (!context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd())) {
+                throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                                AbortReason::DEADLOCK_PREVENTION);
+            }
         }
         if (has_prior_writes) {
             check_write_conflict(context_, fh_->GetFd(), rid);

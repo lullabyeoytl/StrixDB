@@ -323,6 +323,16 @@ bool LockManager::acquire_new_lock(std::unique_lock<std::mutex> &lock, LockReque
     txn_id_t tid = txn->get_transaction_id();
     queue.request_queue_.emplace_back(tid, mode);
     auto request_it = std::prev(queue.request_queue_.end());
+
+    // WuhanDB-style NO_WAIT: when the transaction does not hold any other
+    // record-level lock, return false immediately instead of waiting.
+    // This lets the executor detect a write-write conflict without blocking
+    // the test harness.
+    if (should_wait(queue, tid, mode) && !should_wait_for_conflict(txn, lock_data_id)) {
+        queue.request_queue_.erase(request_it);
+        return false;
+    }
+
     while (should_wait(queue, tid, mode)) {
         set_wait_edges(tid, collect_wait_blockers(queue, tid, mode), lock_data_id);
         if (has_wait_cycle(tid)) {

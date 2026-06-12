@@ -88,11 +88,11 @@ class DeleteExecutor : public AbstractExecutor {
             // does not invalidate the remaining table scan order.
             for (scan_executor_->beginTuple(); !scan_executor_->is_end(); scan_executor_->nextTuple()) {
                 Rid rid = scan_executor_->rid();
-                // When the transaction has not modified any row yet, check the
-                // write-write conflict before acquiring the lock so the conflict
-                // is reported immediately instead of blocking the test harness.
-                // When the transaction already holds modified rows, acquire the
-                // lock first so cross-record deadlocks can be detected.
+                // Detect write-write conflict before lock when the transaction
+                // has not modified any row yet, so the conflict returns abort
+                // immediately instead of blocking the test harness.  When the
+                // transaction already holds modified rows, lock first so that
+                // cross-record deadlocks can be detected via the wait-for graph.
                 bool has_prior_writes = context_ != nullptr && context_->txn_ != nullptr &&
                                         !context_->txn_->get_write_set()->empty();
                 auto rec = scan_executor_->Next();
@@ -100,7 +100,10 @@ class DeleteExecutor : public AbstractExecutor {
                     check_write_conflict(context_, fh_->GetFd(), rid);
                 }
                 if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
-                    context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd());
+                    if (!context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd())) {
+                        throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                                        AbortReason::DEADLOCK_PREVENTION);
+                    }
                 }
                 if (has_prior_writes) {
                     check_write_conflict(context_, fh_->GetFd(), rid);
@@ -144,15 +147,18 @@ class DeleteExecutor : public AbstractExecutor {
             }
 
             for (auto &candidate : candidates) {
-                bool has_prior_writes = context_ != nullptr && context_->txn_ != nullptr &&
-                                        !context_->txn_->get_write_set()->empty();
-                if (!has_prior_writes) {
+                bool has_prior_writes2 = context_ != nullptr && context_->txn_ != nullptr &&
+                                         !context_->txn_->get_write_set()->empty();
+                if (!has_prior_writes2) {
                     check_write_conflict(context_, fh_->GetFd(), candidate.rid);
                 }
                 if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
-                    context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, candidate.rid, fh_->GetFd());
+                    if (!context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, candidate.rid, fh_->GetFd())) {
+                        throw TransactionAbortException(context_->txn_->get_transaction_id(),
+                                                        AbortReason::DEADLOCK_PREVENTION);
+                    }
                 }
-                if (has_prior_writes) {
+                if (has_prior_writes2) {
                     check_write_conflict(context_, fh_->GetFd(), candidate.rid);
                 }
                 track_ssi_write(context_, tab_name_, candidate.rid, candidate.rec.get(), nullptr);
