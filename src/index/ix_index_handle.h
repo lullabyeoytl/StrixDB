@@ -301,7 +301,8 @@ class IxIndexHandle : public NonCopyable {
 
     // for insert
     page_id_t insert_entry(const char *key, const Rid &value, Transaction *transaction,
-                           const std::vector<Rid> *ignored_rids = nullptr);
+                           const std::vector<Rid> *ignored_rids = nullptr,
+                           bool *reused_in_progress_deleted_key = nullptr);
 
     std::unique_ptr<IxNodeHandle> split(IxNodeHandle *node);
 
@@ -453,11 +454,13 @@ class IxIndexHandle : public NonCopyable {
     bool is_ignored_unique_hit(const Rid &hit, const Rid *self_rid, const std::vector<Rid> *ignored_rids) const;
 
     void validate_unique_hit(const char *key, const Rid &hit, IndexVisibility visibility, Transaction *transaction,
-                             const Rid *self_rid, const std::vector<Rid> *ignored_rids) const;
+                             const Rid *self_rid, const std::vector<Rid> *ignored_rids,
+                             bool *reused_in_progress_deleted_key) const;
 
     void validate_unique_key_in_latched_leaf(const char *key, const IxNodeHandle *leaf, Transaction *transaction,
                                              const Rid *self_rid,
-                                             const std::vector<Rid> *ignored_rids) const;
+                                             const std::vector<Rid> *ignored_rids,
+                                             bool *reused_in_progress_deleted_key) const;
 
     // Walk backward from `start` to the first leaf whose last key is < `key`
     std::unique_ptr<IxNodeHandle> backtrack_leaf(std::unique_ptr<IxNodeHandle> start, const char *key,

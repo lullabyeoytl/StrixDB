@@ -76,6 +76,7 @@ class InsertExecutor : public AbstractExecutor {
         std::vector<std::pair<IndexMeta *, std::unique_ptr<char[]>>> inserted_keys;
         std::vector<std::string> violation_cols;
         bool version_link_prepared = false;
+        bool publish_deleted_key_insert = false;
         bool heap_inserted = false;
         auto cleanup_insert_attempt = [&]() {
             for (auto it = inserted_keys.rbegin(); it != inserted_keys.rend(); ++it) {
@@ -106,7 +107,9 @@ class InsertExecutor : public AbstractExecutor {
                 auto key = std::make_unique<char[]>(index.col_tot_len);
                 index.build_key(key.get(), rec.data);
                 try {
-                    ih->insert_entry(key.get(), rid_, context_->txn_);
+                    bool reused_in_progress_deleted_key = false;
+                    ih->insert_entry(key.get(), rid_, context_->txn_, nullptr, &reused_in_progress_deleted_key);
+                    publish_deleted_key_insert = publish_deleted_key_insert || reused_in_progress_deleted_key;
                 } catch (const UniqueKeyViolationError &) {
                     violation_cols = index.col_names();
                     throw;
@@ -116,7 +119,11 @@ class InsertExecutor : public AbstractExecutor {
 
             track_ssi_write(context_, tab_name_, rid_, nullptr, &rec);
             if (context_ != nullptr && context_->txn_mgr_ != nullptr && context_->txn_ != nullptr) {
-                context_->txn_mgr_->PrepareInsert(fh_->GetFd(), rid_, rec, context_->txn_);
+                if (publish_deleted_key_insert) {
+                    context_->txn_mgr_->PrepareInsertFromDeletedKey(fh_->GetFd(), rid_, rec, context_->txn_);
+                } else {
+                    context_->txn_mgr_->PrepareInsert(fh_->GetFd(), rid_, rec, context_->txn_);
+                }
                 version_link_prepared = TransactionManager::IsMvccActive(context_->txn_);
             }
 

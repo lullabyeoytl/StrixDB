@@ -139,6 +139,7 @@ public:
         -> std::unique_ptr<RmRecord>;
 
     void PrepareInsert(int fd, const Rid &rid, const RmRecord &new_record, Transaction *txn);
+    void PrepareInsertFromDeletedKey(int fd, const Rid &rid, const RmRecord &new_record, Transaction *txn);
 
     void PrepareUpdate(int fd, const Rid &rid, const RmRecord &old_record, Transaction *txn);
 

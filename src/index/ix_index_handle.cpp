@@ -337,7 +337,8 @@ bool IxIndexHandle::is_ignored_unique_hit(const Rid &hit, const Rid *self_rid,
 
 void IxIndexHandle::validate_unique_hit(const char *key, const Rid &hit, IndexVisibility visibility,
                                         Transaction *transaction, const Rid *self_rid,
-                                        const std::vector<Rid> *ignored_rids) const {
+                                        const std::vector<Rid> *ignored_rids,
+                                        bool *reused_in_progress_deleted_key) const {
     if (is_ignored_unique_hit(hit, self_rid, ignored_rids)) {
         return;
     }
@@ -358,9 +359,16 @@ void IxIndexHandle::validate_unique_hit(const char *key, const Rid &hit, IndexVi
                 return;
             }
             if (link->in_progress_ && link->prev_.prev_txn_ != transaction->get_transaction_id()) {
+                if (link->is_deleted_) {
+                    if (reused_in_progress_deleted_key != nullptr) {
+                        *reused_in_progress_deleted_key = true;
+                    }
+                    return;
+                }
                 throw TransactionAbortException(transaction->get_transaction_id(), AbortReason::WRITE_CONFLICT);
             }
-            if (link->is_deleted_) {
+            if (link->is_deleted_ && !link->in_progress_ && link->ts_ != INVALID_TS &&
+                link->ts_ > transaction->get_start_ts()) {
                 return;
             }
             if (!link->in_progress_ && link->ts_ != INVALID_TS && link->ts_ > transaction->get_start_ts()) {
@@ -390,7 +398,8 @@ void IxIndexHandle::validate_unique_hit(const char *key, const Rid &hit, IndexVi
 
 void IxIndexHandle::validate_unique_key_in_latched_leaf(const char *key, const IxNodeHandle *leaf,
                                                         Transaction *transaction, const Rid *self_rid,
-                                                        const std::vector<Rid> *ignored_rids) const {
+                                                        const std::vector<Rid> *ignored_rids,
+                                                        bool *reused_in_progress_deleted_key) const {
     if (!file_hdr_->unique_) {
         return;
     }
@@ -399,7 +408,8 @@ void IxIndexHandle::validate_unique_key_in_latched_leaf(const char *key, const I
          pos < leaf->get_size() && ix_compare(leaf->get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_) == 0;
          ++pos) {
         const Rid hit = *leaf->get_rid(pos);
-        validate_unique_hit(key, hit, check_entry_visibility(hit, transaction), transaction, self_rid, ignored_rids);
+        validate_unique_hit(key, hit, check_entry_visibility(hit, transaction), transaction, self_rid, ignored_rids,
+                            reused_in_progress_deleted_key);
     }
 }
 
@@ -418,7 +428,7 @@ bool IxIndexHandle::validate_unique_key(const char *key, Transaction *transactio
 
     while (!scan.is_end()) {
         Rid hit = scan.rid();
-        validate_unique_hit(key, hit, scan.current_visibility(), transaction, self_rid, ignored_rids);
+        validate_unique_hit(key, hit, scan.current_visibility(), transaction, self_rid, ignored_rids, nullptr);
         scan.next();
     }
 
@@ -548,9 +558,14 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle *old_node, const char *key, 
  * @return page_id_t 插入到的叶结点的page_no
  */
 page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transaction *transaction,
-                                      const std::vector<Rid> *ignored_rids) {
+                                      const std::vector<Rid> *ignored_rids,
+                                      bool *reused_in_progress_deleted_key_out) {
     auto access_guard = guard_access();
     std::unique_lock<std::mutex> unique_insert_guard(unique_insert_latch_, std::defer_lock);
+    bool reused_in_progress_deleted_key = false;
+    if (reused_in_progress_deleted_key_out != nullptr) {
+        *reused_in_progress_deleted_key_out = false;
+    }
     if (file_hdr_->unique_) {
         unique_insert_guard.lock();
         validate_unique_key(key, transaction, &value, ignored_rids);
@@ -579,7 +594,8 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
     }
 
     try {
-        validate_unique_key_in_latched_leaf(key, leaf.get(), transaction, &value, ignored_rids);
+        validate_unique_key_in_latched_leaf(key, leaf.get(), transaction, &value, ignored_rids,
+                                            &reused_in_progress_deleted_key);
     } catch (...) {
         unlatch_and_unpin_exclusive(leaf, false);
         throw;
@@ -612,6 +628,9 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
 
     if (should_update_parent) {
         maintain_parent(leaf_page_no, leaf_parent_page_no, updated_first_key.data());
+    }
+    if (reused_in_progress_deleted_key_out != nullptr) {
+        *reused_in_progress_deleted_key_out = reused_in_progress_deleted_key;
     }
     return page_no;
 }

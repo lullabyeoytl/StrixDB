@@ -1131,6 +1131,22 @@ void TransactionManager::PrepareInsert(int fd, const Rid &rid, const RmRecord &n
     }
 }
 
+void TransactionManager::PrepareInsertFromDeletedKey(int fd, const Rid &rid, const RmRecord &new_record,
+                                                     Transaction *txn) {
+    if (!IsMvccActive(txn)) {
+        return;
+    }
+    auto current = GetVersionLink(fd, rid);
+    if (current.has_value()) {
+        UndoLog log = BuildUndoLogForWrite(fd, rid, new_record, txn);
+        UndoLink undo_link = txn->AppendUndoLog(std::move(log));
+        UpdateVersionLink(fd, rid, VersionUndoLink{undo_link, false, txn->get_start_ts(), false});
+    } else {
+        UpdateVersionLink(fd, rid, VersionUndoLink{UndoLink{txn->get_transaction_id(), -1}, false,
+                                                   txn->get_start_ts(), false});
+    }
+}
+
 //--------------------------------------------------------------------------
 // BuildUndoLogForWrite  — construct undo log for UPDATE/DELETE
 //--------------------------------------------------------------------------
