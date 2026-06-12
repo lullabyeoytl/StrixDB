@@ -11,8 +11,6 @@ See the Mulan PSL v2 for more details. */
 #include "execution_manager.h"
 
 #include <algorithm>
-#include <iomanip>
-#include <sstream>
 
 #include "execution_common.h"
 #include "executor_delete.h"
@@ -104,37 +102,29 @@ void write_bounded_output(const std::string &output, Context *context) {
     }
 }
 
-auto render_file_table_output(const std::vector<std::string> &captions,
-                              const std::vector<std::vector<std::string>> &rows,
-                              const std::vector<size_t> &col_widths) -> std::string {
-    std::stringstream output;
-    auto append_separator = [&]() {
-        for (size_t width : col_widths) {
-            output << '+' << std::string(width + 2, '-');
-        }
-        output << "+\n";
-    };
-    auto append_record = [&](const std::vector<std::string> &record) {
-        for (size_t i = 0; i < record.size(); ++i) {
-            auto cell = record[i];
-            size_t width = col_widths[i];
-            if (cell.size() > width) {
-                cell = cell.substr(0, width - 3) + "...";
-            }
-            output << "| " << std::setw(static_cast<int>(width)) << cell << ' ';
-        }
-        output << "|\n";
-    };
+void append_file_cell(std::string &output, const std::string &cell) {
+    output.push_back(' ');
+    output.append(cell);
+    output.append(" |");
+}
 
-    append_separator();
-    append_record(captions);
-    append_separator();
-    for (const auto &row : rows) {
-        append_record(row);
+void append_file_record(const std::vector<std::string> &record, std::string &output) {
+    output.push_back('|');
+    for (const auto &cell : record) {
+        append_file_cell(output, cell);
     }
-    append_separator();
-    output << "Total record(s): " << rows.size() << '\n';
-    return output.str();
+    output.push_back('\n');
+}
+
+auto render_file_table_output(const std::vector<std::string> &captions,
+                              const std::vector<std::vector<std::string>> &rows) -> std::string {
+    std::string output;
+    output.reserve((rows.size() + 1) * captions.size() * 16);
+    append_file_record(captions, output);
+    for (const auto &row : rows) {
+        append_file_record(row, output);
+    }
+    return output;
 }
 
 }  // namespace
@@ -351,7 +341,7 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     rec_printer.print_separator(context);
     RecordPrinter::print_record_count(num_rec, context);
 
-    const auto file_output = render_file_table_output(captions, rows, col_widths);
+    const auto file_output = render_file_table_output(captions, rows);
 
     std::fstream outfile;
     outfile.open("output.txt", std::ios::out | std::ios::app);
