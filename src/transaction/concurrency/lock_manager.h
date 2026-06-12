@@ -80,15 +80,22 @@ private:
     bool has_prior_upgrade_request(const LockRequestQueue &queue, txn_id_t requester_id) const;
     bool should_wait(const LockRequestQueue &queue, txn_id_t requester_id, LockMode mode) const;
     bool should_wait_for_conflict(Transaction *txn, const LockDataId &lock_data_id) const;
+    uint64_t next_wait_sequence(Transaction *txn);
     bool is_at_least_as_strong(LockMode held, LockMode requested) const;
     std::vector<txn_id_t> collect_wait_blockers(const LockRequestQueue &queue, txn_id_t requester_id,
                                                 LockMode mode) const;
     bool has_wait_path(txn_id_t current, txn_id_t target, std::unordered_set<txn_id_t> &visited) const;
     bool has_wait_cycle(txn_id_t txn_id) const;
-    void set_wait_edges(txn_id_t waiter, const std::vector<txn_id_t> &blockers, const LockDataId &lock_data_id);
+    bool collect_wait_path(txn_id_t current, txn_id_t target, std::unordered_set<txn_id_t> &visited,
+                           std::vector<txn_id_t> &path) const;
+    txn_id_t choose_deadlock_victim(txn_id_t txn_id) const;
+    void set_wait_edges(Transaction *txn, txn_id_t waiter, uint64_t wait_sequence,
+                        const std::vector<txn_id_t> &blockers, const LockDataId &lock_data_id);
     void clear_waiter_edges(txn_id_t waiter);
     void clear_blocker_edges(txn_id_t blocker);
     void clear_blocker_edges_on_lock(txn_id_t blocker, const LockDataId &lock_data_id);
+    void notify_waiter(txn_id_t waiter);
+    void mark_waiter_aborted(txn_id_t waiter);
     // void recompute_group_mode(LockRequestQueue &queue);
     bool acquire_lock(std::unique_lock<std::mutex> &lock, LockRequestQueue &queue, Transaction *txn, LockMode mode,
                       const LockDataId &lock_data_id);
@@ -101,4 +108,7 @@ private:
     std::mutex latch_;      // 用于锁表的并发
     std::unordered_map<LockDataId, LockRequestQueue> lock_table_;   // 全局锁表
     std::unordered_map<txn_id_t, std::vector<WaitEdge>> wait_edges_;
+    std::unordered_map<txn_id_t, uint64_t> waiting_request_sequence_;
+    std::unordered_map<txn_id_t, Transaction *> waiting_transactions_;
+    uint64_t next_request_sequence_ = 1;
 };

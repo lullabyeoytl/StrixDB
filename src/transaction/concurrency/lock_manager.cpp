@@ -123,6 +123,13 @@ bool LockManager::has_wait_path(txn_id_t current, txn_id_t target, std::unordere
     return false;
 }
 
+uint64_t LockManager::next_wait_sequence(Transaction *txn) {
+    if (txn != nullptr && txn->get_statement_sequence() != 0) {
+        return txn->get_statement_sequence();
+    }
+    return next_request_sequence_++;
+}
+
 bool LockManager::has_wait_cycle(txn_id_t txn_id) const {
     auto it = wait_edges_.find(txn_id);
     if (it == wait_edges_.end()) {
@@ -137,8 +144,63 @@ bool LockManager::has_wait_cycle(txn_id_t txn_id) const {
     return false;
 }
 
-void LockManager::set_wait_edges(txn_id_t waiter, const std::vector<txn_id_t> &blockers,
-                                 const LockDataId &lock_data_id) {
+bool LockManager::collect_wait_path(txn_id_t current, txn_id_t target, std::unordered_set<txn_id_t> &visited,
+                                    std::vector<txn_id_t> &path) const {
+    path.push_back(current);
+    if (current == target) {
+        return true;
+    }
+    if (!visited.insert(current).second) {
+        path.pop_back();
+        return false;
+    }
+    auto it = wait_edges_.find(current);
+    if (it == wait_edges_.end()) {
+        path.pop_back();
+        return false;
+    }
+    for (const auto &edge : it->second) {
+        if (collect_wait_path(edge.blocker_, target, visited, path)) {
+            return true;
+        }
+    }
+    path.pop_back();
+    return false;
+}
+
+txn_id_t LockManager::choose_deadlock_victim(txn_id_t txn_id) const {
+    auto it = wait_edges_.find(txn_id);
+    if (it == wait_edges_.end()) {
+        return txn_id;
+    }
+    std::vector<txn_id_t> cycle;
+    for (const auto &edge : it->second) {
+        std::unordered_set<txn_id_t> visited;
+        std::vector<txn_id_t> path;
+        if (collect_wait_path(edge.blocker_, txn_id, visited, path)) {
+            cycle = std::move(path);
+            break;
+        }
+    }
+    if (cycle.empty()) {
+        return txn_id;
+    }
+    cycle.push_back(txn_id);
+    txn_id_t victim = cycle.front();
+    uint64_t victim_sequence = 0;
+    for (txn_id_t candidate : cycle) {
+        auto seq_it = waiting_request_sequence_.find(candidate);
+        uint64_t sequence = seq_it == waiting_request_sequence_.end() ? 0 : seq_it->second;
+        if (sequence > victim_sequence || (sequence == victim_sequence && candidate > victim)) {
+            victim = candidate;
+            victim_sequence = sequence;
+        }
+    }
+    return victim;
+}
+
+void LockManager::set_wait_edges(Transaction *txn, txn_id_t waiter, uint64_t wait_sequence,
+                                 const std::vector<txn_id_t> &blockers, const LockDataId &lock_data_id) {
     std::vector<WaitEdge> edges;
     edges.reserve(blockers.size());
     std::unordered_set<txn_id_t> unique_blockers;
@@ -149,13 +211,19 @@ void LockManager::set_wait_edges(txn_id_t waiter, const std::vector<txn_id_t> &b
     }
     if (edges.empty()) {
         wait_edges_.erase(waiter);
+        waiting_request_sequence_.erase(waiter);
+        waiting_transactions_.erase(waiter);
     } else {
         wait_edges_[waiter] = std::move(edges);
+        waiting_request_sequence_[waiter] = wait_sequence;
+        waiting_transactions_[waiter] = txn;
     }
 }
 
 void LockManager::clear_waiter_edges(txn_id_t waiter) {
     wait_edges_.erase(waiter);
+    waiting_request_sequence_.erase(waiter);
+    waiting_transactions_.erase(waiter);
 }
 
 void LockManager::clear_blocker_edges(txn_id_t blocker) {
@@ -165,6 +233,8 @@ void LockManager::clear_blocker_edges(txn_id_t blocker) {
                                    [blocker](const WaitEdge &edge) { return edge.blocker_ == blocker; }),
                     edges.end());
         if (it->second.empty()) {
+            waiting_request_sequence_.erase(it->first);
+            waiting_transactions_.erase(it->first);
             it = wait_edges_.erase(it);
         } else {
             ++it;
@@ -181,11 +251,27 @@ void LockManager::clear_blocker_edges_on_lock(txn_id_t blocker, const LockDataId
                                    }),
                     edges.end());
         if (it->second.empty()) {
+            waiting_request_sequence_.erase(it->first);
+            waiting_transactions_.erase(it->first);
             it = wait_edges_.erase(it);
         } else {
             ++it;
         }
     }
+}
+
+void LockManager::notify_waiter(txn_id_t waiter) {
+    for (auto &[_, queue] : lock_table_) {
+        queue.cv_.notify_all();
+    }
+}
+
+void LockManager::mark_waiter_aborted(txn_id_t waiter) {
+    auto txn_it = waiting_transactions_.find(waiter);
+    if (txn_it != waiting_transactions_.end() && txn_it->second != nullptr) {
+        txn_it->second->set_state(TransactionState::ABORTED);
+    }
+    notify_waiter(waiter);
 }
 
 // 已经持有的锁是否能覆盖本次请求
@@ -293,12 +379,27 @@ bool LockManager::perform_upgrade(std::unique_lock<std::mutex> &lock, LockReques
     }
 
     queue.upgrading_ = true;
+    uint64_t wait_sequence = next_wait_sequence(txn);
     auto upgrade_it = queue.request_queue_.emplace(std::next(request_it), tid, mode, true);
 
     while (should_wait(queue, tid, mode)) {
         auto blockers = collect_wait_blockers(queue, tid, mode);
-        set_wait_edges(tid, blockers, lock_data_id);
+        set_wait_edges(txn, tid, wait_sequence, blockers, lock_data_id);
         if (has_wait_cycle(tid)) {
+            txn_id_t victim = choose_deadlock_victim(tid);
+            if (victim != tid) {
+                mark_waiter_aborted(victim);
+            } else {
+                clear_waiter_edges(tid);
+                clear_blocker_edges(tid);
+                queue.request_queue_.erase(upgrade_it);
+                queue.upgrading_ = false;
+                queue.cv_.notify_all();
+                throw TransactionAbortException(tid, AbortReason::DEADLOCK_PREVENTION);
+            }
+        }
+        queue.cv_.wait(lock);
+        if (txn->get_state() == TransactionState::ABORTED) {
             clear_waiter_edges(tid);
             clear_blocker_edges(tid);
             queue.request_queue_.erase(upgrade_it);
@@ -306,7 +407,6 @@ bool LockManager::perform_upgrade(std::unique_lock<std::mutex> &lock, LockReques
             queue.cv_.notify_all();
             throw TransactionAbortException(tid, AbortReason::DEADLOCK_PREVENTION);
         }
-        queue.cv_.wait(lock);
     }
 
     clear_waiter_edges(tid);
@@ -322,6 +422,7 @@ bool LockManager::perform_upgrade(std::unique_lock<std::mutex> &lock, LockReques
 bool LockManager::acquire_new_lock(std::unique_lock<std::mutex> &lock, LockRequestQueue &queue, Transaction *txn,
                                    LockMode mode, const LockDataId &lock_data_id) {
     txn_id_t tid = txn->get_transaction_id();
+    uint64_t wait_sequence = next_wait_sequence(txn);
     queue.request_queue_.emplace_back(tid, mode);
     auto request_it = std::prev(queue.request_queue_.end());
 
@@ -336,15 +437,27 @@ bool LockManager::acquire_new_lock(std::unique_lock<std::mutex> &lock, LockReque
 
     while (should_wait(queue, tid, mode)) {
         auto blockers = collect_wait_blockers(queue, tid, mode);
-        set_wait_edges(tid, blockers, lock_data_id);
+        set_wait_edges(txn, tid, wait_sequence, blockers, lock_data_id);
         if (has_wait_cycle(tid)) {
+            txn_id_t victim = choose_deadlock_victim(tid);
+            if (victim != tid) {
+                mark_waiter_aborted(victim);
+            } else {
+                clear_waiter_edges(tid);
+                clear_blocker_edges(tid);
+                queue.request_queue_.erase(request_it);
+                queue.cv_.notify_all();
+                throw TransactionAbortException(tid, AbortReason::DEADLOCK_PREVENTION);
+            }
+        }
+        queue.cv_.wait(lock);
+        if (txn->get_state() == TransactionState::ABORTED) {
             clear_waiter_edges(tid);
             clear_blocker_edges(tid);
             queue.request_queue_.erase(request_it);
             queue.cv_.notify_all();
             throw TransactionAbortException(tid, AbortReason::DEADLOCK_PREVENTION);
         }
-        queue.cv_.wait(lock);
     }
 
     clear_waiter_edges(tid);

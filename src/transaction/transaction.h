@@ -151,6 +151,9 @@ class Transaction: public NonCopyable {
     inline IsolationLevel get_isolation_level() { return isolation_level_; }
     inline void set_isolation_level(IsolationLevel level) { isolation_level_ = level; }
 
+    inline void set_statement_sequence(uint64_t statement_sequence) { statement_sequence_ = statement_sequence; }
+    inline uint64_t get_statement_sequence() const { return statement_sequence_; }
+
     inline TransactionState get_state() { return state_; }
     inline void set_state(TransactionState state) { state_ = state; }
 
@@ -292,6 +295,7 @@ class Transaction: public NonCopyable {
 
   /** 提交时间戳 */
   std::atomic<timestamp_t> commit_ts_{INVALID_TS};
+  uint64_t statement_sequence_{0};
   /**
   * @brief 存储撤销日志。
   * 其他撤销日志/表堆将存储 (txn_id, index) 对，因此只能向此vector中追加内容或就地更新内容，而不能删除任何内容。

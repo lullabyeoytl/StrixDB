@@ -47,6 +47,7 @@ auto recovery = std::make_unique<RecoveryManager>(disk_manager.get(), buffer_poo
 auto portal = std::make_unique<Portal>(sm_manager.get());
 auto analyze = std::make_unique<Analyze>(sm_manager.get());
 pthread_mutex_t *sockfd_mutex;
+std::atomic<uint64_t> statement_sequence{1};
 
 static jmp_buf jmpbuf;
 void sigint_handler(int signo) {
@@ -131,6 +132,7 @@ void *client_handler(void *sock_fd) {
         context->isolation_level_ = session_isolation_level_;
         context->txn_mgr_ = txn_manager.get();
         SetTransaction(&txn_id, context.get());
+        context->txn_->set_statement_sequence(statement_sequence.fetch_add(1, std::memory_order_relaxed));
 
         // 用于判断是否已经调用了yy_delete_buffer来删除buf
         bool finish_analyze = false;
