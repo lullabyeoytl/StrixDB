@@ -332,4 +332,6 @@ private:
     bool AddRwDependency(Transaction *from, Transaction *to, Transaction *current, const std::string &reason);
 
     bool HasDangerousStructure(Transaction *from, Transaction *to);
+
+    bool has_rw_path_to(Transaction *current, txn_id_t target, std::unordered_set<txn_id_t> &visited);
 };

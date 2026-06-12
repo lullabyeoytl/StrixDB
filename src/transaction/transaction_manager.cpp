@@ -113,22 +113,6 @@ auto txn_id_from_write_ts(timestamp_t ts) -> txn_id_t {
     return ts - TXN_START_ID;
 }
 
-// Returns the end timestamp of a transaction, or max if not committed.
-auto txn_interval_end(Transaction *txn) -> timestamp_t {
-    if (txn == nullptr || txn->get_state() != TransactionState::COMMITTED) {
-        return std::numeric_limits<timestamp_t>::max();
-    }
-    return txn->get_commit_ts();
-}
-
-// Returns true if two transactions overlap in time.
-auto transactions_overlap(Transaction *lhs, Transaction *rhs) -> bool {
-    if (lhs == nullptr || rhs == nullptr) {
-        return false;
-    }
-    return lhs->get_start_ts() < txn_interval_end(rhs) && rhs->get_start_ts() < txn_interval_end(lhs);
-}
-
 //-------------------------------------------------------------------------
 // SSI visibility helper.
 //-------------------------------------------------------------------------
@@ -1100,52 +1084,25 @@ bool TransactionManager::HasDangerousStructure(Transaction *from, Transaction *t
     if (from == nullptr || to == nullptr) {
         return false;
     }
+    std::unordered_set<txn_id_t> visited;
+    return has_rw_path_to(to, from->get_transaction_id(), visited);
+}
 
-    auto completes_structure = [&](Transaction *tin, Transaction *tpivot, Transaction *tout) {
-        if (!IsSerializableActive(tin) || !IsSerializableActive(tpivot) || !IsSerializableActive(tout)) {
-            return false;
-        }
-        if (!transactions_overlap(tin, tpivot) || !transactions_overlap(tpivot, tout)) {
-            return false;
-        }
-        if (tin->get_transaction_id() == tout->get_transaction_id()) {
+bool TransactionManager::has_rw_path_to(Transaction *current, txn_id_t target,
+                                         std::unordered_set<txn_id_t> &visited) {
+    if (current == nullptr || !visited.insert(current->get_transaction_id()).second) {
+        return false;
+    }
+    auto out_edges = current->GetRwOutEdges();
+    for (const auto &[next_id, _] : out_edges) {
+        if (next_id == target) {
             return true;
         }
-        if (tout->get_state() != TransactionState::COMMITTED) {
-            return false;
-        }
-        if (tin->get_state() == TransactionState::COMMITTED) {
-            return tout->get_commit_ts() < tin->get_commit_ts();
-        }
-        return tout->get_commit_ts() < tin->get_start_ts();
-    };
-
-    auto find_txn_locked = [&](txn_id_t txn_id) -> Transaction * {
-        auto it = txn_map.find(txn_id);
-        if (it == txn_map.end()) return nullptr;
-        return it->second.Get();
-    };
-
-    // Take both edge snapshots before iterating, so both reflect the same
-    // logical moment.  Otherwise edges added/removed between the two copies
-    // could produce an inconsistent view.
-    auto out_edges = to->GetRwOutEdges();
-    auto in_edges = from->GetRwInEdges();
-
-    for (const auto &[candidate_id, _] : out_edges) {
-        auto *candidate = find_txn_locked(candidate_id);
-        if (completes_structure(from, to, candidate)) {
+        auto it = txn_map.find(next_id);
+        if (it != txn_map.end() && has_rw_path_to(it->second.Get(), target, visited)) {
             return true;
         }
     }
-
-    for (const auto &[candidate_id, _] : in_edges) {
-        auto *candidate = find_txn_locked(candidate_id);
-        if (completes_structure(candidate, from, to)) {
-            return true;
-        }
-    }
-
     return false;
 }
 
@@ -1160,8 +1117,18 @@ void TransactionManager::PrepareInsert(int fd, const Rid &rid, const RmRecord &n
     if (!IsMvccActive(txn)) {
         return;
     }
-    UpdateVersionLink(fd, rid, VersionUndoLink{UndoLink{txn->get_transaction_id(), -1}, true,
-                                               make_txn_write_ts(txn), false});
+    auto current = GetVersionLink(fd, rid);
+    if (current.has_value()) {
+        // Reusing a previously-deleted slot: build an undo log that preserves
+        // the old version chain so MVCC readers can still traverse it.
+        UndoLog log = BuildUndoLogForWrite(fd, rid, new_record, txn);
+        UndoLink undo_link = txn->AppendUndoLog(std::move(log));
+        UpdateVersionLink(fd, rid, VersionUndoLink{undo_link, true, make_txn_write_ts(txn), false});
+    } else {
+        // Fresh slot with no prior version chain.
+        UpdateVersionLink(fd, rid, VersionUndoLink{UndoLink{txn->get_transaction_id(), -1}, true,
+                                                   make_txn_write_ts(txn), false});
+    }
 }
 
 //--------------------------------------------------------------------------
