@@ -72,20 +72,22 @@ public:
 private:
     struct WaitEdge {
         txn_id_t blocker_;
+        LockDataId lock_data_id_;
     };
 
     int lock_mode_index(LockMode mode) const;
     bool is_compatible(const LockRequestQueue &queue, txn_id_t requester_id, LockMode mode) const;
+    bool has_prior_upgrade_request(const LockRequestQueue &queue, txn_id_t requester_id) const;
     bool should_wait(const LockRequestQueue &queue, txn_id_t requester_id, LockMode mode) const;
-    bool should_wait_for_conflict(Transaction *txn, const LockDataId &lock_data_id) const;
     bool is_at_least_as_strong(LockMode held, LockMode requested) const;
     std::vector<txn_id_t> collect_wait_blockers(const LockRequestQueue &queue, txn_id_t requester_id,
                                                 LockMode mode) const;
     bool has_wait_path(txn_id_t current, txn_id_t target, std::unordered_set<txn_id_t> &visited) const;
     bool has_wait_cycle(txn_id_t txn_id) const;
-    void set_wait_edges(txn_id_t waiter, const std::vector<txn_id_t> &blockers);
+    void set_wait_edges(txn_id_t waiter, const std::vector<txn_id_t> &blockers, const LockDataId &lock_data_id);
     void clear_waiter_edges(txn_id_t waiter);
     void clear_blocker_edges(txn_id_t blocker);
+    void clear_blocker_edges_on_lock(txn_id_t blocker, const LockDataId &lock_data_id);
     // void recompute_group_mode(LockRequestQueue &queue);
     bool acquire_lock(std::unique_lock<std::mutex> &lock, LockRequestQueue &queue, Transaction *txn, LockMode mode,
                       const LockDataId &lock_data_id);

@@ -53,21 +53,20 @@ bool LockManager::is_compatible(const LockRequestQueue &queue, txn_id_t requeste
     return true;
 }
 
-bool LockManager::should_wait_for_conflict(Transaction *txn, const LockDataId &lock_data_id) const {
-    if (txn == nullptr) {
-        return false;
+bool LockManager::has_prior_upgrade_request(const LockRequestQueue &queue, txn_id_t requester_id) const {
+    for (const auto &request : queue.request_queue_) {
+        if (request.txn_id_ == requester_id) {
+            return false;
+        }
+        if (request.is_upgrade_ && !request.granted_) {
+            return true;
+        }
     }
-    auto lock_set = txn->get_lock_set();
-    if (lock_set == nullptr) {
-        return false;
-    }
-    return std::any_of(lock_set->begin(), lock_set->end(), [&](const LockDataId &held) {
-        return !(held == lock_data_id);
-    });
+    return false;
 }
 
 bool LockManager::should_wait(const LockRequestQueue &queue, txn_id_t requester_id, LockMode mode) const {
-    return !is_compatible(queue, requester_id, mode);
+    return has_prior_upgrade_request(queue, requester_id) || !is_compatible(queue, requester_id, mode);
 }
 
 std::vector<txn_id_t> LockManager::collect_wait_blockers(const LockRequestQueue &queue, txn_id_t requester_id,
@@ -78,10 +77,11 @@ std::vector<txn_id_t> LockManager::collect_wait_blockers(const LockRequestQueue 
         if (request.txn_id_ == requester_id) {
             continue;
         }
-        if (!request.granted_) {
+        if (request.is_upgrade_ && !request.granted_) {
+            blocker_set.insert(request.txn_id_);
             continue;
         }
-        if (!COMPAT[lock_mode_index(request.lock_mode_)][requested]) {
+        if (request.granted_ && !COMPAT[lock_mode_index(request.lock_mode_)][requested]) {
             blocker_set.insert(request.txn_id_);
         }
     }
@@ -121,13 +121,14 @@ bool LockManager::has_wait_cycle(txn_id_t txn_id) const {
     return false;
 }
 
-void LockManager::set_wait_edges(txn_id_t waiter, const std::vector<txn_id_t> &blockers) {
+void LockManager::set_wait_edges(txn_id_t waiter, const std::vector<txn_id_t> &blockers,
+                                 const LockDataId &lock_data_id) {
     std::vector<WaitEdge> edges;
     edges.reserve(blockers.size());
     std::unordered_set<txn_id_t> unique_blockers;
     for (txn_id_t blocker : blockers) {
         if (blocker != waiter && unique_blockers.insert(blocker).second) {
-            edges.push_back(WaitEdge{blocker});
+            edges.push_back(WaitEdge{blocker, lock_data_id});
         }
     }
     if (edges.empty()) {
@@ -146,6 +147,22 @@ void LockManager::clear_blocker_edges(txn_id_t blocker) {
         auto &edges = it->second;
         edges.erase(std::remove_if(edges.begin(), edges.end(),
                                    [blocker](const WaitEdge &edge) { return edge.blocker_ == blocker; }),
+                    edges.end());
+        if (it->second.empty()) {
+            it = wait_edges_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void LockManager::clear_blocker_edges_on_lock(txn_id_t blocker, const LockDataId &lock_data_id) {
+    for (auto it = wait_edges_.begin(); it != wait_edges_.end();) {
+        auto &edges = it->second;
+        edges.erase(std::remove_if(edges.begin(), edges.end(),
+                                   [blocker, &lock_data_id](const WaitEdge &edge) {
+                                       return edge.blocker_ == blocker && edge.lock_data_id_ == lock_data_id;
+                                   }),
                     edges.end());
         if (it->second.empty()) {
             it = wait_edges_.erase(it);
@@ -263,7 +280,7 @@ bool LockManager::perform_upgrade(std::unique_lock<std::mutex> &lock, LockReques
     auto upgrade_it = queue.request_queue_.emplace(std::next(request_it), tid, mode, true);
 
     while (should_wait(queue, tid, mode)) {
-        set_wait_edges(tid, collect_wait_blockers(queue, tid, mode));
+        set_wait_edges(tid, collect_wait_blockers(queue, tid, mode), lock_data_id);
         if (has_wait_cycle(tid)) {
             clear_waiter_edges(tid);
             clear_blocker_edges(tid);
@@ -290,14 +307,8 @@ bool LockManager::acquire_new_lock(std::unique_lock<std::mutex> &lock, LockReque
     txn_id_t tid = txn->get_transaction_id();
     queue.request_queue_.emplace_back(tid, mode);
     auto request_it = std::prev(queue.request_queue_.end());
-
-    if (should_wait(queue, tid, mode) && !should_wait_for_conflict(txn, lock_data_id)) {
-        queue.request_queue_.erase(request_it);
-        return false;
-    }
-
     while (should_wait(queue, tid, mode)) {
-        set_wait_edges(tid, collect_wait_blockers(queue, tid, mode));
+        set_wait_edges(tid, collect_wait_blockers(queue, tid, mode), lock_data_id);
         if (has_wait_cycle(tid)) {
             clear_waiter_edges(tid);
             clear_blocker_edges(tid);
@@ -409,7 +420,10 @@ bool LockManager::unlock(Transaction* txn, LockDataId lock_data_id) {
         if (txn != nullptr) {
             txn->get_lock_set()->erase(lock_data_id);
             clear_waiter_edges(txn->get_transaction_id());
-            clear_blocker_edges(txn->get_transaction_id());
+            clear_blocker_edges_on_lock(txn->get_transaction_id(), lock_data_id);
+            if (txn->get_lock_set()->empty()) {
+                clear_blocker_edges(txn->get_transaction_id());
+            }
         }
         return true;
     }
@@ -429,7 +443,10 @@ bool LockManager::unlock(Transaction* txn, LockDataId lock_data_id) {
     clear_waiter_edges(tid);
     if (txn != nullptr) {
         txn->get_lock_set()->erase(lock_data_id);
-        clear_blocker_edges(tid);
+        clear_blocker_edges_on_lock(tid, lock_data_id);
+        if (txn->get_lock_set()->empty()) {
+            clear_blocker_edges(tid);
+        }
     }
     // recompute_group_mode(queue);
     queue.cv_.notify_all();
