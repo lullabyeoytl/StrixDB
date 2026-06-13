@@ -365,14 +365,14 @@ void IxIndexHandle::validate_unique_hit(const char *key, const Rid &hit, IndexVi
                     }
                     return;
                 }
-                throw TransactionAbortException(transaction->get_transaction_id(), AbortReason::WRITE_CONFLICT);
+                throw UniqueKeyViolationError();
             }
             if (link->is_deleted_ && !link->in_progress_ && link->ts_ != INVALID_TS &&
                 link->ts_ > transaction->get_start_ts()) {
                 return;
             }
             if (!link->in_progress_ && link->ts_ != INVALID_TS && link->ts_ > transaction->get_start_ts()) {
-                throw TransactionAbortException(transaction->get_transaction_id(), AbortReason::WRITE_CONFLICT);
+                throw UniqueKeyViolationError();
             }
         }
     }
