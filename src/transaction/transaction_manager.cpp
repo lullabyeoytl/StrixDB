@@ -202,7 +202,6 @@ void TransactionManager::commit(Transaction *txn, LogManager *log_manager) {
         log_record.prev_lsn_ = txn->get_prev_lsn();
         lsn_t lsn = log_manager->add_log_to_buffer(&log_record);
         txn->set_prev_lsn(lsn);
-        log_manager->flush_log_to_disk();
     }
 
     txn->set_state(TransactionState::SHRINKING);

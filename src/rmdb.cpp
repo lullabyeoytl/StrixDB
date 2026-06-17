@@ -118,6 +118,7 @@ void *client_handler(void *sock_fd) {
         }
         if (strcmp(data_recv, "crash") == 0) {
             std::cout << "Server crash" << std::endl;
+            log_manager->flush_buffer_to_disk_safe();
             exit(1);
         }
 
@@ -289,6 +290,7 @@ void start_server() {
     int ret = shutdown(sockfd_server, SHUT_WR);  // shut down the all or part of a full-duplex connection.
     if(ret == -1) { printf("%s\n", strerror(errno)); }
 //    assert(ret != -1);
+    log_manager->flush_log_to_disk();
     sm_manager->close_db();
     std::cout << " DB has been closed.\n";
     std::cout << "Server shuts down." << std::endl;

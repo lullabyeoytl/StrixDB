@@ -10,10 +10,13 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <iostream>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 #include "errors.h"
@@ -466,23 +469,35 @@ public:
 class LogManager: public NonCopyable {
 public:
     explicit LogManager(DiskManager* disk_manager);
+    ~LogManager();
 
     lsn_t add_log_to_buffer(LogRecord* log_record);
     LogAppendResult add_log_to_buffer_with_result(LogRecord *log_record);
     void flush_log_to_disk();
     void flush_log_to_lsn(lsn_t target_lsn);
+    void flush_buffer_to_disk_safe();
     lsn_t sync_global_lsn_with_disk();
 
     LogBuffer* get_log_buffer() { return &log_buffer_; }
 
+    static constexpr double FLUSH_LOW_WATERMARK = 0.60;
+    static constexpr double FLUSH_HIGH_WATERMARK = 0.90;
+    static constexpr int FLUSH_TIMEOUT_MS = 100;
+
 private:
-    void flush_buffer_to_disk();
-    void sync_written_log();
+    lsn_t flush_buffer_to_disk();
+    void sync_written_log(lsn_t target_lsn);
+    void advance_persist_lsn(lsn_t target_lsn);
+    void run_flush_thread();
 
     std::atomic<lsn_t> global_lsn_{0};  // 全局lsn，递增，用于为每条记录分发lsn
     std::mutex latch_;                  // 用于对log_buffer_的互斥访问
     LogBuffer log_buffer_;              // 日志缓冲区
-    lsn_t written_lsn_;                 // 记录已经写入日志文件的最后一条日志的日志号
-    lsn_t persist_lsn_;                 // 记录已经持久化到磁盘中的最后一条日志的日志号
+    std::atomic<lsn_t> written_lsn_;     // 记录已经写入日志文件的最后一条日志的日志号
+    std::atomic<lsn_t> persist_lsn_;     // 记录已经持久化到磁盘中的最后一条日志的日志号
+    std::atomic<bool> stop_flag_{false};
+    std::thread flush_thread_;
+    std::condition_variable flush_cv_;
+    std::mutex cv_mutex_;
     DiskManager* disk_manager_;
 };

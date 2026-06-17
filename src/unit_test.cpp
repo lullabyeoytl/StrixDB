@@ -13,16 +13,19 @@ See the Mulan PSL v2 for more details. */
 #define private public
 
 #include "record/rm.h"
+#include "recovery/log_manager.h"
 #include "storage/buffer_pool_manager.h"
 
 #undef private
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <random>
@@ -31,10 +34,12 @@ See the Mulan PSL v2 for more details. */
 #include <thread>  // NOLINT
 #include <unordered_map>
 #include <vector>
+#include <unistd.h>
 
 #include "gtest/gtest.h"
 #include "replacer/lru_replacer.h"
 #include "storage/disk_manager.h"
+#include "transaction/transaction_manager.h"
 
 const std::string TEST_DB_NAME = "BufferPoolManagerTest_db";  // 以数据库名作为根目录
 const std::string TEST_FILE_NAME = "basic";                   // 测试文件的名字
@@ -229,6 +234,130 @@ TEST(LRUReplacerTest, SampleTest) {
     EXPECT_EQ(6, value);
     lru_replacer.victim(&value);
     EXPECT_EQ(4, value);
+}
+
+class LogManagerAsyncFlushTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        original_dir_ = std::filesystem::current_path();
+        test_dir_ = original_dir_ /
+                    ("LogManagerAsyncFlushTest_" + std::to_string(getpid()) + "_" +
+                     std::to_string(reinterpret_cast<uintptr_t>(this)));
+        std::filesystem::remove_all(test_dir_);
+        std::filesystem::create_directory(test_dir_);
+        std::filesystem::current_path(test_dir_);
+    }
+
+    void TearDown() override {
+        std::filesystem::current_path(original_dir_);
+        std::error_code ignored;
+        std::filesystem::remove_all(test_dir_, ignored);
+    }
+
+    static void CreateLogFile(DiskManager *disk_manager) {
+        if (!disk_manager->is_file(LOG_FILE_NAME)) {
+            disk_manager->create_file(LOG_FILE_NAME);
+        }
+    }
+
+    std::filesystem::path original_dir_;
+    std::filesystem::path test_dir_;
+};
+
+TEST_F(LogManagerAsyncFlushTest, TimeoutFlushPersistsBufferedRecord) {
+    auto disk_manager = std::make_unique<DiskManager>();
+    CreateLogFile(disk_manager.get());
+    LogManager log_manager(disk_manager.get());
+
+    BeginLogRecord record(1);
+    LogAppendResult result = log_manager.add_log_to_buffer_with_result(&record);
+    ASSERT_TRUE(result.IsValid());
+    ASSERT_EQ(0, disk_manager->get_file_size(LOG_FILE_NAME));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(LogManager::FLUSH_TIMEOUT_MS + 150));
+
+    EXPECT_GE(disk_manager->get_file_size(LOG_FILE_NAME), static_cast<int>(record.log_tot_len_));
+    EXPECT_GE(log_manager.persist_lsn_.load(std::memory_order_acquire), result.lsn);
+}
+
+TEST_F(LogManagerAsyncFlushTest, HighWatermarkAppendWaitsForPersistedLsn) {
+    auto disk_manager = std::make_unique<DiskManager>();
+    CreateLogFile(disk_manager.get());
+    LogManager log_manager(disk_manager.get());
+
+    auto record_len = static_cast<uint32_t>(LOG_BUFFER_SIZE * LogManager::FLUSH_HIGH_WATERMARK) + 1;
+    LogRecord record(LogType::begin, record_len);
+    LogAppendResult result = log_manager.add_log_to_buffer_with_result(&record);
+
+    ASSERT_TRUE(result.IsValid());
+    EXPECT_GE(disk_manager->get_file_size(LOG_FILE_NAME), static_cast<int>(record.log_tot_len_));
+    EXPECT_GE(log_manager.persist_lsn_.load(std::memory_order_acquire), result.lsn);
+
+    char header[LOG_HEADER_SIZE];
+    ASSERT_EQ(LOG_HEADER_SIZE, disk_manager->read_log(header, LOG_HEADER_SIZE, 0));
+    LogRecord persisted;
+    persisted.deserialize(header);
+    EXPECT_EQ(result.lsn, persisted.lsn_);
+}
+
+TEST_F(LogManagerAsyncFlushTest, SafeBufferFlushWritesBufferedRecord) {
+    auto disk_manager = std::make_unique<DiskManager>();
+    CreateLogFile(disk_manager.get());
+    LogManager log_manager(disk_manager.get());
+
+    BeginLogRecord record(7);
+    LogAppendResult result = log_manager.add_log_to_buffer_with_result(&record);
+    ASSERT_TRUE(result.IsValid());
+
+    log_manager.flush_buffer_to_disk_safe();
+
+    EXPECT_GE(disk_manager->get_file_size(LOG_FILE_NAME), static_cast<int>(record.log_tot_len_));
+}
+
+TEST_F(LogManagerAsyncFlushTest, CommitReturnsBeforeSynchronousFlush) {
+    auto disk_manager = std::make_unique<DiskManager>();
+    CreateLogFile(disk_manager.get());
+    LogManager log_manager(disk_manager.get());
+    LockManager lock_manager;
+    TransactionManager txn_manager(&lock_manager, nullptr);
+
+    Transaction *txn = txn_manager.begin(nullptr, &log_manager);
+    auto start = std::chrono::steady_clock::now();
+    txn_manager.commit(txn, &log_manager);
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start);
+
+    EXPECT_EQ(0, disk_manager->get_file_size(LOG_FILE_NAME));
+    EXPECT_LT(elapsed.count(), 500);
+}
+
+TEST_F(LogManagerAsyncFlushTest, FlushLogToLsnPersistsTargetRecord) {
+    auto disk_manager = std::make_unique<DiskManager>();
+    CreateLogFile(disk_manager.get());
+    LogManager log_manager(disk_manager.get());
+
+    BeginLogRecord record(11);
+    LogAppendResult result = log_manager.add_log_to_buffer_with_result(&record);
+    ASSERT_TRUE(result.IsValid());
+
+    log_manager.flush_log_to_lsn(result.lsn);
+
+    EXPECT_GE(disk_manager->get_file_size(LOG_FILE_NAME), static_cast<int>(record.log_tot_len_));
+    EXPECT_GE(log_manager.persist_lsn_.load(std::memory_order_acquire), result.lsn);
+}
+
+TEST_F(LogManagerAsyncFlushTest, AbortReturnsAfterSynchronousFlush) {
+    auto disk_manager = std::make_unique<DiskManager>();
+    CreateLogFile(disk_manager.get());
+    LogManager log_manager(disk_manager.get());
+    LockManager lock_manager;
+    TransactionManager txn_manager(&lock_manager, nullptr);
+
+    Transaction *txn = txn_manager.begin(nullptr, &log_manager);
+    txn_manager.abort(txn, &log_manager);
+
+    EXPECT_GT(disk_manager->get_file_size(LOG_FILE_NAME), 0);
+    EXPECT_GE(log_manager.persist_lsn_.load(std::memory_order_acquire), 1);
 }
 
 /** 注意：每个测试点只测试了单个文件！
