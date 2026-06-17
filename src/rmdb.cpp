@@ -49,10 +49,10 @@ auto analyze = std::make_unique<Analyze>(sm_manager.get());
 pthread_mutex_t *sockfd_mutex;
 
 static jmp_buf jmpbuf;
-void sigint_handler(int signo) {
+void termination_handler(int signo) {
     should_exit = true;
     log_manager->flush_log_to_disk();
-    std::cout << "The Server receive Crtl+C, will been closed\n";
+    std::cout << "The Server receives termination signal " << signo << ", will be closed\n";
     longjmp(jmpbuf, 1);
 }
 
@@ -303,7 +303,8 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
-    signal(SIGINT, sigint_handler);
+    signal(SIGINT, termination_handler);
+    signal(SIGTERM, termination_handler);
     try {
         std::cout << "\n"
                      "  _____  __  __ _____  ____  \n"

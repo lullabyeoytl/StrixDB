@@ -482,7 +482,7 @@ public:
 
     static constexpr double FLUSH_LOW_WATERMARK = 0.60;
     static constexpr double FLUSH_HIGH_WATERMARK = 0.90;
-    static constexpr int FLUSH_TIMEOUT_MS = 100;
+    static constexpr int FLUSH_TIMEOUT_MS = 20;
 
 private:
     lsn_t flush_buffer_to_disk();
