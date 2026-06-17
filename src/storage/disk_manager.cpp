@@ -12,11 +12,25 @@ See the Mulan PSL v2 for more details. */
 
 #include <assert.h>    // for assert
 #include <errno.h>
+#include <ftw.h>
 #include <string.h>    // for memset
 #include <sys/stat.h>  // for stat
 #include <unistd.h>    // for lseek
 
 #include "defs.h"
+
+namespace {
+
+int rm_callback(const char *fpath, __attribute__((unused)) const struct stat *sb,
+                int typeflag, __attribute__((unused)) struct FTW *ftwbuf) {
+    int rc = (typeflag == FTW_DP) ? rmdir(fpath) : unlink(fpath);
+    if (rc < 0 && errno != ENOENT) {
+        perror(fpath);
+    }
+    return rc;
+}
+
+}  // namespace
 
 void write_all_at(int fd, const char *data, int num_bytes, off_t offset) {
     int total_written = 0;
@@ -57,7 +71,7 @@ int read_at(int fd, char *data, int num_bytes, off_t offset) {
 
 DiskManager::DiskManager() {
     for (int i = 0; i < MAX_FD; ++i) {
-        fd2pageno_[i] = 0;
+        fd2pageno_[i].val = 0;
     }
 }
 
@@ -99,7 +113,7 @@ void DiskManager::read_page(int fd, page_id_t page_no, char *offset, int num_byt
 page_id_t DiskManager::allocate_page(int fd) {
     // 简单的自增分配策略，指定文件的页面编号加1
     assert(fd >= 0 && fd < MAX_FD);
-    return fd2pageno_[fd]++;
+    return fd2pageno_[fd].val++;
 }
 
 void DiskManager::deallocate_page(__attribute__((unused)) page_id_t page_id) {}
@@ -110,15 +124,23 @@ bool DiskManager::is_dir(const std::string& path) {
 }
 
 void DiskManager::create_dir(const std::string &path) {
-    std::string cmd = "mkdir -p " + path;
-    if (system(cmd.c_str()) < 0) {
-        throw UnixError();
+    // Recursive mkdir via direct syscall, equivalent to "mkdir -p".
+    std::string current;
+    for (size_t i = 0; i < path.size(); ++i) {
+        current.push_back(path[i]);
+        if (path[i] == '/' || i == path.size() - 1) {
+            if (!current.empty() && current != "/") {
+                if (mkdir(current.c_str(), 0755) < 0 && errno != EEXIST) {
+                    throw UnixError();
+                }
+            }
+        }
     }
 }
 
 void DiskManager::destroy_dir(const std::string &path) {
-    std::string cmd = "rm -r " + path;
-    if (system(cmd.c_str()) < 0) {
+    // Recursive remove via nftw, equivalent to "rm -r".
+    if (nftw(path.c_str(), rm_callback, 64, FTW_DEPTH | FTW_PHYS) < 0) {
         throw UnixError();
     }
 }
@@ -194,10 +216,15 @@ int DiskManager::open_file(const std::string &path) {
     if (fd < 0) {
         throw UnixError();
     }
+    const int file_size = get_file_size(path);
+    const page_id_t allocated_pages =
+        file_size <= 0 ? 0 : static_cast<page_id_t>((file_size + PAGE_SIZE - 1) / PAGE_SIZE);
     std::lock_guard<std::mutex> lock(latch_);
     path2fd_[path] = fd;
     fd2path_[fd] = path;
     fd2ref_count_[fd] = 1;
+    fd2name_[fd] = path;
+    fd2pageno_[fd].val.store(allocated_pages, std::memory_order_release);
     return fd;
 }
 
@@ -226,7 +253,7 @@ void DiskManager::close_file(int fd) {
         path2fd_.erase(path);
         fd2path_.erase(path_it);
         fd2ref_count_.erase(ref_it);
-        fd2pageno_[fd] = 0;
+        fd2name_[fd].clear();
         should_close = true;
     }
 
@@ -271,6 +298,7 @@ int DiskManager::get_file_fd(const std::string &file_name) {
         std::lock_guard<std::mutex> lock(latch_);
         auto it = path2fd_.find(file_name);
         if (it != path2fd_.end()) {
+            fd2ref_count_[it->second]++;
             return it->second;
         }
     }
@@ -296,16 +324,28 @@ int DiskManager::read_log(char *log_data, int size, int offset) {
     if (log_fd_ == -1) {
         log_fd_ = open_file(LOG_FILE_NAME);
     }
-    int file_size = get_file_size(LOG_FILE_NAME);
+    const int64_t file_size = get_log_file_size();
     if (offset > file_size) {
         return -1;
     }
 
-    size = std::min(size, file_size - offset);
+    size = std::min(size, static_cast<int>(file_size - offset));
     if(size == 0) return 0;
     return read_at(log_fd_, log_data, size, offset);
 }
 
+
+int64_t DiskManager::get_log_file_size() {
+    int64_t cached = log_file_size_.load(std::memory_order_acquire);
+    if (cached >= 0) {
+        return cached;
+    }
+    // Lazy-init: read actual file size from disk (only on first access / after recovery).
+    int64_t actual = get_file_size(LOG_FILE_NAME);
+    if (actual < 0) actual = 0;
+    log_file_size_.store(actual, std::memory_order_release);
+    return actual;
+}
 
 /**
  * @description: 写日志内容
@@ -318,9 +358,10 @@ void DiskManager::write_log(char *log_data, int size) {
         log_fd_ = open_file(LOG_FILE_NAME);
     }
 
-    // write from the file_end
-    const int file_size = get_file_size(LOG_FILE_NAME);
+    // Use cached size instead of stat(); update cache after write.
+    const int64_t file_size = get_log_file_size();
     write_all_at(log_fd_, log_data, size, file_size);
+    log_file_size_.store(file_size + size, std::memory_order_release);
 }
 
 void DiskManager::sync_log() {

@@ -11,6 +11,7 @@ See the Mulan PSL v2 for more details. */
 #include "execution_manager.h"
 
 #include <algorithm>
+#include <sstream>
 
 #include "execution_common.h"
 #include "executor_delete.h"
@@ -280,14 +281,13 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
     rec_printer.print_separator(context);
     rec_printer.print_record(captions, context);
     rec_printer.print_separator(context);
-    // print header into file
-    std::fstream outfile;
-    outfile.open("output.txt", std::ios::out | std::ios::app);
-    outfile << "|";
+    // print header into file (collect in memory, write once after query)
+    std::stringstream file_output;
+    file_output << "|";
     for (size_t i = 0; i < captions.size(); ++i) {
-        outfile << " " << captions[i] << " |";
+        file_output << " " << captions[i] << " |";
     }
-    outfile << "\n";
+    file_output << "\n";
 
     // Print records
     size_t num_rec = 0;
@@ -316,13 +316,17 @@ void QlManager::select_from(std::unique_ptr<AbstractExecutor> executorTreeRoot, 
             columns.push_back(value_to_string(get_col_value(*Tuple, col)));
         }
         rec_printer.print_record(columns, context);
-        outfile << "|";
+        file_output << "|";
         for (size_t i = 0; i < columns.size(); ++i) {
-            outfile << " " << columns[i] << " |";
+            file_output << " " << columns[i] << " |";
         }
-        outfile << "\n";
+        file_output << "\n";
         num_rec++;
     }
+    // Write all file output in one operation after query completes
+    std::fstream outfile;
+    outfile.open("output.txt", std::ios::out | std::ios::app);
+    outfile << file_output.str();
     outfile.close();
     // Print footer into buffer
     rec_printer.print_separator(context);

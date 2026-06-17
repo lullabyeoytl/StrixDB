@@ -293,15 +293,14 @@ auto collect_join_conditions(std::vector<Condition> direct_conds, std::vector<Co
         }
     }
 
-    auto it = pending_conds.begin();
-    while (it != pending_conds.end()) {
-        if (condition_spans_subtrees(*it, left, right)) {
-            join_conds.push_back(orient_condition_for_join(*it, left, right));
-            it = pending_conds.erase(it);
-        } else {
-            ++it;
-        }
+    auto match_start = std::partition(pending_conds.begin(), pending_conds.end(),
+        [&](const Condition &cond) {
+            return !condition_spans_subtrees(cond, left, right);
+        });
+    for (auto it = match_start; it != pending_conds.end(); ++it) {
+        join_conds.push_back(orient_condition_for_join(*it, left, right));
     }
+    pending_conds.erase(match_start, pending_conds.end());
     return join_conds;
 }
 
@@ -370,12 +369,16 @@ auto join_has_equi_keys(const JoinPredicateAnalysis &analysis) -> bool {
 }
 
 auto join_residual_conds(const JoinPredicateAnalysis &analysis) -> std::vector<Condition> {
-    std::vector<Condition> residual_conds = analysis.all_conds;
-    if (join_has_equi_keys(analysis)) {
-        residual_conds.erase(
-            std::remove_if(residual_conds.begin(), residual_conds.end(),
-                           [](const Condition &cond) { return !cond.is_rhs_val && cond.op == OP_EQ; }),
-            residual_conds.end());
+    if (!join_has_equi_keys(analysis)) {
+        return analysis.all_conds;  // no equi keys: return all as-is
+    }
+    // Only copy conditions that are NOT equi-join keys
+    std::vector<Condition> residual_conds;
+    residual_conds.reserve(analysis.all_conds.size());
+    for (const auto &cond : analysis.all_conds) {
+        if (cond.is_rhs_val || cond.op != OP_EQ) {
+            residual_conds.push_back(cond);
+        }
     }
     return residual_conds;
 }
@@ -575,7 +578,7 @@ auto is_aggregate_query(const Query &query) -> bool {
 
 Planner::ScanBuildResult Planner::make_scan_plan(const std::string &tab_name,
                                                  const std::vector<Condition> &semantic_conds,
-                                                 std::vector<TabCol> required_cols,
+                                                 const std::vector<TabCol> &required_cols,
                                                  bool allow_covering_index) {
     ScanBuildResult result;
     const auto &tab = sm_manager_->db_.get_table(tab_name);
@@ -710,7 +713,7 @@ std::vector<std::pair<std::string, std::shared_ptr<Plan>>> Planner::build_table_
     result.reserve(query->tables.size());
 
     for (const auto &tab_name : query->tables) {
-        auto required_cols = plan_context.table_required_cols.at(tab_name);
+        const auto &required_cols = plan_context.table_required_cols.at(tab_name);
         std::vector<Condition> curr_conds;
         auto it = plan_context.table_conds.find(tab_name);
         if (it != plan_context.table_conds.end()) {

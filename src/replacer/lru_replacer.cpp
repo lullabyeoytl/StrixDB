@@ -61,12 +61,13 @@ void LRUReplacer::unpin(frame_id_t frame_id) {
     //  选择一个frame取消固定
     std::scoped_lock lock{latch_};
 
-    // If the frame is already in the replacer, don't change its LRU position.
-    if (LRUhash_.find(frame_id) != LRUhash_.end()) {
+    // Single hash lookup via try_emplace: only inserts if key is absent.
+    auto [it, inserted] = LRUhash_.try_emplace(frame_id, LRUlist_.end());
+    if (!inserted) {
         return;
     }
     LRUlist_.push_front(frame_id);
-    LRUhash_[frame_id] = LRUlist_.begin();
+    it->second = LRUlist_.begin();
 }
 
 /**

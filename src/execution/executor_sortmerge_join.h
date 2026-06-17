@@ -77,7 +77,7 @@ class SortMergeJoinExecutor : public AbstractExecutor {
             group_ready_ = false;
             return;
         }
-        right_group_.push_back(*right_rec_);
+        right_group_.push_back(std::move(*right_rec_));
         while (true) {
             right_->nextTuple();
             if (right_->is_end()) {
@@ -89,7 +89,7 @@ class SortMergeJoinExecutor : public AbstractExecutor {
                 right_rec_ = std::move(next_right);
                 break;
             }
-            right_group_.push_back(*next_right);
+            right_group_.push_back(std::move(*next_right));
         }
         group_ready_ = !right_group_.empty();
     }
@@ -196,6 +196,7 @@ class SortMergeJoinExecutor : public AbstractExecutor {
             left_key_metas_.push_back(find_col_meta(left_->cols(), cond.lhs_col));
             right_key_metas_.push_back(find_col_meta(right_->cols(), cond.rhs_col));
         }
+        resolve_conditions(residual_conds_, eval_cols_);
     }
 
     void beginTupleImpl() override {

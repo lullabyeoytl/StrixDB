@@ -68,6 +68,20 @@ class DiskManager: public NonCopyable {
 
     bool is_file_open(const std::string &file_name);
 
+    // Lock-free accessor for hot paths: returns cached file name for open fd.
+    // Caller must ensure fd is valid and file remains open.
+    const std::string& get_file_name_nolock(int fd) { return fd2name_[fd]; }
+
+    // Returns cached log file size without stat() syscall.
+    // Lazily initialized from disk on first call.
+    int64_t get_log_file_size();
+
+    // Atomically set the cached log file size (used by LogManager
+    // when draining the log buffer under its latch).
+    void set_log_file_size(int64_t new_size) {
+        log_file_size_.store(new_size, std::memory_order_release);
+    }
+
     /*日志操作*/
     int read_log(char *log_data, int size, int offset);
 
@@ -84,16 +98,22 @@ class DiskManager: public NonCopyable {
      * @param {int} fd 文件对应的文件句柄
      * @param {int} start_page_no 已经分配的页面个数，即文件接下来从start_page_no开始分配页面编号
      */
-    void set_fd2pageno(int fd, int start_page_no) { fd2pageno_[fd] = start_page_no; }
+    void set_fd2pageno(int fd, int start_page_no) { fd2pageno_[fd].val = start_page_no; }
 
     /**
      * @description: 获得文件目前已分配的页面个数，即如果文件要分配一个新页面，需要从fd2pagenp_[fd]开始分配
      * @return {page_id_t} 已分配的页面个数
      * @param {int} fd 文件对应的句柄
      */
-    page_id_t get_fd2pageno(int fd) { return fd2pageno_[fd]; }
+    page_id_t get_fd2pageno(int fd) { return fd2pageno_[fd].val; }
 
     static constexpr int MAX_FD = 8192;
+
+    // Padded to a full cache line to avoid false sharing when different threads
+    // allocate pages for different file descriptors concurrently.
+    struct alignas(64) PaddedPageId {
+        std::atomic<page_id_t> val{0};
+    };
 
    private:
     // 文件打开列表，用于记录文件是否被打开
@@ -104,5 +124,12 @@ class DiskManager: public NonCopyable {
     std::mutex log_latch_;                          // 日志追加锁
 
     int log_fd_ = -1;                             // WAL日志文件的文件句柄，默认为-1，代表未打开日志文件
-    std::atomic<page_id_t> fd2pageno_[MAX_FD]{};  // 文件中已经分配的页面个数，初始值为0
+    PaddedPageId fd2pageno_[MAX_FD]{};            // 文件中已经分配的页面个数，初始值为0
+
+    // Lock-free fd → file name cache. Entries for open fds are immutable, cleared on close.
+    std::string fd2name_[MAX_FD];
+
+    // Cached WAL file size to avoid stat() on every log write/read.
+    // -1 means uninitialized; lazy-init on first access.
+    std::atomic<int64_t> log_file_size_{-1};
 };

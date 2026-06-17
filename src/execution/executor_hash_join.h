@@ -127,7 +127,7 @@ class HashJoinExecutor : public AbstractExecutor {
         while (!right_->is_end()) {
             auto right_rec = right_->Next();
             auto key = extract_join_key(*right_rec, right_key_metas_);
-            hash_table_[std::move(key)].push_back(*right_rec);
+            hash_table_[std::move(key)].push_back(std::move(*right_rec));
             right_->nextTuple();
         }
     }
@@ -207,6 +207,7 @@ class HashJoinExecutor : public AbstractExecutor {
             left_key_metas_.push_back(find_col_meta(left_->cols(), cond.lhs_col));
             right_key_metas_.push_back(find_col_meta(right_->cols(), cond.rhs_col));
         }
+        resolve_conditions(residual_conds_, eval_cols_);
     }
 
     void beginTupleImpl() override {

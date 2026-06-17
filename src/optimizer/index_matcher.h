@@ -98,7 +98,11 @@ inline auto match_index(const IndexMeta &index_meta, const std::vector<Condition
                         const std::vector<TabCol> &required_cols) -> IndexMatchResult {
     IndexMatchResult result;
     // Access path scoring depends only on lookup predicates and index width.
-    result.index_col_names = index_meta.col_names();
+    // Build index column names directly to avoid intermediate allocation.
+    result.index_col_names.reserve(index_meta.cols.size());
+    for (const auto &col : index_meta.cols) {
+        result.index_col_names.push_back(col.name);
+    }
     result.index_meta = index_meta;
     result.score.index_width = index_meta.col_num;
     

@@ -10,43 +10,53 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
-#include <atomic>
-#include <cassert>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <cassert>
 #include <thread>
 #include <unordered_map>
 
 class PageLatch {
    public:
+    PageLatch() = default;
+    ~PageLatch() = default;
+
+    PageLatch(const PageLatch&) = delete;
+    PageLatch& operator=(const PageLatch&) = delete;
+    PageLatch(PageLatch&&) = delete;
+    PageLatch& operator=(PageLatch&&) = delete;
+
     void lock_shared() {
 #ifndef NDEBUG
         const std::thread::id self = std::this_thread::get_id();
-        {
-            std::lock_guard<std::mutex> guard(debug_latch_);
-            assert(!exclusive_locked_ || exclusive_owner_ != self);
+        if (debug_state_) {
+            std::lock_guard<std::mutex> guard(debug_state_->debug_latch);
+            assert(!debug_state_->exclusive_locked || debug_state_->exclusive_owner != self);
         }
 #endif
 
         latch_.lock_shared();
 
 #ifndef NDEBUG
-        std::lock_guard<std::mutex> guard(debug_latch_);
-        shared_holders_[self]++;
+        if (debug_state_) {
+            std::lock_guard<std::mutex> guard(debug_state_->debug_latch);
+            debug_state_->shared_holders[self]++;
+        }
 #endif
     }
 
     void unlock_shared() {
 #ifndef NDEBUG
         const std::thread::id self = std::this_thread::get_id();
-        {
-            std::lock_guard<std::mutex> guard(debug_latch_);
-            auto holder = shared_holders_.find(self);
-            assert(holder != shared_holders_.end());
+        if (debug_state_) {
+            std::lock_guard<std::mutex> guard(debug_state_->debug_latch);
+            auto holder = debug_state_->shared_holders.find(self);
+            assert(holder != debug_state_->shared_holders.end());
             assert(holder->second > 0);
             holder->second--;
             if (holder->second == 0) {
-                shared_holders_.erase(holder);
+                debug_state_->shared_holders.erase(holder);
             }
         }
 #endif
@@ -57,31 +67,33 @@ class PageLatch {
     void lock_exclusive() {
 #ifndef NDEBUG
         const std::thread::id self = std::this_thread::get_id();
-        {
-            std::lock_guard<std::mutex> guard(debug_latch_);
-            assert(!exclusive_locked_ || exclusive_owner_ != self);
-            assert(shared_holders_.find(self) == shared_holders_.end());
+        if (debug_state_) {
+            std::lock_guard<std::mutex> guard(debug_state_->debug_latch);
+            assert(!debug_state_->exclusive_locked || debug_state_->exclusive_owner != self);
+            assert(debug_state_->shared_holders.find(self) == debug_state_->shared_holders.end());
         }
 #endif
 
         latch_.lock();
 
 #ifndef NDEBUG
-        std::lock_guard<std::mutex> guard(debug_latch_);
-        exclusive_locked_ = true;
-        exclusive_owner_ = self;
+        if (debug_state_) {
+            std::lock_guard<std::mutex> guard(debug_state_->debug_latch);
+            debug_state_->exclusive_locked = true;
+            debug_state_->exclusive_owner = self;
+        }
 #endif
     }
 
     void unlock_exclusive() {
 #ifndef NDEBUG
         const std::thread::id self = std::this_thread::get_id();
-        {
-            std::lock_guard<std::mutex> guard(debug_latch_);
-            assert(exclusive_locked_);
-            assert(exclusive_owner_ == self);
-            exclusive_locked_ = false;
-            exclusive_owner_ = std::thread::id{};
+        if (debug_state_) {
+            std::lock_guard<std::mutex> guard(debug_state_->debug_latch);
+            assert(debug_state_->exclusive_locked);
+            assert(debug_state_->exclusive_owner == self);
+            debug_state_->exclusive_locked = false;
+            debug_state_->exclusive_owner = std::thread::id{};
         }
 #endif
 
@@ -91,10 +103,18 @@ class PageLatch {
    private:
     std::shared_mutex latch_;
 
-    // Keep these members present in every build so Page has one layout even
-    // when different translation units disagree about NDEBUG.
-    std::mutex debug_latch_;
-    std::atomic_bool exclusive_locked_ = false;
-    std::thread::id exclusive_owner_{};
-    std::unordered_map<std::thread::id, size_t> shared_holders_;
+    struct DebugState {
+        std::mutex debug_latch;
+        bool exclusive_locked = false;
+        std::thread::id exclusive_owner{};
+        std::unordered_map<std::thread::id, size_t> shared_holders;
+    };
+    // Keep layout stable across translation units even if they disagree on NDEBUG.
+    std::unique_ptr<DebugState> debug_state_{
+#ifndef NDEBUG
+        new DebugState()
+#else
+        nullptr
+#endif
+    };
 };

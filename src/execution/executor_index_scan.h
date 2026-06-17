@@ -123,7 +123,7 @@ class IndexScanExecutor : public AbstractExecutor {
 
     auto project_visible_record(const RmRecord &heap_record) const -> std::unique_ptr<RmRecord> {
         if (!use_covering_index_) {
-            return std::make_unique<RmRecord>(heap_record);
+            return std::make_unique<RmRecord>(std::move(heap_record));
         }
         auto record = std::make_unique<RmRecord>(len_);
         for (const auto &col : cols_) {
@@ -431,6 +431,10 @@ class IndexScanExecutor : public AbstractExecutor {
         normalize_conds(residual_conds_, tab_name_);
         all_conds_ = index_lookup_conds_;
         all_conds_.insert(all_conds_.end(), residual_conds_.begin(), residual_conds_.end());
+        if (use_covering_index_) {
+            resolve_conditions(residual_conds_, index_eval_cols_);
+        }
+        resolve_conditions(all_conds_, tab_.cols);
         prepare_lookup_values();
         if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
             context_->lock_mgr_->lock_IS_on_table(context_->txn_, fh_->GetFd());

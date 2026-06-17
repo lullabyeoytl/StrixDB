@@ -42,6 +42,7 @@ class FilterExecutor : public AbstractExecutor {
     FilterExecutor(std::unique_ptr<AbstractExecutor> prev, std::vector<Condition> conds)
         : prev_(std::move(prev)), conds_(std::move(conds)) {
         set_children({prev_.get()});
+        resolve_conditions(conds_, prev_->cols());
         set_end();
     }
 
@@ -69,9 +70,7 @@ class FilterExecutor : public AbstractExecutor {
         if (current_ == nullptr) {
             return nullptr;
         }
-        auto out = std::make_unique<RmRecord>(current_->size);
-        memcpy(out->data, current_->data, current_->size);
-        return out;
+        return std::make_unique<RmRecord>(std::move(*current_));
     }
 
     Rid &rid() override { return rid_; }

@@ -394,13 +394,15 @@ struct Condition {
     bool is_rhs_val;  // true if right-hand side is a value (not a column)
     TabCol rhs_col;   // right-hand side column
     Value rhs_val;    // right-hand side value
-    
+    int lhs_col_idx = -1; // pre-resolved column index in evaluate_columns vector
+    int rhs_col_idx = -1; // pre-resolved column index (only valid when !is_rhs_val)
+
     inline auto equals(const Condition &rhs) const -> bool {
         // 左列， 操作符， RHS种类&值
         if (!lhs_col.equals(rhs.lhs_col) || op != rhs.op || is_rhs_val != rhs.is_rhs_val) return false;
         if (is_rhs_val) {
             return rhs_val.equals(rhs.rhs_val);
-        } 
+        }
         return rhs_col.equals(rhs.rhs_col);
     }
 };
@@ -427,10 +429,46 @@ inline auto compare_values(const Value &lhs, const Value &rhs, CompOp op) -> boo
     return compare_result_matches_op(lhs.compare(rhs), op);
 }
 
+// Pre-resolve column indices for a condition against a cols vector.
+// Call once in executor constructors to avoid O(n_cols) linear scans in hot paths.
+inline auto resolve_condition(Condition &cond, const std::vector<ColMeta> &cols) -> void {
+    auto lhs_it = std::find_if(cols.begin(), cols.end(),
+                               [&](const ColMeta &col) { return col_meta_matches(col, cond.lhs_col); });
+    if (lhs_it == cols.end()) {
+        throw ColumnNotFoundError(cond.lhs_col.tab_name + '.' + cond.lhs_col.col_name);
+    }
+    cond.lhs_col_idx = static_cast<int>(lhs_it - cols.begin());
+    if (!cond.is_rhs_val) {
+        auto rhs_it = std::find_if(cols.begin(), cols.end(),
+                                   [&](const ColMeta &col) { return col_meta_matches(col, cond.rhs_col); });
+        if (rhs_it == cols.end()) {
+            throw ColumnNotFoundError(cond.rhs_col.tab_name + '.' + cond.rhs_col.col_name);
+        }
+        cond.rhs_col_idx = static_cast<int>(rhs_it - cols.begin());
+    }
+}
+
+inline auto resolve_conditions(std::vector<Condition> &conds, const std::vector<ColMeta> &cols) -> void {
+    for (auto &cond : conds) {
+        resolve_condition(cond, cols);
+    }
+}
+
 inline auto evaluate_condition(const Condition &cond, const RmRecord &record, const std::vector<ColMeta> &cols) -> bool {
-    const auto &lhs_meta = find_col_meta(cols, cond.lhs_col);
-    Value lhs_value = get_col_value(record, lhs_meta);
-    Value rhs_value = cond.is_rhs_val ? cond.rhs_val : get_col_value(record, find_col_meta(cols, cond.rhs_col));
+    Value lhs_value;
+    Value rhs_value;
+    if (cond.lhs_col_idx >= 0) {
+        lhs_value = get_col_value(record, cols[static_cast<size_t>(cond.lhs_col_idx)]);
+    } else {
+        lhs_value = get_col_value(record, find_col_meta(cols, cond.lhs_col));
+    }
+    if (cond.is_rhs_val) {
+        rhs_value = cond.rhs_val;
+    } else if (cond.rhs_col_idx >= 0) {
+        rhs_value = get_col_value(record, cols[static_cast<size_t>(cond.rhs_col_idx)]);
+    } else {
+        rhs_value = get_col_value(record, find_col_meta(cols, cond.rhs_col));
+    }
     return compare_values(lhs_value, rhs_value, cond.op);
 }
 

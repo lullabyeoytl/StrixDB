@@ -28,11 +28,13 @@ class SeqScanExecutor : public AbstractExecutor {
 
     Rid rid_;
     std::unique_ptr<RecScan> scan_;     // table_iterator
+    std::unique_ptr<RmRecord> current_record_;  // cached record between seek and next
 
     SmManager *sm_manager_;
 
     void set_end() {
         rid_ = Rid{-1, -1};
+        current_record_.reset();
     }
 
     auto fetch_visible_record(const Rid &rid) -> std::unique_ptr<RmRecord> {
@@ -59,6 +61,7 @@ class SeqScanExecutor : public AbstractExecutor {
             if (record != nullptr && evaluate_conditions(conds_, *record, cols_)) {
                 // 登记点读
                 track_ssi_record_read(context_, tab_name_, conds_, rid_, *record);
+                current_record_ = std::move(record);
                 return;
             }
             scan_->next();
@@ -76,6 +79,7 @@ class SeqScanExecutor : public AbstractExecutor {
         fh_ = sm_manager_->fhs_.at(tab_name_).get();
         cols_ = tab.cols;
         len_ = cols_.back().offset + cols_.back().len;
+        resolve_conditions(conds_, cols_);
 
         context_ = context;
         if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
@@ -115,7 +119,7 @@ class SeqScanExecutor : public AbstractExecutor {
         if (is_end()) {
             return nullptr;
         }
-        return fetch_visible_record(rid_);
+        return std::move(current_record_);
     }
 
     Rid &rid() override { return rid_; }

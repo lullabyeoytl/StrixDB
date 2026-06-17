@@ -97,6 +97,7 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
         output_cols_ = std::move(layout.output_cols);
         isend = true;
         fed_conds_ = std::move(conds);
+        resolve_conditions(fed_conds_, eval_cols_);
 
     }
 

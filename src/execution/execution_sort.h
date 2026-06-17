@@ -76,7 +76,7 @@ class SortExecutor : public AbstractExecutor {
         while (!prev_->is_end()) {
             auto tuple = prev_->Next();
             if (tuple != nullptr) {
-                tuples_.push_back(*tuple);
+                tuples_.push_back(std::move(*tuple));
                 tuple_rids_.push_back(prev_->rid());
             }
             prev_->nextTuple();

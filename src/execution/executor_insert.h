@@ -52,15 +52,9 @@ class InsertExecutor : public AbstractExecutor {
             val.init_raw(col.len);
             memcpy(rec.data + col.offset, val.raw->data, col.len);
         }
-        while (true) {
-            rid_ = fh_->next_insert_rid();
-            if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
-                context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid_, fh_->GetFd());
-            }
-            // avoid insert duplicate slot
-            if (!fh_->is_record(rid_)) {
-                break;
-            }
+        rid_ = fh_->next_insert_rid();
+        if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
+            context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid_, fh_->GetFd());
         }
 
         std::vector<std::pair<IndexMeta *, std::unique_ptr<char[]>>> inserted_keys;

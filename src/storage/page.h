@@ -86,19 +86,14 @@ class Page : public NonCopyable {
    private:
     void reset_memory() { memset(data_, OFFSET_PAGE_START, PAGE_SIZE); }  // 将data_的PAGE_SIZE个字节填充为0
 
-    /** page的唯一标识符 */
+    // Hot fields: accessed on every pin/unpin/fetch, placed together in the first cache line.
     PageId id_;
-
-    /** The actual data that is stored within a page.
-     *  该页面在bufferPool中的偏移地址
-     */
-    char data_[PAGE_SIZE] = {};
-
-    /** 脏页判断 */
+    int pin_count_ = 0;
     bool is_dirty_ = false;
 
-    /** The pin count of this page. */
-    int pin_count_ = 0;
+    /** The actual data that is stored within a page. 4 KiB. */
+    char data_[PAGE_SIZE] = {};
 
+    // Cold: page-level latch, accessed only during B-Link tree concurrency control.
     PageLatch latch_;
 };

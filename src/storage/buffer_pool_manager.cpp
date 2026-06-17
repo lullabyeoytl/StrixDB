@@ -55,7 +55,7 @@ void BufferPoolManager::update_page(Page *page, PageId new_page_id, frame_id_t n
 }
 
 BufferPoolManager::PageKey BufferPoolManager::make_page_key(PageId page_id) {
-    return PageKey{disk_manager_->get_file_name(page_id.fd), page_id.page_no};
+    return PageKey{disk_manager_->get_file_name_nolock(page_id.fd), page_id.page_no};
 }
 
 void BufferPoolManager::flush_wal_before_page_write(const char *data) {
@@ -72,12 +72,10 @@ void BufferPoolManager::write_page_data(const PageKey &page_key, const char *dat
     }
 
     flush_wal_before_page_write(data);
-    const bool was_open = disk_manager_->is_file_open(page_key.file_name);
+    // get_file_fd always bumps refcount; balance with close_file below.
     int fd = disk_manager_->get_file_fd(page_key.file_name);
     disk_manager_->write_page(fd, page_key.page_no, data, PAGE_SIZE);
-    if (!was_open) {
-        disk_manager_->close_file(fd);
-    }
+    disk_manager_->close_file(fd);
 }
 
 /**
@@ -99,8 +97,8 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
     frame_id_t frame_id = INVALID_FRAME_ID;
     PageKey victim_page_key;
     bool flush_victim = false;
-    std::array<char, PAGE_SIZE> victim_data{};
-    std::array<char, PAGE_SIZE> page_data{};
+    std::array<char, PAGE_SIZE> victim_data;
+    std::array<char, PAGE_SIZE> page_data;
 
     {
         std::unique_lock<std::mutex> lock(latch_);
@@ -235,7 +233,7 @@ bool BufferPoolManager::flush_page(PageId page_id) {
     // 3. 更新P的is_dirty_
     PageKey page_key = make_page_key(page_id);
     frame_id_t frame_id = INVALID_FRAME_ID;
-    std::array<char, PAGE_SIZE> page_data{};
+    std::array<char, PAGE_SIZE> page_data;
 
     {
         std::unique_lock<std::mutex> lock(latch_);
@@ -313,7 +311,7 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
     PageKey page_key;
     PageKey victim_page_key;
     bool flush_victim = false;
-    std::array<char, PAGE_SIZE> victim_data{};
+    std::array<char, PAGE_SIZE> victim_data;
 
     {
         std::lock_guard<std::mutex> lock(latch_);
@@ -385,7 +383,7 @@ bool BufferPoolManager::delete_page(PageId page_id) {
     // 3.   将目标页数据写回磁盘，从页表中删除目标页，重置其元数据，将其加入free_list_，返回true
     PageKey page_key = make_page_key(page_id);
     frame_id_t frame_id = INVALID_FRAME_ID;
-    std::array<char, PAGE_SIZE> page_data{};
+    std::array<char, PAGE_SIZE> page_data;
 
     {
         std::unique_lock<std::mutex> lock(latch_);
@@ -452,7 +450,7 @@ bool BufferPoolManager::delete_page(PageId page_id) {
  */
  bool BufferPoolManager::flush_all_pages(int fd) {
       std::vector<PageId> pages_to_flush;
-      std::string file_name = disk_manager_->get_file_name(fd);
+      const std::string file_name = disk_manager_->get_file_name_nolock(fd);
       {
         // also need lock in flush_page, so first get all page_id in vec
           std::lock_guard<std::mutex> lock(latch_);

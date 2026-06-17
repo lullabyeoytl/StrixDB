@@ -106,7 +106,7 @@ class Planner {
 
     // int get_indexNo(std::string tab_name, std::vector<Condition> curr_conds);
     ScanBuildResult make_scan_plan(const std::string &tab_name, const std::vector<Condition> &semantic_conds,
-                                   std::vector<TabCol> required_cols, bool allow_covering_index);
+                                   const std::vector<TabCol> &required_cols, bool allow_covering_index);
     std::shared_ptr<Plan> build_dml_scan_plan(const LogicalPlanContext &plan_context, const std::string &tab_name);
 
     ColMeta lookup_col_meta(const TabCol &col) const;

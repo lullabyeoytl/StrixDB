@@ -79,6 +79,14 @@ struct RmRecord {
         allocated_ = true;
     };
 
+    RmRecord(RmRecord&& other) noexcept
+        : data(other.data)
+        , size(other.size)
+        , allocated_(other.allocated_) {
+        other.data = nullptr;
+        other.size = 0;
+        other.allocated_ = false;
+    }
 
     RmRecord &operator=(const RmRecord& other) {
         if (this == &other) {
@@ -93,6 +101,22 @@ struct RmRecord {
         allocated_ = true;
         return *this;
     };
+
+    RmRecord &operator=(RmRecord&& other) noexcept {
+        if (this == &other) {
+            return *this;
+        }
+        if (allocated_) {
+            delete[] data;
+        }
+        data = other.data;
+        size = other.size;
+        allocated_ = other.allocated_;
+        other.data = nullptr;
+        other.size = 0;
+        other.allocated_ = false;
+        return *this;
+    }
 
     RmRecord(int size_) {
         size = size_;

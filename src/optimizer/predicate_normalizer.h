@@ -45,22 +45,20 @@ inline auto normalize_predicates(const std::vector<ColMeta> &cols, const std::ve
     NormalizeResult result;
     result.normalized_conds.reserve(conds.size());
     
-    // step 1: remove duplicated conditions
-    for (const auto &cond : conds) {
-        bool duplicated = std::any_of(result.normalized_conds.begin(), result.normalized_conds.end(),
-                                      [&](const Condition &existing) {
-                                          return existing.equals(cond);
-                                      });
-        if (!duplicated) {
-            result.normalized_conds.push_back(cond);
-        }
-    }
+    // step 1: collect conditions, then sort + unique to remove duplicates
+    result.normalized_conds.assign(conds.begin(), conds.end());
+    std::sort(result.normalized_conds.begin(), result.normalized_conds.end(), condition_less);
+    result.normalized_conds.erase(
+        std::unique(result.normalized_conds.begin(), result.normalized_conds.end(),
+                    [](const Condition &a, const Condition &b) { return a.equals(b); }),
+        result.normalized_conds.end());
     
     // step 2: handle equivalence class
     std::vector<TabCol> columns;
     std::map<std::string, int> column_ids;
     std::vector<int> parent;
-    
+    std::vector<int> sz;  // union by size: track component sizes
+
     // col_name -> int index key
     auto ensure_column = [&](const TabCol &col) {
         std::string key = col.tab_name + "." + col.col_name;
@@ -68,6 +66,7 @@ inline auto normalize_predicates(const std::vector<ColMeta> &cols, const std::ve
         if (inserted) {
             columns.push_back(col);
             parent.push_back(static_cast<int>(parent.size()));
+            sz.push_back(1);
         }
         return it->second;
     };
@@ -93,9 +92,15 @@ inline auto normalize_predicates(const std::vector<ColMeta> &cols, const std::ve
     auto unite = [&](int lhs, int rhs) {
         lhs = find_root(lhs);
         rhs = find_root(rhs);
-        if (lhs != rhs) {
-            parent[rhs] = lhs;
+        if (lhs == rhs) {
+            return;
         }
+        // Union by size: attach smaller tree under larger tree
+        if (sz[lhs] < sz[rhs]) {
+            std::swap(lhs, rhs);
+        }
+        parent[rhs] = lhs;
+        sz[lhs] += sz[rhs];
     };
 
     for (const auto &cond : result.normalized_conds) {
@@ -118,22 +123,23 @@ inline auto normalize_predicates(const std::vector<ColMeta> &cols, const std::ve
         }
     }
     
-    // step 4, spread const val for columns
+    // step 4, spread const val for columns (defer duplicate removal to final pass)
     for (const auto &col : columns) {
         int root = find_root(ensure_column(col));
         auto const_it = component_constants.find(root);
         if (const_it == component_constants.end()) {
             continue;
         }
-        Condition inferred = normalize_make_const_condition(col, const_it->second, cols);
-        bool exists = std::any_of(result.normalized_conds.begin(), result.normalized_conds.end(),
-                                  [&](const Condition &existing) {
-                                      return existing.equals(inferred);
-                                  });
-        if (!exists) {
-            result.normalized_conds.push_back(std::move(inferred));
-        }
+        result.normalized_conds.push_back(
+            normalize_make_const_condition(col, const_it->second, cols));
     }
+
+    // Final dedup after inferred conditions have been added
+    std::sort(result.normalized_conds.begin(), result.normalized_conds.end(), condition_less);
+    result.normalized_conds.erase(
+        std::unique(result.normalized_conds.begin(), result.normalized_conds.end(),
+                    [](const Condition &a, const Condition &b) { return a.equals(b); }),
+        result.normalized_conds.end());
 
     return result;
 }
