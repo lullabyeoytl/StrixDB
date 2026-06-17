@@ -41,9 +41,6 @@ class InsertExecutor : public AbstractExecutor {
     };
 
     std::unique_ptr<RmRecord> NextImpl() override {
-        auto write_guard = context_ != nullptr && context_->txn_mgr_ != nullptr
-                               ? context_->txn_mgr_->write_txn_guard()
-                               : TransactionManager::WriteTxnGuard(nullptr);
         // Make record buffer
         RmRecord rec(fh_->get_file_hdr().record_size);
         for (size_t i = 0; i < values_.size(); i++) {
@@ -74,8 +71,6 @@ class InsertExecutor : public AbstractExecutor {
                 inserted_keys.emplace_back(&index, std::move(key));
             }
 
-            track_ssi_write(context_, tab_name_, rid_, nullptr, &rec);
-
             lsn_t op_prev_lsn = context_ != nullptr && context_->txn_ != nullptr ? context_->txn_->get_prev_lsn() : INVALID_LSN;
             lsn_t op_lsn = INVALID_LSN;
             if (context_ != nullptr && context_->txn_ != nullptr && context_->log_mgr_ != nullptr) {
@@ -87,9 +82,6 @@ class InsertExecutor : public AbstractExecutor {
 
             fh_->insert_record(rid_, rec.data, op_lsn);
             if (context_ != nullptr && context_->txn_ != nullptr) {
-                if (context_->txn_mgr_ != nullptr) {
-                    context_->txn_mgr_->PrepareInsert(fh_->GetFd(), rid_, rec, context_->txn_);
-                }
                 context_->txn_->append_write_record(new WriteRecord(WType::INSERT_TUPLE, tab_name_, rid_, op_prev_lsn));
             }
         } catch (const UniqueKeyViolationError &) {

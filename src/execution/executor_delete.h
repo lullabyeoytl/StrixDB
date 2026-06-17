@@ -70,17 +70,12 @@ class DeleteExecutor : public AbstractExecutor {
      * Index scans must be drained first so index mutations do not destabilize iteration.
      */
     std::unique_ptr<RmRecord> NextImpl() override {
-        auto write_guard = context_ != nullptr && context_->txn_mgr_ != nullptr
-                               ? context_->txn_mgr_->write_txn_guard()
-                               : TransactionManager::WriteTxnGuard(nullptr);
         // Pre-compute index handles (loop-invariant across rows)
         std::vector<IxIndexHandle *> index_handles;
         index_handles.reserve(tab_.indexes.size());
         for (size_t i = 0; i < tab_.indexes.size(); ++i) {
             index_handles.push_back(sm_manager_->get_ih(tab_name_, tab_.indexes[i].cols));
         }
-        bool use_mvcc = is_mvcc_active(context_);
-
         auto scan_type = leaf_scan_type(scan_executor_.get());
 
         if (scan_type == "SeqScanExecutor") {
@@ -92,8 +87,6 @@ class DeleteExecutor : public AbstractExecutor {
                     context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd());
                 }
                 auto rec = scan_executor_->Next();
-                check_write_conflict(context_, fh_->GetFd(), rid);
-                track_ssi_write(context_, tab_name_, rid, rec.get(), nullptr);
                 lsn_t op_lsn = INVALID_LSN;
                 if (context_ != nullptr && context_->txn_ != nullptr && context_->log_mgr_ != nullptr) {
                     lsn_t prev_lsn = context_->txn_->get_prev_lsn();
@@ -104,16 +97,8 @@ class DeleteExecutor : public AbstractExecutor {
                     context_->txn_->append_write_record(
                         new WriteRecord(WType::DELETE_TUPLE, tab_name_, rid, *rec, prev_lsn));
                 }
-                if (!use_mvcc) {
-                    delete_index_entries(index_handles, *rec, rid);
-                }
-                if (context_ != nullptr && context_->txn_mgr_ != nullptr && context_->txn_ != nullptr) {
-                    context_->txn_mgr_->PrepareDelete(fh_->GetFd(), rid, *rec, context_->txn_);
-                }
-                fh_->delete_record(rid, context_);
-                if (op_lsn != INVALID_LSN) {
-                    fh_->set_page_lsn(rid, op_lsn);
-                }
+                delete_index_entries(index_handles, *rec, rid);
+                fh_->delete_record(rid, context_, op_lsn);
             }
             return nullptr;
         }
@@ -135,8 +120,6 @@ class DeleteExecutor : public AbstractExecutor {
                 if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
                     context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, candidate.rid, fh_->GetFd());
                 }
-                check_write_conflict(context_, fh_->GetFd(), candidate.rid);
-                track_ssi_write(context_, tab_name_, candidate.rid, candidate.rec.get(), nullptr);
                 lsn_t op_lsn = INVALID_LSN;
                 if (context_ != nullptr && context_->txn_ != nullptr && context_->log_mgr_ != nullptr) {
                     lsn_t prev_lsn = context_->txn_->get_prev_lsn();
@@ -148,16 +131,8 @@ class DeleteExecutor : public AbstractExecutor {
                     context_->txn_->append_write_record(
                         new WriteRecord(WType::DELETE_TUPLE, tab_name_, candidate.rid, *candidate.rec, prev_lsn));
                 }
-                if (!use_mvcc) {
-                    delete_index_entries(index_handles, *candidate.rec, candidate.rid);
-                }
-                if (context_ != nullptr && context_->txn_mgr_ != nullptr && context_->txn_ != nullptr) {
-                    context_->txn_mgr_->PrepareDelete(fh_->GetFd(), candidate.rid, *candidate.rec, context_->txn_);
-                }
-                fh_->delete_record(candidate.rid, context_);
-                if (op_lsn != INVALID_LSN) {
-                    fh_->set_page_lsn(candidate.rid, op_lsn);
-                }
+                delete_index_entries(index_handles, *candidate.rec, candidate.rid);
+                fh_->delete_record(candidate.rid, context_, op_lsn);
             }
             return nullptr;
         }

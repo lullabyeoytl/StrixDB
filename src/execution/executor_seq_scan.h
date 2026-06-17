@@ -38,9 +38,6 @@ class SeqScanExecutor : public AbstractExecutor {
     }
 
     auto fetch_visible_record(const Rid &rid) -> std::unique_ptr<RmRecord> {
-        if (!is_mvcc_active(context_) && context_ != nullptr && context_->lock_mgr_ != nullptr) {
-            context_->lock_mgr_->lock_shared_on_record(context_->txn_, rid, fh_->GetFd());
-        }
         try {
             return fh_->get_record(rid, context_);
         } catch (const RecordNotFoundError &) {
@@ -59,8 +56,6 @@ class SeqScanExecutor : public AbstractExecutor {
             rid_ = scan_->rid();
             auto record = fetch_visible_record(rid_);
             if (record != nullptr && evaluate_conditions(conds_, *record, cols_)) {
-                // 登记点读
-                track_ssi_record_read(context_, tab_name_, conds_, rid_, *record);
                 current_record_ = std::move(record);
                 return;
             }
@@ -94,8 +89,6 @@ class SeqScanExecutor : public AbstractExecutor {
     }
 
     void restartTupleImpl() override {
-        // 登记已读范围
-        track_ssi_predicate_read(context_, tab_name_, conds_);
         if (empty_result_) {
             scan_.reset();
             set_end();

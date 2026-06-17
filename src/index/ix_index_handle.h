@@ -288,8 +288,6 @@ class IxIndexHandle : public NonCopyable {
 
     TransactionManager *get_txn_mgr() const { return txn_mgr_; }
 
-    IndexVisibility check_entry_visibility(const Rid &rid, Transaction *transaction) const;
-
     bool validate_unique_key(const char *key, Transaction *transaction, const Rid *self_rid = nullptr,
                              const std::vector<Rid> *ignored_rids = nullptr);
 
@@ -452,8 +450,7 @@ class IxIndexHandle : public NonCopyable {
 
     bool is_ignored_unique_hit(const Rid &hit, const Rid *self_rid, const std::vector<Rid> *ignored_rids) const;
 
-    void validate_unique_hit(const char *key, const Rid &hit, IndexVisibility visibility, Transaction *transaction,
-                             const Rid *self_rid, const std::vector<Rid> *ignored_rids) const;
+    void validate_unique_hit(const Rid &hit, const Rid *self_rid, const std::vector<Rid> *ignored_rids) const;
 
     void validate_unique_key_in_latched_leaf(const char *key, const IxNodeHandle *leaf, Transaction *transaction,
                                              const Rid *self_rid,

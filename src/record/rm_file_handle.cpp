@@ -10,8 +10,6 @@ See the Mulan PSL v2 for more details. */
 
 #include "rm_file_handle.h"
 
-#include "transaction/transaction_manager.h"
-
 /**
  * @description: 获取当前表中记录号为rid的记录
  * @param {Rid&} rid 记录号，指定记录的位置
@@ -33,26 +31,6 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
         memcpy(record->data, page_handle.get_slot(rid.slot_no), file_hdr_.record_size);
         buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
     }
-    if (context != nullptr && context->txn_mgr_ != nullptr && context->txn_ != nullptr) {
-        auto visible = context->txn_mgr_->GetVisibleRecord(fd_, rid, *record, context->txn_);
-        if (visible == nullptr) {
-            throw RecordNotFoundError(rid.page_no, rid.slot_no);
-        }
-        return visible;
-    }
-    return record;
-}
-
-std::unique_ptr<RmRecord> RmFileHandle::get_record_no_mvcc(const Rid &rid) const {
-    std::lock_guard<std::mutex> guard(file_latch_);
-    RmPageHandle page_handle = fetch_page_handle(rid.page_no);
-    if (!Bitmap::is_set(page_handle.bitmap, rid.slot_no)) {
-        buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
-        throw RecordNotFoundError(rid.page_no, rid.slot_no);
-    }
-    auto record = std::make_unique<RmRecord>(file_hdr_.record_size);
-    memcpy(record->data, page_handle.get_slot(rid.slot_no), file_hdr_.record_size);
-    buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
     return record;
 }
 
@@ -187,15 +165,6 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context, lsn_t page_ls
     if (!Bitmap::is_set(page_handle.bitmap, rid.slot_no)) {
         buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, false);
         throw RecordNotFoundError(rid.page_no, rid.slot_no);
-    }
-    if (context != nullptr && context->txn_mgr_ != nullptr && context->txn_ != nullptr &&
-        (context->txn_->get_isolation_level() == IsolationLevel::SNAPSHOT_ISOLATION ||
-         context->txn_->get_isolation_level() == IsolationLevel::SERIALIZABLE)) {
-        if (page_lsn != INVALID_LSN) {
-            page_handle.page->set_page_lsn(page_lsn);
-        }
-        buffer_pool_manager_->unpin_page(PageId{fd_, rid.page_no}, true);
-        return;
     }
     // 2. 更新page_handle.page_hdr中的数据结构
     bool was_full = (page_handle.page_hdr->num_records >= file_hdr_.num_records_per_page);

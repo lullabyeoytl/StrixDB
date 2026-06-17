@@ -102,12 +102,6 @@ void IxScan::advance_to_valid_record() {
             return;
         }
 
-        current_visibility_ = ih_->check_entry_visibility(*current_node_->get_rid(iid_.slot_no), txn_);
-        if (!current_visibility_.matches_snapshot) {
-            iid_.slot_no++;
-            continue;
-        }
-
         is_end_ = false;
         iid_.page_no = current_node_->get_page_no();
         return;

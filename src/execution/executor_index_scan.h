@@ -134,18 +134,11 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     auto fetch_visible_heap_record(const Rid &rid) -> std::unique_ptr<RmRecord> {
-        if (!is_mvcc_active(context_) && context_ != nullptr && context_->lock_mgr_ != nullptr) {
-            context_->lock_mgr_->lock_shared_on_record(context_->txn_, rid, fh_->GetFd());
-        }
         try {
             return fh_->get_record(rid, context_);
         } catch (const RecordNotFoundError &) {
             return nullptr;
         }
-    }
-
-    void track_ssi_record_read(const Rid &rid, const RmRecord &record) {
-        ::track_ssi_record_read(context_, tab_name_, all_conds_, rid, record);
     }
 
     auto seek_to_next_covered_tuple() -> bool {
@@ -156,22 +149,10 @@ class IndexScanExecutor : public AbstractExecutor {
 
         while (!scan_->is_end()) {
             rid_ = scan_->rid();
-            auto *ix_scan = current_index_scan();
-            if (ix_scan->current_visibility().matches_snapshot) {
-                auto key_record = make_record_from_index_key();
-                auto eval_record = make_eval_record_from_index_key();
-                if (evaluate_conditions(residual_conds_, *eval_record, index_eval_cols_)) {
-                    track_ssi_record_read(rid_, *key_record);
-                    current_heap_record_.reset();
-                    return true;
-                }
-            } else {
-                auto heap_record = fetch_visible_heap_record(rid_);
-                if (heap_record != nullptr && evaluate_conditions(all_conds_, *heap_record, tab_.cols)) {
-                    track_ssi_record_read(rid_, *heap_record);
-                    current_heap_record_ = std::move(heap_record);
-                    return true;
-                }
+            auto eval_record = make_eval_record_from_index_key();
+            if (evaluate_conditions(residual_conds_, *eval_record, index_eval_cols_)) {
+                current_heap_record_.reset();
+                return true;
             }
             scan_->next();
         }
@@ -196,7 +177,6 @@ class IndexScanExecutor : public AbstractExecutor {
             rid_ = scan_->rid();
             auto heap_record = fetch_visible_heap_record(rid_);
             if (heap_record != nullptr && evaluate_conditions(all_conds_, *heap_record, tab_.cols)) {
-                track_ssi_record_read(rid_, *heap_record);
                 current_heap_record_ = std::move(heap_record);
                 return;
             }
@@ -447,8 +427,6 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void restartTupleImpl() override {
-        track_ssi_predicate_read(context_, tab_name_, all_conds_);
-
         auto ix_name = sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_);
         auto *ih = sm_manager_->ihs_.at(ix_name).get();
 
@@ -495,14 +473,7 @@ class IndexScanExecutor : public AbstractExecutor {
             return nullptr;
         }
         if (use_covering_index_) {
-            auto *ix_scan = current_index_scan();
-            if (ix_scan->current_visibility().matches_snapshot) {
-                return make_record_from_index_key();
-            }
-            auto heap_record = current_heap_record_ != nullptr ? std::move(current_heap_record_)
-                                                               : fetch_visible_heap_record(rid_);
-            if (heap_record == nullptr) return nullptr;
-            return project_visible_record(*heap_record);
+            return make_record_from_index_key();
         }
         if (current_heap_record_ != nullptr) {
             return std::move(current_heap_record_);

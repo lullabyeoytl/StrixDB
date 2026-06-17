@@ -191,8 +191,6 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
             }
             case T_Transaction_begin:
             {
-                // Apply the session-configured isolation level before any real work.
-                context->txn_->set_isolation_level(context->isolation_level_);
                 // 显示开启一个事务
                 context->txn_->set_txn_mode(true);
                 break;

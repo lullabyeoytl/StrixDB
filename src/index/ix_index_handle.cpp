@@ -14,7 +14,6 @@ See the Mulan PSL v2 for more details. */
 
 #include "ix_scan.h"
 #include "record/rm_file_handle.h"
-#include "transaction/transaction_manager.h"
 
 namespace {
 constexpr int IX_SPLIT_PUBLISH_RETRY_LIMIT = 128;
@@ -24,19 +23,6 @@ auto same_rid(const Rid &lhs, const Rid &rhs) -> bool {
     return lhs.page_no == rhs.page_no && lhs.slot_no == rhs.slot_no;
 }
 
-auto build_key_from_record(const std::vector<ColMeta> &cols, const RmRecord &record) -> std::vector<char> {
-    int total_len = 0;
-    for (const auto &col : cols) {
-        total_len += col.len;
-    }
-    std::vector<char> key(total_len);
-    int offset = 0;
-    for (const auto &col : cols) {
-        memcpy(key.data() + offset, record.data + col.offset, col.len);
-        offset += col.len;
-    }
-    return key;
-}
 }
 
 /**
@@ -236,31 +222,6 @@ IxIndexHandle::~IxIndexHandle() {
     delete file_hdr_;
 }
 
-IndexVisibility IxIndexHandle::check_entry_visibility(const Rid &rid, Transaction *transaction) const {
-    if (txn_mgr_ == nullptr || transaction == nullptr || table_fd_ < 0 ||
-        !TransactionManager::IsMvccActive(transaction)) {
-        return {};
-    }
-    // no version link info -> visiable
-    auto link = txn_mgr_->GetVersionLink(table_fd_, rid);
-    if (!link.has_value()) {
-        return {};
-    }
-    
-    if (link->in_progress_) {
-        if (link->prev_.prev_txn_ == transaction->get_transaction_id()) {
-            return IndexVisibility{!link->is_deleted_, false, true};
-        }
-        return IndexVisibility{true, true, true};
-    }
-    // has committed
-    if (link->ts_ != INVALID_TS && link->ts_ <= transaction->get_start_ts()) {
-        return IndexVisibility{!link->is_deleted_, false, true};
-    }
-
-    return IndexVisibility{true, false, true};
-}
-
 /**
  * @brief 用于查找指定键所在的叶子结点
  * @param key 要查找的目标key值
@@ -334,42 +295,9 @@ bool IxIndexHandle::is_ignored_unique_hit(const Rid &hit, const Rid *self_rid,
                        [&](const Rid &ignored) { return same_rid(hit, ignored); });
 }
 
-void IxIndexHandle::validate_unique_hit(const char *key, const Rid &hit, IndexVisibility visibility,
-                                        Transaction *transaction, const Rid *self_rid,
+void IxIndexHandle::validate_unique_hit(const Rid &hit, const Rid *self_rid,
                                         const std::vector<Rid> *ignored_rids) const {
     if (is_ignored_unique_hit(hit, self_rid, ignored_rids)) {
-        return;
-    }
-
-    if (!visibility.matches_snapshot) {
-        return;
-    }
-
-    if (!TransactionManager::IsMvccActive(transaction) || txn_mgr_ == nullptr || table_handle_ == nullptr ||
-        index_cols_.empty()) {
-        throw UniqueKeyViolationError();
-    }
-
-    if (visibility.check_write_conflict) {
-        auto link = txn_mgr_->GetVersionLink(table_fd_, hit);
-        if (link.has_value() && link->in_progress_ && link->prev_.prev_txn_ != transaction->get_transaction_id()) {
-            throw TransactionAbortException(transaction->get_transaction_id(), AbortReason::WRITE_CONFLICT);
-        }
-    }
-
-    if (!visibility.allow_stale_index_entry) {
-        throw UniqueKeyViolationError();
-    }
-
-    try {
-        Context probe(nullptr, nullptr, transaction);
-        probe.txn_mgr_ = txn_mgr_;
-        auto record = table_handle_->get_record(hit, &probe);
-        auto current_key = build_key_from_record(index_cols_, *record);
-        if (ix_compare(current_key.data(), key, file_hdr_->col_types_, file_hdr_->col_lens_) != 0) {
-            return;
-        }
-    } catch (const RecordNotFoundError &) {
         return;
     }
 
@@ -387,7 +315,7 @@ void IxIndexHandle::validate_unique_key_in_latched_leaf(const char *key, const I
          pos < leaf->get_size() && ix_compare(leaf->get_key(pos), key, file_hdr_->col_types_, file_hdr_->col_lens_) == 0;
          ++pos) {
         const Rid hit = *leaf->get_rid(pos);
-        validate_unique_hit(key, hit, check_entry_visibility(hit, transaction), transaction, self_rid, ignored_rids);
+        validate_unique_hit(hit, self_rid, ignored_rids);
     }
 }
 
@@ -406,7 +334,7 @@ bool IxIndexHandle::validate_unique_key(const char *key, Transaction *transactio
 
     while (!scan.is_end()) {
         Rid hit = scan.rid();
-        validate_unique_hit(key, hit, scan.current_visibility(), transaction, self_rid, ignored_rids);
+        validate_unique_hit(hit, self_rid, ignored_rids);
         scan.next();
     }
 

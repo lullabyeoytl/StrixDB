@@ -98,15 +98,9 @@ class UpdateExecutor : public AbstractExecutor {
      */
     void apply_row_update(const PreparedIndexState &state, const Rid &rid, const RmRecord &old_rec,
                           const RmRecord &new_rec, const std::vector<std::vector<Rid>> *ignored_rids_by_index) {
-        auto write_guard = context_ != nullptr && context_->txn_mgr_ != nullptr
-                               ? context_->txn_mgr_->write_txn_guard()
-                               : TransactionManager::WriteTxnGuard(nullptr);
         if (context_ != nullptr && context_->lock_mgr_ != nullptr) {
             context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd());
         }
-        bool use_mvcc = is_mvcc_active(context_);
-        check_write_conflict(context_, fh_->GetFd(), rid);
-        track_ssi_write(context_, tab_name_, rid, &old_rec, &new_rec);
         lsn_t op_lsn = INVALID_LSN;
         if (context_ != nullptr && context_->txn_ != nullptr && context_->log_mgr_ != nullptr) {
             lsn_t prev_lsn = context_->txn_->get_prev_lsn();
@@ -116,29 +110,20 @@ class UpdateExecutor : public AbstractExecutor {
             context_->txn_->set_prev_lsn(op_lsn);
             context_->txn_->append_write_record(new WriteRecord(WType::UPDATE_TUPLE, tab_name_, rid, old_rec, prev_lsn));
         }
-        if (context_ != nullptr && context_->txn_mgr_ != nullptr && context_->txn_ != nullptr) {
-            context_->txn_mgr_->PrepareUpdate(fh_->GetFd(), rid, old_rec, context_->txn_);
-        }
-        fh_->update_record(rid, new_rec.data, context_);
-        if (op_lsn != INVALID_LSN) {
-            fh_->set_page_lsn(rid, op_lsn);
-        }
 
         for (size_t i = 0; i < tab_.indexes.size(); ++i) {
             auto old_key = build_index_key(tab_.indexes[i], old_rec);
             auto new_key = build_index_key(tab_.indexes[i], new_rec);
-            if (use_mvcc && memcmp(old_key.get(), new_key.get(), tab_.indexes[i].col_tot_len) == 0) {
-                continue;
-            }
-            if (!use_mvcc) {
+            if (memcmp(old_key.get(), new_key.get(), tab_.indexes[i].col_tot_len) != 0) {
                 state.index_handles[i]->delete_entry(old_key.get(), rid, context_->txn_);
+                const std::vector<Rid> *ignored_rids = nullptr;
+                if (ignored_rids_by_index != nullptr && i < ignored_rids_by_index->size()) {
+                    ignored_rids = &(*ignored_rids_by_index)[i];
+                }
+                state.index_handles[i]->insert_entry(new_key.get(), rid, context_->txn_, ignored_rids);
             }
-            const std::vector<Rid> *ignored_rids = nullptr;
-            if (ignored_rids_by_index != nullptr && i < ignored_rids_by_index->size()) {
-                ignored_rids = &(*ignored_rids_by_index)[i];
-            }
-            state.index_handles[i]->insert_entry(new_key.get(), rid, context_->txn_, ignored_rids);
         }
+        fh_->update_record(rid, new_rec.data, context_, op_lsn);
     }
 
     /**

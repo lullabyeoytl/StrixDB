@@ -26,7 +26,6 @@ class IxScan : public RecScan {
     BufferPoolManager *bpm_;
     bool is_end_ = false;
     Transaction *txn_ = nullptr;
-    IndexVisibility current_visibility_;
 
    public:
     IxScan(const IxIndexHandle *ih, const Iid &lower, ScanUpperBound upper_bound, BufferPoolManager *bpm,
@@ -43,8 +42,6 @@ class IxScan : public RecScan {
     const char *key() const;
 
     const Iid &iid() const { return iid_; }
-
-    IndexVisibility current_visibility() const { return current_visibility_; }
 
    private:
     void release_current();
