@@ -201,6 +201,7 @@ void TransactionManager::commit(Transaction *txn, LogManager *log_manager) {
         CommitLogRecord log_record(txn_id);
         log_record.prev_lsn_ = txn->get_prev_lsn();
         lsn_t lsn = log_manager->add_log_to_buffer(&log_record);
+        log_manager->flush_buffer_to_disk_safe();
         txn->set_prev_lsn(lsn);
     }
 
