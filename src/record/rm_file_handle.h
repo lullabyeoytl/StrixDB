@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <assert.h>
 
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_set>
@@ -62,6 +63,28 @@ class RmFileHandle: public NonCopyable {
     mutable std::unordered_set<int64_t> reserved_slots_;
 
    public:
+    class BulkInsertContext {
+       public:
+        explicit BulkInsertContext(RmFileHandle *file_handle);
+        ~BulkInsertContext();
+
+        BulkInsertContext(const BulkInsertContext &) = delete;
+        BulkInsertContext &operator=(const BulkInsertContext &) = delete;
+
+        Rid insert(char *buf, const std::function<lsn_t(const Rid &)> &make_page_lsn);
+
+       private:
+        void ensure_page();
+        void release_current_page(bool dirty);
+        int next_available_slot() const;
+
+        RmFileHandle *file_handle_;
+        std::unique_lock<std::mutex> file_guard_;
+        std::unique_ptr<RmPageHandle> page_handle_;
+        bool current_page_dirty_;
+        int next_slot_no_;
+    };
+
     RmFileHandle(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager, int fd)
         : disk_manager_(disk_manager), buffer_pool_manager_(buffer_pool_manager), fd_(fd) {
         // 注意：这里从磁盘中读出文件描述符为fd的文件的file_hdr，读到内存中
@@ -95,6 +118,8 @@ class RmFileHandle: public NonCopyable {
     void release_reserved_rid(const Rid &rid);
 
     Rid insert_record(char *buf, Context *context);
+
+    std::unique_ptr<BulkInsertContext> start_bulk_insert();
 
     void insert_record(const Rid &rid, char *buf, lsn_t page_lsn = INVALID_LSN);
 

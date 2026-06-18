@@ -27,6 +27,12 @@ class RmFileHandle;
 
 enum class Operation { FIND = 0, INSERT, DELETE };  // 三种操作：查找、插入、删除
 enum class LatchMode { SHARED, EXCLUSIVE };
+enum class InsertEntryOptions { ValidateUnique = 0, SkipUniqueProbe };
+
+struct IxBulkLoadEntry {
+    const char *key;
+    Rid rid;
+};
 
 static const bool binary_search = false;
 
@@ -299,7 +305,10 @@ class IxIndexHandle : public NonCopyable {
 
     // for insert
     page_id_t insert_entry(const char *key, const Rid &value, Transaction *transaction,
-                           const std::vector<Rid> *ignored_rids = nullptr);
+                           const std::vector<Rid> *ignored_rids = nullptr,
+                           InsertEntryOptions options = InsertEntryOptions::ValidateUnique);
+
+    bool bulk_load_sorted_entries(const std::vector<IxBulkLoadEntry> &entries, Transaction *transaction);
 
     std::unique_ptr<IxNodeHandle> split(IxNodeHandle *node);
 
@@ -336,6 +345,13 @@ class IxIndexHandle : public NonCopyable {
     void update_root_page_no(page_id_t root) {
         std::lock_guard<std::mutex> guard(file_hdr_latch_);
         file_hdr_->root_page_ = root;
+    }
+
+    void update_tree_page_nos(page_id_t root, page_id_t first_leaf, page_id_t last_leaf) {
+        std::lock_guard<std::mutex> guard(file_hdr_latch_);
+        file_hdr_->root_page_ = root;
+        file_hdr_->first_leaf_ = first_leaf;
+        file_hdr_->last_leaf_ = last_leaf;
     }
 
     page_id_t get_root_page_no() const {

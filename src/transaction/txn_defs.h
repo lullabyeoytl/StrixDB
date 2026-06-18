@@ -11,6 +11,8 @@ See the Mulan PSL v2 for more details. */
 #pragma once
 
 #include <atomic>
+#include <utility>
+#include <vector>
 
 #include "common/config.h"
 #include "defs.h"
@@ -30,7 +32,7 @@ enum class TransactionState { DEFAULT, GROWING, SHRINKING, COMMITTED, ABORTED };
 enum class IsolationLevel { READ_UNCOMMITTED, REPEATABLE_READ, READ_COMMITTED, SNAPSHOT_ISOLATION, SERIALIZABLE };
 
 /* 事务写操作类型，包括插入、删除、更新三种操作 */
-enum class WType { INSERT_TUPLE = 0, DELETE_TUPLE, UPDATE_TUPLE};
+enum class WType { INSERT_TUPLE = 0, DELETE_TUPLE, UPDATE_TUPLE, INSERT_TUPLE_BATCH};
 
 /**
  * @brief 事务的写操作记录，用于事务的回滚
@@ -51,6 +53,9 @@ class WriteRecord {
     WriteRecord(WType wtype, const std::string &tab_name, const Rid &rid, lsn_t op_prev_lsn = INVALID_LSN)
         : wtype_(wtype), tab_name_(tab_name), rid_(rid), op_prev_lsn_(op_prev_lsn) {}
 
+    WriteRecord(WType wtype, const std::string &tab_name)
+        : wtype_(wtype), tab_name_(tab_name) {}
+
     // constructor for delete & update operation
     WriteRecord(WType wtype, const std::string &tab_name, const Rid &rid, const RmRecord &record,
                 lsn_t op_prev_lsn = INVALID_LSN)
@@ -68,12 +73,19 @@ class WriteRecord {
 
     inline lsn_t GetOpPrevLsn() const { return op_prev_lsn_; }
 
+    inline void AppendBatchRid(const Rid &rid, lsn_t op_prev_lsn) {
+        batch_rids_.emplace_back(rid, op_prev_lsn);
+    }
+
+    inline std::vector<std::pair<Rid, lsn_t>> &GetBatchRids() { return batch_rids_; }
+
    private:
     WType wtype_;
     std::string tab_name_;
     Rid rid_;
     RmRecord record_;
     lsn_t op_prev_lsn_ = INVALID_LSN;      // 回滚补偿, last lsn of the operation
+    std::vector<std::pair<Rid, lsn_t>> batch_rids_;
 };
 
 /* 多粒度锁，加锁对象的类型，包括记录和表 */

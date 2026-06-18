@@ -251,6 +251,10 @@ bool LockManager::lock_exclusive_on_record(Transaction* txn, const Rid& rid, int
     if (!lock_IX_on_table(txn, tab_fd)) {
         return false;
     }
+    return lock_exclusive_on_record_after_table_ix(txn, rid, tab_fd);
+}
+
+bool LockManager::lock_exclusive_on_record_after_table_ix(Transaction* txn, const Rid& rid, int tab_fd) {
     std::unique_lock<std::mutex> lock(latch_);
     LockDataId lock_data_id(tab_fd, rid, LockDataType::RECORD);
     return acquire_lock(lock, lock_table_[lock_data_id], txn, LockMode::EXLUCSIVE, lock_data_id);

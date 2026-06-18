@@ -23,6 +23,10 @@ auto same_rid(const Rid &lhs, const Rid &rhs) -> bool {
     return lhs.page_no == rhs.page_no && lhs.slot_no == rhs.slot_no;
 }
 
+int ceil_div_int(int value, int divisor) {
+    return (value + divisor - 1) / divisor;
+}
+
 }
 
 /**
@@ -464,12 +468,14 @@ void IxIndexHandle::insert_into_parent(IxNodeHandle *old_node, const char *key, 
  * @return page_id_t 插入到的叶结点的page_no
  */
 page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transaction *transaction,
-                                      const std::vector<Rid> *ignored_rids) {
+                                      const std::vector<Rid> *ignored_rids, InsertEntryOptions options) {
     auto access_guard = guard_access();
     std::unique_lock<std::mutex> unique_insert_guard(unique_insert_latch_, std::defer_lock);
     if (file_hdr_->unique_) {
         unique_insert_guard.lock();
-        validate_unique_key(key, transaction, &value, ignored_rids);
+        if (options == InsertEntryOptions::ValidateUnique) {
+            validate_unique_key(key, transaction, &value, ignored_rids);
+        }
     }
     std::unique_ptr<IxNodeHandle> leaf;
     int split_publish_waits = 0;
@@ -530,6 +536,138 @@ page_id_t IxIndexHandle::insert_entry(const char *key, const Rid &value, Transac
         maintain_parent(leaf_page_no, leaf_parent_page_no, updated_first_key.data());
     }
     return page_no;
+}
+
+bool IxIndexHandle::bulk_load_sorted_entries(const std::vector<IxBulkLoadEntry> &entries, Transaction *transaction) {
+    auto access_guard = guard_access();
+    std::unique_lock<std::mutex> unique_insert_guard(unique_insert_latch_, std::defer_lock);
+    if (file_hdr_->unique_) {
+        unique_insert_guard.lock();
+    }
+
+    auto root = fetch_node(get_root_page_no());
+    root->WLatch();
+    if (!root->is_leaf_page() || root->get_size() != 0 || root->get_prev() != IX_LEAF_HEADER_PAGE ||
+        root->get_next() != IX_LEAF_HEADER_PAGE) {
+        unlatch_and_unpin_exclusive(root, false);
+        return false;
+    }
+    unlatch_and_unpin_exclusive(root, false);
+
+    if (entries.empty()) {
+        return true;
+    }
+
+    const int key_len = file_hdr_->col_tot_len_;
+    const int node_capacity = file_hdr_->btree_order_;
+    const int leaf_count = ceil_div_int(static_cast<int>(entries.size()), node_capacity);
+
+    std::vector<page_id_t> current_level_pages;
+    std::vector<std::vector<char>> current_level_first_keys;
+    current_level_pages.reserve(leaf_count);
+    current_level_first_keys.reserve(leaf_count);
+
+    for (int leaf_idx = 0; leaf_idx < leaf_count; ++leaf_idx) {
+        auto leaf = create_node();
+        leaf->WLatch();
+
+        int start = leaf_idx * node_capacity;
+        int count = std::min(node_capacity, static_cast<int>(entries.size()) - start);
+        leaf->page_hdr->next_free_page_no = IX_NO_PAGE;
+        leaf->page_hdr->parent = IX_NO_PAGE;
+        leaf->page_hdr->num_key = 0;
+        leaf->page_hdr->is_leaf = true;
+        leaf->page_hdr->prev = leaf_idx == 0 ? IX_LEAF_HEADER_PAGE : current_level_pages.back();
+        leaf->page_hdr->next = IX_LEAF_HEADER_PAGE;
+        leaf->page_hdr->split_state = IxPageSplitState::NORMAL;
+        leaf->page_hdr->recycle_state = IxPageRecycleState::LIVE;
+        leaf->page_hdr->deleted_epoch = 0;
+
+        if (leaf_idx > 0) {
+            auto prev = fetch_node(current_level_pages.back());
+            prev->WLatch();
+            prev->set_next(leaf->get_page_no());
+            prev->set_high_key(entries[start].key);
+            unlatch_and_unpin_exclusive(prev, true);
+        }
+
+        for (int slot = 0; slot < count; ++slot) {
+            memcpy(leaf->get_key(slot), entries[start + slot].key, key_len);
+            leaf->set_rid(slot, entries[start + slot].rid);
+        }
+        leaf->set_size(count);
+
+        current_level_pages.push_back(leaf->get_page_no());
+        current_level_first_keys.emplace_back(entries[start].key, entries[start].key + key_len);
+        unlatch_and_unpin_exclusive(leaf, true);
+    }
+
+    page_id_t first_leaf_page_no = current_level_pages.front();
+    page_id_t last_leaf_page_no = current_level_pages.back();
+
+    auto leaf_header = fetch_node(IX_LEAF_HEADER_PAGE);
+    leaf_header->WLatch();
+    leaf_header->set_prev(last_leaf_page_no);
+    leaf_header->set_next(first_leaf_page_no);
+    unlatch_and_unpin_exclusive(leaf_header, true);
+
+    while (current_level_pages.size() > 1) {
+        int parent_count = ceil_div_int(static_cast<int>(current_level_pages.size()), node_capacity);
+        std::vector<page_id_t> parent_pages;
+        std::vector<std::vector<char>> parent_first_keys;
+        parent_pages.reserve(parent_count);
+        parent_first_keys.reserve(parent_count);
+
+        for (int parent_idx = 0; parent_idx < parent_count; ++parent_idx) {
+            auto parent = create_node();
+            parent->WLatch();
+
+            int start = parent_idx * node_capacity;
+            int count = std::min(node_capacity, static_cast<int>(current_level_pages.size()) - start);
+            parent->page_hdr->next_free_page_no = IX_NO_PAGE;
+            parent->page_hdr->parent = IX_NO_PAGE;
+            parent->page_hdr->num_key = 0;
+            parent->page_hdr->is_leaf = false;
+            parent->page_hdr->prev = IX_NO_PAGE;
+            parent->page_hdr->next = IX_NO_PAGE;
+            parent->page_hdr->split_state = IxPageSplitState::NORMAL;
+            parent->page_hdr->recycle_state = IxPageRecycleState::LIVE;
+            parent->page_hdr->deleted_epoch = 0;
+
+            if (parent_idx > 0) {
+                auto prev = fetch_node(parent_pages.back());
+                prev->WLatch();
+                prev->set_next(parent->get_page_no());
+                prev->set_high_key(current_level_first_keys[start].data());
+                unlatch_and_unpin_exclusive(prev, true);
+            }
+
+            for (int slot = 0; slot < count; ++slot) {
+                memcpy(parent->get_key(slot), current_level_first_keys[start + slot].data(), key_len);
+                parent->set_rid(slot, Rid{current_level_pages[start + slot], 0});
+
+                auto child = fetch_node(current_level_pages[start + slot]);
+                child->WLatch();
+                child->set_parent(parent->get_page_no());
+                unlatch_and_unpin_exclusive(child, true);
+            }
+            parent->set_size(count);
+
+            parent_pages.push_back(parent->get_page_no());
+            parent_first_keys.push_back(current_level_first_keys[start]);
+            unlatch_and_unpin_exclusive(parent, true);
+        }
+
+        current_level_pages = std::move(parent_pages);
+        current_level_first_keys = std::move(parent_first_keys);
+    }
+
+    auto new_root = fetch_node(current_level_pages.front());
+    new_root->WLatch();
+    new_root->set_parent(IX_NO_PAGE);
+    unlatch_and_unpin_exclusive(new_root, true);
+    update_tree_page_nos(current_level_pages.front(), first_leaf_page_no, last_leaf_page_no);
+    return true;
 }
 
 /**

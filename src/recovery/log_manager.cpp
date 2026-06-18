@@ -137,7 +137,15 @@ lsn_t LogManager::add_log_to_buffer(LogRecord* log_record) {
     return add_log_to_buffer_with_result(log_record).lsn;
 }
 
+lsn_t LogManager::add_log_to_buffer_relaxed(LogRecord *log_record) {
+    return append_log_to_buffer(log_record, false).lsn;
+}
+
 LogAppendResult LogManager::add_log_to_buffer_with_result(LogRecord *log_record) {
+    return append_log_to_buffer(log_record, true);
+}
+
+LogAppendResult LogManager::append_log_to_buffer(LogRecord *log_record, bool wait_for_high_watermark) {
     std::unique_lock<std::mutex> lock(latch_);
     if (log_record == nullptr) {
         return {};
@@ -158,7 +166,7 @@ LogAppendResult LogManager::add_log_to_buffer_with_result(LogRecord *log_record)
     log_buffer_.offset_ += static_cast<int>(log_record->log_tot_len_);
 
     double fill_ratio = static_cast<double>(log_buffer_.offset_) / static_cast<double>(LOG_BUFFER_SIZE);
-    if (fill_ratio >= FLUSH_HIGH_WATERMARK) {
+    if (fill_ratio >= FLUSH_HIGH_WATERMARK && wait_for_high_watermark) {
         lsn_t wait_lsn = result.lsn;
         lock.unlock();
         flush_cv_.notify_one();

@@ -201,10 +201,6 @@ void TransactionManager::commit(Transaction *txn, LogManager *log_manager) {
         CommitLogRecord log_record(txn_id);
         log_record.prev_lsn_ = txn->get_prev_lsn();
         lsn_t lsn = log_manager->add_log_to_buffer(&log_record);
-        // log_manager->flush_buffer_to_disk_safe();
-        if (!log_manager->is_first_flush_done()) {
-            log_manager->flush_buffer_to_disk_safe();
-        }
         txn->set_prev_lsn(lsn);
     }
 
@@ -247,12 +243,21 @@ void TransactionManager::abort(Transaction *txn, LogManager *log_manager) {
             RmFileHandle *fh = fh_it->second.get();
             TabMeta &tab = sm_manager_->db_.get_table(tab_name);
 
+            auto undo_insert = [&](const Rid &rid, lsn_t op_prev_lsn) {
+                auto rec = fh->get_record(rid, nullptr);
+                DeleteLogRecord clr(txn_id, *rec, rid, tab_name);
+                append_txn_clr(txn, log_manager, clr, LogType::CLR_DELETE, op_prev_lsn);
+                apply_index_op(sm_manager_, tab_name, tab, *rec, rid, txn, IndexEntryOp::DELETE);
+                fh->delete_record(rid, nullptr, txn->get_prev_lsn());
+            };
+
             if (write_record->GetWriteType() == WType::INSERT_TUPLE) {
-                auto rec = fh->get_record(write_record->GetRid(), nullptr);
-                DeleteLogRecord clr(txn_id, *rec, write_record->GetRid(), tab_name);
-                append_txn_clr(txn, log_manager, clr, LogType::CLR_DELETE, write_record->GetOpPrevLsn());
-                apply_index_op(sm_manager_, tab_name, tab, *rec, write_record->GetRid(), txn, IndexEntryOp::DELETE);
-                fh->delete_record(write_record->GetRid(), nullptr, txn->get_prev_lsn());
+                undo_insert(write_record->GetRid(), write_record->GetOpPrevLsn());
+            } else if (write_record->GetWriteType() == WType::INSERT_TUPLE_BATCH) {
+                auto &rids = write_record->GetBatchRids();
+                for (auto batch_it = rids.rbegin(); batch_it != rids.rend(); ++batch_it) {
+                    undo_insert(batch_it->first, batch_it->second);
+                }
             } else if (write_record->GetWriteType() == WType::DELETE_TUPLE) {
                 InsertLogRecord clr(txn_id, write_record->GetRecord(), write_record->GetRid(), tab_name);
                 append_txn_clr(txn, log_manager, clr, LogType::CLR_INSERT, write_record->GetOpPrevLsn());

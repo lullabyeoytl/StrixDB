@@ -333,6 +333,43 @@ public:
     }
 };
 
+class InsertLogRecordView : public LogRecord {
+public:
+    InsertLogRecordView(txn_id_t txn_id, const char *record_data, int record_size, const Rid &rid,
+                        const std::string &table_name)
+        : LogRecord(LogType::INSERT)
+        , record_data_(record_data)
+        , record_size_(record_size)
+        , rid_(rid)
+        , table_name_(table_name.data())
+        , table_name_size_(table_name.size()) {
+        log_tid_ = txn_id;
+        log_tot_len_ += sizeof(int);
+        log_tot_len_ += static_cast<uint32_t>(record_size_);
+        log_tot_len_ += sizeof(Rid);
+        log_tot_len_ += table_name_log_size(table_name_size_);
+    }
+
+    void serialize(char *dest) const override {
+        LogRecord::serialize(dest);
+        int offset = OFFSET_LOG_DATA;
+        memcpy(dest + offset, &record_size_, sizeof(int));
+        offset += sizeof(int);
+        memcpy(dest + offset, record_data_, record_size_);
+        offset += record_size_;
+        memcpy(dest + offset, &rid_, sizeof(Rid));
+        offset += sizeof(Rid);
+        serialize_table_name(dest, offset, table_name_, table_name_size_);
+    }
+
+private:
+    const char *record_data_;
+    int record_size_;
+    Rid rid_;
+    const char *table_name_;
+    size_t table_name_size_;
+};
+
 /**
  * TODO: delete操作的日志记录
 */
@@ -474,6 +511,7 @@ public:
     void set_first_flush_done(bool done) { first_flush_done_.store(done, std::memory_order_release); }
     bool is_first_flush_done() const { return first_flush_done_.load(std::memory_order_acquire); }
     lsn_t add_log_to_buffer(LogRecord* log_record);
+    lsn_t add_log_to_buffer_relaxed(LogRecord *log_record);
     LogAppendResult add_log_to_buffer_with_result(LogRecord *log_record);
     void flush_log_to_disk();
     void flush_log_to_lsn(lsn_t target_lsn);
@@ -487,6 +525,7 @@ public:
     static constexpr int FLUSH_TIMEOUT_MS = 100;
 
 private:
+    LogAppendResult append_log_to_buffer(LogRecord *log_record, bool wait_for_high_watermark);
     lsn_t flush_buffer_to_disk();
     void sync_written_log(lsn_t target_lsn);
     void advance_persist_lsn(lsn_t target_lsn);

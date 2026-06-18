@@ -125,6 +125,98 @@ Rid RmFileHandle::insert_record(char* buf, Context* context) {
     }
 }
 
+RmFileHandle::BulkInsertContext::BulkInsertContext(RmFileHandle *file_handle)
+    : file_handle_(file_handle),
+      file_guard_(file_handle->file_latch_),
+      page_handle_(nullptr),
+      current_page_dirty_(false),
+      next_slot_no_(0) {}
+
+RmFileHandle::BulkInsertContext::~BulkInsertContext() {
+    release_current_page(current_page_dirty_);
+}
+
+void RmFileHandle::BulkInsertContext::ensure_page() {
+    if (page_handle_ != nullptr) {
+        return;
+    }
+
+    bool created_page = file_handle_->file_hdr_.first_free_page_no == RM_NO_PAGE;
+    RmPageHandle handle = created_page ? file_handle_->create_new_page_handle()
+                                       : file_handle_->fetch_page_handle(file_handle_->file_hdr_.first_free_page_no);
+    page_handle_ = std::make_unique<RmPageHandle>(handle);
+    current_page_dirty_ = created_page;
+    next_slot_no_ = next_available_slot();
+}
+
+void RmFileHandle::BulkInsertContext::release_current_page(bool dirty) {
+    if (page_handle_ == nullptr) {
+        return;
+    }
+
+    PageId page_id{file_handle_->fd_, page_handle_->page->get_page_id().page_no};
+    file_handle_->buffer_pool_manager_->unpin_page(page_id, dirty);
+    page_handle_.reset();
+    current_page_dirty_ = false;
+    next_slot_no_ = 0;
+}
+
+int RmFileHandle::BulkInsertContext::next_available_slot() const {
+    if (page_handle_ == nullptr) {
+        return file_handle_->file_hdr_.num_records_per_page;
+    }
+
+    int slot_no = next_slot_no_;
+    while (slot_no < file_handle_->file_hdr_.num_records_per_page) {
+        Rid rid{page_handle_->page->get_page_id().page_no, slot_no};
+        if (!Bitmap::is_set(page_handle_->bitmap, slot_no) &&
+            file_handle_->reserved_slots_.find(encode_rid(rid)) == file_handle_->reserved_slots_.end()) {
+            return slot_no;
+        }
+        slot_no = Bitmap::next_bit(false, page_handle_->bitmap, file_handle_->file_hdr_.num_records_per_page, slot_no);
+    }
+    return file_handle_->file_hdr_.num_records_per_page;
+}
+
+Rid RmFileHandle::BulkInsertContext::insert(char *buf,
+                                            const std::function<lsn_t(const Rid &)> &make_page_lsn) {
+    while (true) {
+        ensure_page();
+        if (next_slot_no_ >= file_handle_->file_hdr_.num_records_per_page) {
+            release_current_page(current_page_dirty_);
+            continue;
+        }
+
+        Rid rid{page_handle_->page->get_page_id().page_no, next_slot_no_};
+        lsn_t page_lsn = make_page_lsn ? make_page_lsn(rid) : INVALID_LSN;
+
+        file_handle_->reserved_slots_.erase(encode_rid(rid));
+        memcpy(page_handle_->get_slot(rid.slot_no), buf, file_handle_->file_hdr_.record_size);
+        Bitmap::set(page_handle_->bitmap, rid.slot_no);
+        page_handle_->page_hdr->num_records++;
+        if (page_lsn != INVALID_LSN) {
+            page_handle_->page->set_page_lsn(page_lsn);
+        }
+
+        current_page_dirty_ = true;
+        next_slot_no_ = rid.slot_no + 1;
+        if (page_handle_->page_hdr->num_records >= file_handle_->file_hdr_.num_records_per_page) {
+            if (file_handle_->file_hdr_.first_free_page_no == rid.page_no) {
+                file_handle_->file_hdr_.first_free_page_no = page_handle_->page_hdr->next_free_page_no;
+                page_handle_->page_hdr->next_free_page_no = RM_NO_PAGE;
+            }
+            release_current_page(true);
+        } else {
+            next_slot_no_ = next_available_slot();
+        }
+        return rid;
+    }
+}
+
+std::unique_ptr<RmFileHandle::BulkInsertContext> RmFileHandle::start_bulk_insert() {
+    return std::make_unique<BulkInsertContext>(this);
+}
+
 /**
  * @description: 在当前表中的指定位置插入一条记录
  * @param {Rid&} rid 要插入记录的位置
