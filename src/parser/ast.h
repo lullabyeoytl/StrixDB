@@ -263,6 +263,14 @@ struct InsertStmt : public TreeNode {
             tab_name(std::move(tab_name_)), vals(std::move(vals_)) {}
 };
 
+struct LoadStmt : public TreeNode {
+    std::string tab_name;
+    std::string file_name;
+
+    LoadStmt(std::string tab_name_, std::string file_name_) :
+            tab_name(std::move(tab_name_)), file_name(std::move(file_name_)) {}
+};
+
 struct DeleteStmt : public TreeNode {
     std::string tab_name;
     std::vector<std::shared_ptr<BinaryExpr>> conds;

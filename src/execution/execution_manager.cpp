@@ -12,6 +12,7 @@ See the Mulan PSL v2 for more details. */
 
 #include <algorithm>
 #include <sstream>
+#include <stdexcept>
 
 #include "execution_common.h"
 #include "executor_delete.h"
@@ -114,6 +115,7 @@ const char *help_info = "Supported SQL syntax:\n"
                    "  SHOW INDEX FROM table_name\n"
                    "  DROP INDEX table_name (column_name)\n"
                    "  INSERT INTO table_name VALUES (value [, value ...])\n"
+                   "  LOAD file_name INTO table_name\n"
                    "  DELETE FROM table_name [WHERE where_clause]\n"
                    "  UPDATE table_name SET column_name = value [, column_name = value ...] [WHERE where_clause]\n"
                    "  SELECT selector FROM table_name [WHERE where_clause]\n"
@@ -252,6 +254,184 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
             break;
         }
         }
+    } else if(auto x = std::dynamic_pointer_cast<LoadPlan>(plan)) {
+        // Load CSV data from file into table.
+        // The first line of every CSV is unconditionally treated as a header row
+        // and discarded — files produced by the TPC-C data generator always carry
+        // a header, which is the only supported input format.
+        auto &tab = sm_manager_->db_.get_table(x->tab_name_);
+        auto fh = sm_manager_->fhs_.at(x->tab_name_).get();
+
+        std::ifstream csv_file(x->file_name_);
+        if (!csv_file.is_open()) {
+            throw RMDBError("Cannot open file: " + x->file_name_);
+        }
+
+        std::string line;
+        if (!std::getline(csv_file, line)) {
+            throw RMDBError("File is empty: " + x->file_name_);
+        }
+
+        int row_count = 0;
+        while (std::getline(csv_file, line)) {
+            if (line.empty()) {
+                continue;
+            }
+
+            // Split line on commas.  This is a minimal splitter that does not
+            // handle quoted fields, embedded commas, or embedded newlines —
+            // sufficient for the narrow character set produced by the TPC-C
+            // data generator, but not a general-purpose CSV parser.
+            std::vector<std::string> tokens;
+            std::string token;
+            for (char ch : line) {
+                if (ch == ',') {
+                    tokens.push_back(std::move(token));
+                    token.clear();
+                } else {
+                    token += ch;
+                }
+            }
+            tokens.push_back(std::move(token));
+
+            if (tokens.size() != tab.cols.size()) {
+                throw RMDBError("Column count mismatch in file " + x->file_name_ +
+                                ": expected " + std::to_string(tab.cols.size()) +
+                                ", got " + std::to_string(tokens.size()));
+            }
+
+            // Build values from tokens, typed by column metadata.
+            // std::stoi / std::stof throw std::invalid_argument or
+            // std::out_of_range on malformed input, which are not project
+            // exception types.  Convert them to RMDBError so the outer
+            // handler in rmdb.cpp can deliver a diagnostic to the client.
+            std::vector<Value> values;
+            values.reserve(tokens.size());
+            for (size_t i = 0; i < tokens.size(); i++) {
+                Value val;
+                try {
+                    switch (tab.cols[i].type) {
+                        case TYPE_INT: {
+                            size_t parsed_len = 0;
+                            int parsed_value = std::stoi(tokens[i], &parsed_len);
+                            if (parsed_len != tokens[i].size()) {
+                                throw std::invalid_argument("trailing characters");
+                            }
+                            val.set_int(parsed_value);
+                            break;
+                        }
+                        case TYPE_FLOAT: {
+                            size_t parsed_len = 0;
+                            float parsed_value = std::stof(tokens[i], &parsed_len);
+                            if (parsed_len != tokens[i].size()) {
+                                throw std::invalid_argument("trailing characters");
+                            }
+                            val.set_float(parsed_value);
+                            break;
+                        }
+                        case TYPE_STRING:
+                            val.set_str(tokens[i]);
+                            break;
+                        case TYPE_DATETIME:
+                            val = parse_datetime_literal(tokens[i]);
+                            break;
+                        default:
+                            throw InternalError("Unexpected column type in LOAD");
+                    }
+                } catch (const std::invalid_argument &) {
+                    throw RMDBError("Invalid value in file " + x->file_name_ +
+                                    " row " + std::to_string(row_count + 1) +
+                                    " col " + std::to_string(i + 1) +
+                                    ": '" + tokens[i] + "'");
+                } catch (const std::out_of_range &) {
+                    throw RMDBError("Value out of range in file " + x->file_name_ +
+                                    " row " + std::to_string(row_count + 1) +
+                                    " col " + std::to_string(i + 1) +
+                                    ": '" + tokens[i] + "'");
+                }
+                values.push_back(std::move(val));
+            }
+
+            // Insert a single row.  The pattern mirrors InsertExecutor::NextImpl
+            // except that the record lock is acquired inside the try block so
+            // that a TransactionAbortException from lock acquisition still
+            // triggers release_reserved_rid — otherwise the slot is permanently
+            // lost until the next process restart.
+            {
+                auto write_guard = context != nullptr && context->txn_mgr_ != nullptr
+                                       ? context->txn_mgr_->write_txn_guard()
+                                       : TransactionManager::WriteTxnGuard(nullptr);
+
+                RmRecord rec(fh->get_file_hdr().record_size);
+                for (size_t i = 0; i < values.size(); i++) {
+                    auto &col = tab.cols[i];
+                    Value val = coerce_value_to_type(values[i], col.type);
+                    val.init_raw(col.len);
+                    memcpy(rec.data + col.offset, val.raw->data, col.len);
+                }
+
+                Rid rid = fh->next_insert_rid();
+
+                std::vector<std::pair<IndexMeta *, std::unique_ptr<char[]>>> inserted_keys;
+                std::vector<std::string> violation_cols;
+                try {
+                    if (context != nullptr && context->lock_mgr_ != nullptr) {
+                        context->lock_mgr_->lock_exclusive_on_record(context->txn_, rid, fh->GetFd());
+                    }
+
+                    for (size_t i = 0; i < tab.indexes.size(); ++i) {
+                        auto &index = tab.indexes[i];
+                        auto ih = sm_manager_->get_ih(x->tab_name_, index.cols);
+                        auto key = std::make_unique<char[]>(index.col_tot_len);
+                        index.build_key(key.get(), rec.data);
+                        try {
+                            ih->insert_entry(key.get(), rid, context->txn_);
+                        } catch (const UniqueKeyViolationError &) {
+                            violation_cols = index.col_names();
+                            throw;
+                        }
+                        inserted_keys.emplace_back(&index, std::move(key));
+                    }
+
+                    lsn_t op_prev_lsn = context != nullptr && context->txn_ != nullptr
+                                            ? context->txn_->get_prev_lsn()
+                                            : INVALID_LSN;
+                    lsn_t op_lsn = INVALID_LSN;
+                    if (context != nullptr && context->txn_ != nullptr && context->log_mgr_ != nullptr) {
+                        InsertLogRecord log_record(context->txn_->get_transaction_id(), rec, rid, x->tab_name_);
+                        log_record.prev_lsn_ = op_prev_lsn;
+                        op_lsn = context->log_mgr_->add_log_to_buffer(&log_record);
+                        context->txn_->set_prev_lsn(op_lsn);
+                    }
+
+                    fh->insert_record(rid, rec.data, op_lsn);
+                    if (context != nullptr && context->txn_ != nullptr) {
+                        context->txn_->append_write_record(
+                            new WriteRecord(WType::INSERT_TUPLE, x->tab_name_, rid, op_prev_lsn));
+                    }
+                } catch (const UniqueKeyViolationError &) {
+                    for (auto it = inserted_keys.rbegin(); it != inserted_keys.rend(); ++it) {
+                        auto ih = sm_manager_->get_ih(x->tab_name_, it->first->cols);
+                        ih->delete_entry(it->second.get(), rid, context->txn_);
+                    }
+                    fh->release_reserved_rid(rid);
+                    throw UniqueViolationError(x->tab_name_, violation_cols);
+                } catch (...) {
+                    for (auto it = inserted_keys.rbegin(); it != inserted_keys.rend(); ++it) {
+                        auto ih = sm_manager_->get_ih(x->tab_name_, it->first->cols);
+                        ih->delete_entry(it->second.get(), rid, context->txn_);
+                    }
+                    fh->release_reserved_rid(rid);
+                    throw;
+                }
+            }
+
+            row_count++;
+        }
+
+        write_bounded_output("Loaded " + std::to_string(row_count) + " rows into " + x->tab_name_ + "\n",
+                             context);
+
     } else if(auto x = std::dynamic_pointer_cast<SetIsolationLevelPlan>(plan)) {
         context->isolation_level_ = x->level_;
     }

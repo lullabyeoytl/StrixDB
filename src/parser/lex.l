@@ -48,6 +48,7 @@ value_string '[^']*'
 single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 
 %x STATE_COMMENT
+%x STATE_LOAD
 
 %%
     /* block comment */
@@ -56,6 +57,17 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 <STATE_COMMENT>[^*] { /* ignore the text of the comment */ }
 <STATE_COMMENT>\* { /* ignore *'s that aren't part of */ }
     /* single line comment */
+    /* load file path */
+<STATE_LOAD>{white_space} { /* ignore whitespace */ }
+<STATE_LOAD>{new_line} { /* ignore newline */ }
+<STATE_LOAD>[A-Za-z0-9_/.\\-]+ {
+    yylval->sv_str = yytext;
+    BEGIN(INITIAL);
+    return VALUE_FILEPATH;
+}
+<STATE_LOAD>. {
+    std::cerr << "Lexer Error: unexpected character in file path: " << yytext[0] << std::endl;
+}
 "--".* { /* ignore single line comment */ }
     /* white space and new line */
 {white_space} { /* ignore white space */ }
@@ -100,6 +112,7 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "ORDER" { return ORDER; }
 "BY" {  return BY;  }
 "LIMIT" { return LIMIT; }
+"LOAD" { BEGIN(STATE_LOAD); return LOAD; }
 "OFFSET" { return OFFSET; }
 "AS" { return AS; }
 "ASC" { return ASC; }
@@ -115,9 +128,9 @@ single_op ";"|"("|")"|","|"*"|"="|">"|"<"|"."
 "ENABLE_NESTLOOP" { return ENABLE_NESTLOOP; }
 "ENABLE_SORTMERGE" { return ENABLE_SORTMERGE; }
 "ENABLE_HASHJOIN" { return ENABLE_HASHJOIN; }
-"TRUE" { 
+"TRUE" {
     yylval->sv_bool = true;
-    return VALUE_BOOL; 
+    return VALUE_BOOL;
 }
 "FALSE" {
     yylval->sv_bool = false;

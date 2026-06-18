@@ -27,10 +27,10 @@ class Optimizer {
     Planner *planner_;
 
    public:
-    Optimizer(SmManager *sm_manager,  Planner *planner) 
+    Optimizer(SmManager *sm_manager,  Planner *planner)
         : sm_manager_(sm_manager),  planner_(planner)
         {}
-    
+
     std::shared_ptr<Plan> plan_query(std::shared_ptr<Query> query, Context *context) {
         if (auto x = std::dynamic_pointer_cast<ast::Help>(query->parse)) {
             // help;
@@ -64,6 +64,9 @@ class Optimizer {
         } else if (auto x = std::dynamic_pointer_cast<ast::SetIsolationLevelStmt>(query->parse)) {
             // Set Transaction Isolation Level Plan
             return std::make_shared<SetIsolationLevelPlan>(x->level_);
+        } else if (auto x = std::dynamic_pointer_cast<ast::LoadStmt>(query->parse)) {
+            // load data from file into table
+            return std::make_shared<LoadPlan>(x->tab_name, x->file_name);
         } else {
             return planner_->do_planner(query, context);
         }

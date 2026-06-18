@@ -44,6 +44,7 @@ typedef enum PlanTag{
     T_Transaction_abort,
     T_Transaction_rollback,
     T_StaticCheckpoint,
+    T_Load,
     T_SeqScan,
     T_IndexScan,
     T_IndexNestLoop,
@@ -390,6 +391,21 @@ class OtherPlan : public Plan
         }
         ~OtherPlan(){}
         std::string tab_name_;
+};
+
+// load data from file into table
+class LoadPlan : public Plan
+{
+    public:
+        LoadPlan(std::string tab_name, std::string file_name)
+        {
+            Plan::tag = T_Load;
+            tab_name_ = std::move(tab_name);
+            file_name_ = std::move(file_name);
+        }
+        ~LoadPlan(){}
+        std::string tab_name_;
+        std::string file_name_;
 };
 
 // Set Knob Plan

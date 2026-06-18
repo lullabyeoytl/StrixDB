@@ -227,6 +227,9 @@ class Portal
         } else if(auto x = std::dynamic_pointer_cast<SetIsolationLevelPlan>(plan)) {
             return std::make_shared<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<TabCol>(), std::vector<std::string>(),
                                                 std::unique_ptr<AbstractExecutor>(), plan);
+        } else if(auto x = std::dynamic_pointer_cast<LoadPlan>(plan)) {
+            return std::make_shared<PortalStmt>(PORTAL_CMD_UTILITY, std::vector<TabCol>(), std::vector<std::string>(),
+                                                std::unique_ptr<AbstractExecutor>(), plan);
         } else if (auto x = std::dynamic_pointer_cast<DDLPlan>(plan)) {
             return std::make_shared<PortalStmt>(PORTAL_MULTI_QUERY, std::vector<TabCol>(), std::vector<std::string>(),
                                                 std::unique_ptr<AbstractExecutor>(), plan);

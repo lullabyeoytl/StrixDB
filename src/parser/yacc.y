@@ -41,19 +41,20 @@ void append_join_clause(std::vector<std::shared_ptr<JoinExpr>> &join_exprs,
 // keywords
 %token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY LIMIT OFFSET AS
 WHERE UPDATE SET SELECT INT CHAR FLOAT DATETIME INDEX AND ON SEMI JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY ENABLE_NESTLOOP ENABLE_SORTMERGE ENABLE_HASHJOIN
+%token LOAD
 %token COUNT SUM AVG MIN MAX GROUP HAVING EXPLAIN ANALYZE
 %token TRANSACTION ISOLATION LEVEL SNAPSHOT SERIALIZABLE STATIC_CHECKPOINT
 // non-keywords
 %token LEQ NEQ GEQ T_EOF
 
 // type-specific tokens
-%token <sv_str> IDENTIFIER VALUE_STRING
+%token <sv_str> IDENTIFIER VALUE_STRING VALUE_FILEPATH
 %token <sv_int> VALUE_INT
 %token <sv_float> VALUE_FLOAT
 %token <sv_bool> VALUE_BOOL
 
 // specify types for non-terminal symbol
-%type <sv_node> stmt dbStmt ddl dml txnStmt setStmt selectStmt explainAnalyzeTarget
+%type <sv_node> stmt dbStmt ddl dml txnStmt setStmt loadStmt selectStmt explainAnalyzeTarget
 %type <sv_field> field
 %type <sv_fields> fieldList
 %type <sv_type_len> type
@@ -126,6 +127,14 @@ stmt:
     |   dml
     |   txnStmt
     |   setStmt
+    |   loadStmt
+    ;
+
+loadStmt:
+        LOAD VALUE_FILEPATH INTO tbName
+    {
+        $$ = std::make_shared<LoadStmt>($4, $2);
+    }
     ;
 
 explainAnalyzeTarget:
@@ -374,7 +383,7 @@ optWhereClause:
     ;
 
 whereClause:
-        condition 
+        condition
     {
         $$ = std::vector<std::shared_ptr<BinaryExpr>>{$1};
     }
@@ -614,9 +623,9 @@ tableRef:
     ;
 
 opt_order_clause:
-    ORDER BY order_clause      
-    { 
-        $$ = std::make_shared<OrderBy>($3); 
+    ORDER BY order_clause
+    {
+        $$ = std::make_shared<OrderBy>($3);
     }
     |   /* epsilon */ { $$ = nullptr; }
     ;
@@ -635,7 +644,7 @@ opt_limit_clause:
 
 order_clause:
       order_item
-    { 
+    {
         $$ = std::vector<std::shared_ptr<OrderBy::Item>>{$1};
     }
     |   order_clause ',' order_item
@@ -667,7 +676,7 @@ opt_asc_desc:
     ASC          { $$ = OrderBy_ASC;     }
     |  DESC      { $$ = OrderBy_DESC;    }
     |       { $$ = OrderBy_DEFAULT; }
-    ;    
+    ;
 
 set_knob_type:
     ENABLE_NESTLOOP { $$ = EnableNestLoop; }
