@@ -219,6 +219,7 @@ void LogManager::run_flush_thread() {
         }
         if (target_lsn != INVALID_LSN) {
             sync_written_log(target_lsn);
+            first_flush_done_.store(true, std::memory_order_release);
         }
     }
 }

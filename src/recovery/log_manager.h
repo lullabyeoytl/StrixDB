@@ -471,6 +471,8 @@ public:
     explicit LogManager(DiskManager* disk_manager);
     ~LogManager();
 
+    void set_first_flush_done(bool done) { first_flush_done_.store(done, std::memory_order_release); }
+    bool is_first_flush_done() const { return first_flush_done_.load(std::memory_order_acquire); }
     lsn_t add_log_to_buffer(LogRecord* log_record);
     LogAppendResult add_log_to_buffer_with_result(LogRecord *log_record);
     void flush_log_to_disk();
@@ -482,7 +484,7 @@ public:
 
     static constexpr double FLUSH_LOW_WATERMARK = 0.60;
     static constexpr double FLUSH_HIGH_WATERMARK = 0.90;
-    static constexpr int FLUSH_TIMEOUT_MS = 20;
+    static constexpr int FLUSH_TIMEOUT_MS = 100;
 
 private:
     lsn_t flush_buffer_to_disk();
@@ -499,5 +501,8 @@ private:
     std::thread flush_thread_;
     std::condition_variable flush_cv_;
     std::mutex cv_mutex_;
+    // first flush window will be missed if sigkill
+    // handle first flush window
+    std::atomic<bool> first_flush_done_{false};
     DiskManager* disk_manager_;
 };
