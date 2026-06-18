@@ -1,9 +1,11 @@
 #include "load_executor.h"
 
 #include <algorithm>
-#include <charconv>
+#include <cerrno>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <string_view>
 #include <vector>
 
@@ -59,6 +61,55 @@ int compare_load_key(const IndexMeta &index, const char *lhs, const char *rhs) {
     return 0;
 }
 
+bool parse_load_int(std::string_view token, int *value) {
+    if (token.empty()) {
+        return false;
+    }
+
+    int sign = 1;
+    size_t pos = 0;
+    if (token[pos] == '+' || token[pos] == '-') {
+        sign = token[pos] == '-' ? -1 : 1;
+        pos++;
+        if (pos == token.size()) {
+            return false;
+        }
+    }
+
+    long long parsed = 0;
+    long long limit = sign < 0 ? static_cast<long long>(std::numeric_limits<int>::max()) + 1
+                               : std::numeric_limits<int>::max();
+    for (; pos < token.size(); ++pos) {
+        unsigned char ch = static_cast<unsigned char>(token[pos]);
+        if (ch < '0' || ch > '9') {
+            return false;
+        }
+        parsed = parsed * 10 + (ch - '0');
+        if (parsed > limit) {
+            errno = ERANGE;
+            return false;
+        }
+    }
+
+    *value = static_cast<int>(sign * parsed);
+    return true;
+}
+
+bool parse_load_float(std::string_view token, float *value) {
+    std::string text(token);
+    char *end = nullptr;
+    errno = 0;
+    float parsed = std::strtof(text.c_str(), &end);
+    if (errno == ERANGE) {
+        return false;
+    }
+    if (end != text.c_str() + text.size()) {
+        return false;
+    }
+    *value = parsed;
+    return true;
+}
+
 void write_load_field(std::string_view token, const ColMeta &col, char *record_data,
                       const std::string &file_name, int row_number, size_t col_number) {
     char *dest = record_data + col.offset;
@@ -78,11 +129,11 @@ void write_load_field(std::string_view token, const ColMeta &col, char *record_d
     switch (col.type) {
         case TYPE_INT: {
             int parsed_value = 0;
-            auto result = std::from_chars(token.data(), token.data() + token.size(), parsed_value);
-            if (result.ec == std::errc::result_out_of_range) {
-                out_of_range_value();
-            }
-            if (result.ec != std::errc() || result.ptr != token.data() + token.size()) {
+            errno = 0;
+            if (!parse_load_int(token, &parsed_value)) {
+                if (errno == ERANGE) {
+                    out_of_range_value();
+                }
                 invalid_value();
             }
             memcpy(dest, &parsed_value, sizeof(parsed_value));
@@ -90,11 +141,10 @@ void write_load_field(std::string_view token, const ColMeta &col, char *record_d
         }
         case TYPE_FLOAT: {
             float parsed_value = 0;
-            auto result = std::from_chars(token.data(), token.data() + token.size(), parsed_value);
-            if (result.ec == std::errc::result_out_of_range) {
-                out_of_range_value();
-            }
-            if (result.ec != std::errc() || result.ptr != token.data() + token.size()) {
+            if (!parse_load_float(token, &parsed_value)) {
+                if (errno == ERANGE) {
+                    out_of_range_value();
+                }
                 invalid_value();
             }
             memcpy(dest, &parsed_value, sizeof(parsed_value));
