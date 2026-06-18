@@ -49,6 +49,20 @@ public:
         return GetTransactionLocked(txn_id);
     }
 
+    class WriteTxnGuard {
+       public:
+        explicit WriteTxnGuard(TransactionManager *txn_mgr) {
+            if (txn_mgr != nullptr) {
+                checkpoint_guard_ = std::shared_lock<std::shared_mutex>(txn_mgr->checkpoint_mutex_);
+            }
+        }
+
+       private:
+        std::shared_lock<std::shared_mutex> checkpoint_guard_;
+    };
+
+    WriteTxnGuard write_txn_guard() { return WriteTxnGuard(this); }
+
 private:
     struct TxnEntry {
         std::unique_ptr<Transaction> txn;

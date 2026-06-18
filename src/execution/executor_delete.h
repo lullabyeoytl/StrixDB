@@ -70,6 +70,9 @@ class DeleteExecutor : public AbstractExecutor {
      * Index scans must be drained first so index mutations do not destabilize iteration.
      */
     std::unique_ptr<RmRecord> NextImpl() override {
+        auto write_guard = context_ != nullptr && context_->txn_mgr_ != nullptr
+                               ? context_->txn_mgr_->write_txn_guard()
+                               : TransactionManager::WriteTxnGuard(nullptr);
         // Pre-compute index handles (loop-invariant across rows)
         std::vector<IxIndexHandle *> index_handles;
         index_handles.reserve(tab_.indexes.size());
