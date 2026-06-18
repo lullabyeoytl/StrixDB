@@ -46,6 +46,7 @@ typedef enum PlanTag{
     T_StaticCheckpoint,
     T_SeqScan,
     T_IndexScan,
+    T_IndexNestLoop,
     T_Join,
     T_NestLoop,
     T_SortMerge,    // sort merge join
@@ -216,6 +217,24 @@ class HashJoinPlan : public PhysicalJoinPlan
         // Hash Join will build hash tables from equi-join keys when the executor is introduced later.
         std::vector<Condition> hash_conds_;
         std::vector<Condition> residual_conds_;
+};
+
+class IndexNestedLoopJoinPlan : public PhysicalJoinPlan
+{
+    public:
+        IndexNestedLoopJoinPlan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> right,
+                                std::vector<Condition> conds, std::vector<std::string> index_col_names,
+                                JoinType join_type = INNER_JOIN)
+            : PhysicalJoinPlan(T_IndexNestLoop, std::move(left), std::move(right), join_type)
+        {
+            conds_ = std::move(conds);
+            index_col_names_ = std::move(index_col_names);
+        }
+        ~IndexNestedLoopJoinPlan() override = default;
+        // Join conditions used for index lookup and residual evaluation.
+        std::vector<Condition> conds_;
+        // Index column names for the right table index.
+        std::vector<std::string> index_col_names_;
 };
 
 /**

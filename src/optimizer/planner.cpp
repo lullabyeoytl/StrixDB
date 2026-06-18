@@ -458,6 +458,98 @@ auto choose_join_implementation(const JoinPredicateAnalysis &analysis, JoinType 
 }
 
 // ================================================================
+// Leaf plan helpers (for INLJ detection)
+// ================================================================
+
+struct LeafPlanShape {
+    std::shared_ptr<ProjectionPlan> projection;
+    std::shared_ptr<FilterPlan> filter;
+    std::shared_ptr<ScanPlan> scan;
+};
+
+auto inspect_leaf_plan(const std::shared_ptr<Plan> &plan) -> std::optional<LeafPlanShape> {
+    LeafPlanShape shape;
+    std::shared_ptr<Plan> current = plan;
+    if (auto projection = std::dynamic_pointer_cast<ProjectionPlan>(current)) {
+        shape.projection = projection;
+        current = projection->subplan_;
+    }
+    if (auto filter = std::dynamic_pointer_cast<FilterPlan>(current)) {
+        shape.filter = filter;
+        current = filter->subplan_;
+    }
+    auto scan = std::dynamic_pointer_cast<ScanPlan>(current);
+    if (scan == nullptr) {
+        return std::nullopt;
+    }
+    shape.scan = scan;
+    return shape;
+}
+
+auto rebuild_leaf_plan(const LeafPlanShape &shape, std::shared_ptr<ScanPlan> scan) -> std::shared_ptr<Plan> {
+    std::shared_ptr<Plan> node = std::move(scan);
+    if (shape.filter != nullptr) {
+        node = std::make_shared<FilterPlan>(std::move(node), shape.filter->conds_);
+    }
+    if (shape.projection != nullptr) {
+        std::vector<TabCol> sel_cols = shape.projection->sel_cols_;
+        std::vector<std::string> output_names = shape.projection->output_names_;
+        node = std::make_shared<ProjectionPlan>(T_Projection, std::move(node),
+                                                std::move(sel_cols), std::move(output_names));
+    }
+    return node;
+}
+
+// ================================================================
+// Index match helpers for join
+// ================================================================
+
+auto match_join_index(const TabMeta &tab, const std::string &right_visible,
+                      const std::vector<Condition> &join_conds) -> IndexMatchResult {
+    IndexMatchResult best;
+    for (const auto &index_meta : tab.indexes) {
+        IndexMatchResult current;
+        current.index_col_names = index_meta.col_names();
+        current.index_meta = index_meta;
+        current.score.index_width = index_meta.col_num;
+        std::vector<bool> selected(join_conds.size(), false);
+        for (const auto &index_col : index_meta.cols) {
+            int eq_idx = -1;
+            for (size_t i = 0; i < join_conds.size(); ++i) {
+                const auto &cond = join_conds[i];
+                if (cond.is_rhs_val || cond.op != OP_EQ) {
+                    continue;
+                }
+                if (cond.rhs_col.tab_name == right_visible && cond.rhs_col.col_name == index_col.name) {
+                    eq_idx = static_cast<int>(i);
+                    break;
+                }
+            }
+            if (eq_idx == -1) {
+                break;
+            }
+            selected[eq_idx] = true;
+            ++current.score.eq_prefix_len;
+        }
+        if (current.score.eq_prefix_len == 0) {
+            continue;
+        }
+        current.matched = true;
+        for (size_t i = 0; i < join_conds.size(); ++i) {
+            if (selected[i]) {
+                current.lookup_conds.push_back(join_conds[i]);
+            } else {
+                current.residual_conds.push_back(join_conds[i]);
+            }
+        }
+        if (!best.matched || current.score.better_than(best.score)) {
+            best = std::move(current);
+        }
+    }
+    return best;
+}
+
+// ================================================================
 // Join plan helpers
 // ================================================================
 
@@ -486,8 +578,28 @@ auto build_hash_join_plan(std::shared_ptr<Plan> left, std::shared_ptr<Plan> righ
 }
 
 auto physicalize_logical_join(const std::shared_ptr<JoinPlan> &join, std::shared_ptr<Plan> left,
-                              std::shared_ptr<Plan> right, const JoinImplementationConfig &config)
+                              std::shared_ptr<Plan> right, const JoinImplementationConfig &config,
+                              SmManager *sm_manager)
     -> std::shared_ptr<Plan> {
+    // Try INLJ when the right side is a simple SeqScan on a single table.
+    auto leaf = inspect_leaf_plan(right);
+    if (leaf.has_value() && leaf->scan != nullptr && leaf->scan->tag == T_SeqScan && !leaf->scan->empty_result_) {
+        std::string right_visible = leaf->scan->tab_name_;
+        const auto &tab = sm_manager->db_.get_table(leaf->scan->tab_name_);
+        auto match = match_join_index(tab, right_visible, join->conds_);
+        if (match.matched) {
+            std::vector<Condition> fed_conds = join->conds_;
+            if (leaf->filter != nullptr && match.index_col_names.size() > 1) {
+                fed_conds.insert(fed_conds.end(),
+                                 leaf->filter->conds_.begin(), leaf->filter->conds_.end());
+            }
+            right = leaf->scan;
+            return std::make_shared<IndexNestedLoopJoinPlan>(
+                std::move(left), std::move(right), std::move(fed_conds),
+                std::move(match.index_col_names), join->join_type_);
+        }
+    }
+
     auto analysis = analyze_join_predicates(join->conds_);
     auto decision = choose_join_implementation(analysis, join->join_type_, config);
     switch (decision.implementation) {
@@ -501,7 +613,8 @@ auto physicalize_logical_join(const std::shared_ptr<JoinPlan> &join, std::shared
     throw InternalError("Unexpected join implementation decision");
 }
 
-auto physicalize_join_tree(const std::shared_ptr<Plan> &plan, const JoinImplementationConfig &config, int depth = 0)
+auto physicalize_join_tree(const std::shared_ptr<Plan> &plan, const JoinImplementationConfig &config,
+                           SmManager *sm_manager, int depth = 0)
     -> std::shared_ptr<Plan> {
     if (depth >= kMaxPlanTreeDepth) {
         throw InternalError("Plan tree depth exceeds limit");
@@ -512,9 +625,9 @@ auto physicalize_join_tree(const std::shared_ptr<Plan> &plan, const JoinImplemen
     }
 
     // Children must be physicalized before the parent join is built.
-    auto left = physicalize_join_tree(join->left_, config, depth + 1);
-    auto right = physicalize_join_tree(join->right_, config, depth + 1);
-    return physicalize_logical_join(join, std::move(left), std::move(right), config);
+    auto left = physicalize_join_tree(join->left_, config, sm_manager, depth + 1);
+    auto right = physicalize_join_tree(join->right_, config, sm_manager, depth + 1);
+    return physicalize_logical_join(join, std::move(left), std::move(right), config, sm_manager);
 }
 
 // ================================================================
@@ -804,7 +917,7 @@ std::shared_ptr<Plan> Planner::make_one_rel(std::shared_ptr<Query> query, const 
         build_join_implementation_config(enable_nestedloop_join, enable_sortmerge_join, this->enable_hash_join);
     validate_join_executor_config(join_impl_config);
 
-    return physicalize_join_tree(plan, join_impl_config);
+    return physicalize_join_tree(plan, join_impl_config, sm_manager_);
 }
 
 
